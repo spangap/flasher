@@ -1,8 +1,9 @@
 // Spangap web flasher.
 //
 // Reads ?build=<name> from the URL, looks up the builds-repo root in
-// builds-repo.txt, downloads <root>/main/<name>.zip (a flasher.zip produced by
-// `spangap build`), unzips it in the browser, and flashes every image at its
+// builds-repo.txt, downloads <root>/<branch>/<name>.zip (a flasher.zip produced
+// by `spangap build`; ?branch=<ref> selects the builds-repo branch, default
+// main), unzips it in the browser, and flashes every image at its
 // offset over Web Serial using the vendored esptool-js. No CDN, no build step —
 // these files can be served from anywhere static.
 
@@ -34,7 +35,11 @@ const terminal = {
   },
 };
 
-const build = new URLSearchParams(location.search).get('build');
+const params = new URLSearchParams(location.search);
+const build = params.get('build');
+// Which builds-repo branch to pull from; the raw-GitHub root omits the ref, so
+// the branch becomes the first path segment. Defaults to main.
+const branch = params.get('branch') || 'main';
 
 if (!build) {
   $('build-label').textContent = 'no build selected';
@@ -69,7 +74,7 @@ flashBtn.addEventListener('click', async () => {
   let transport;
   try {
     const root = await readBuildsRoot();
-    const zipURL = `${root}/main/${build}.zip`;
+    const zipURL = `${root}/${branch}/${build}.zip`;
     log(`Downloading ${zipURL}`);
     const res = await fetch(zipURL, { cache: 'no-store' });
     if (!res.ok) throw new Error(`could not fetch ${build}.zip (HTTP ${res.status}) — is the build published?`);

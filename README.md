@@ -10,11 +10,13 @@ web server): `index.html`, `flasher.js`, `builds-repo.txt`, and `vendor/`.
 
 ## How it resolves a build
 
-`https://…/flasher/?build=tdeck`
+`https://…/flasher/?build=tdeck` (optionally `&branch=<ref>`)
 
 1. Reads `builds-repo.txt` → the builds-repo **root URL** (first non-comment line).
-2. Downloads `<root>/main/tdeck.zip` — a `flasher.zip` produced by `spangap build`
-   and published by `spangap make-builds` (see the `*-builds` repos).
+2. Downloads `<root>/<branch>/tdeck.zip` — a `flasher.zip` produced by `spangap
+   build` and published by `spangap make-builds` (see the `*-builds` repos). The
+   `branch` query param selects the builds-repo ref (default `main`); on raw
+   GitHub that ref is the first path segment.
 3. Unzips it in the browser (JSZip), reads `flasher_args.json` for the
    offset→image map and flash settings.
 4. Flashes every image at its offset over Web Serial (esptool-js), then resets.
@@ -26,7 +28,8 @@ web server): `index.html`, `flasher.js`, `builds-repo.txt`, and `vendor/`.
   builds repo must be **public** so the browser can fetch its zips.
 - Serve the folder over **HTTPS** (or `http://localhost`) — Web Serial requires a
   secure context.
-- Link users straight to a build: `.../flasher/?build=tdeck`.
+- Link users straight to a build: `.../flasher/?build=tdeck` (add
+  `&branch=<ref>` to pull from a non-`main` builds-repo branch).
 
 ## Vendored dependencies (no runtime CDN)
 
