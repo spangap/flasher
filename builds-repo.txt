@@ -1,0 +1,12 @@
+# Root URL of the builds repo this flasher pulls images from.
+# The flasher fetches  <root>/main/<name>.zip  for  ?build=<name>.
+# The first non-comment, non-blank line below is used as <root>.
+#
+# Raw GitHub (public repo, works with no extra setup):
+https://raw.githubusercontent.com/reticulous/reticulous-builds/main
+#
+# GitHub Pages alternative (enable Pages on the builds repo, serve the main
+# branch), which avoids the doubled "main" in the raw path:
+#   https://reticulous.github.io/reticulous-builds
+#
+# Point this at spangap/spangap-builds instead when deploying the spangap flavor.
