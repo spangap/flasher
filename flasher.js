@@ -87,13 +87,15 @@ flashBtn.addEventListener('click', async () => {
     const entries = Object.entries(fargs.flash_files || {});
     if (!entries.length) throw new Error('flasher_args.json lists no flash_files');
 
-    // esptool-js wants each image as a "binary string" (1 char per byte), which
-    // JSZip produces directly.
+    // esptool-js (0.6.0) wants each image as a Uint8Array of raw bytes. Passing a
+    // binary string makes pako's deflater UTF-8-encode any byte >= 0x80, so the
+    // image inflates on-device past its declared size and the stub aborts with
+    // ESP_TOO_MUCH_DATA (status 0xC9) partway through the largest image.
     const fileArray = [];
     for (const [offset, fname] of entries) {
       const f = zip.file(fname);
       if (!f) throw new Error(`image "${fname}" missing from flasher.zip`);
-      fileArray.push({ data: await f.async('binarystring'), address: parseInt(offset, 16) });
+      fileArray.push({ data: await f.async('uint8array'), address: parseInt(offset, 16) });
     }
     fileArray.sort((a, b) => a.address - b.address);
     log(`Unpacked ${fileArray.length} image(s). Select your device's serial port…`);
