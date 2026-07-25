@@ -16,6 +16,8 @@ flashmon/                     ← this repo
     index.html
     flashmon.js
     flashmon.py               ← single-file terminal flasher (for non-browser users)
+    <project>-flashmon        ← branded copy of flashmon.py `make` writes: deployment
+                                URL baked in (gitignored generated artifact)
     flashmon.yaml.example     ← template config (checked in); copy → flashmon.yaml
     flashmon.yaml             ← your config: project brand + catalogue (gitignored)
     detect/spangap_detect.bin ← the peripheral detector (checked in)
@@ -87,6 +89,28 @@ the device's CLI in one batch.
 If the device is powered off or unplugged, the port's permission is retained:
 the stream notes `-- Serial port gone --`, and when it reappears (matched by USB
 VID/PID) it reconnects automatically with `-- Serial port came back --`.
+
+## The terminal flasher — `flashmon.py`
+
+For people who can't run a Chromium browser, `flashmon.py` does the same flow
+from a plain terminal: pick a port, probe the chip, RAM-load the detector, flash
+the matching image, then open a full-screen serial monitor. It reads the same
+`flashmon.yaml` + `builds/` + `detect/` the browser does — either from a served
+deployment or from a local flashmon folder:
+
+```sh
+./flashmon.py --url https://<host>/flashmon/   # a served deployment
+./flashmon.py --dir flashmon                    # a local flashmon/ folder
+```
+
+`make` also writes a **branded** copy of it next to it, named for the project —
+`<project>-flashmon` (e.g. `reticulous-flashmon`). It's the identical script with
+the deployment's `url:` baked into its `PROJECT_URL`, so a downloaded copy runs
+with **no arguments** and already knows where to fetch its config and images.
+That branded script is what you serve for a one-line `curl`-and-run, and it's the
+entry point inside the offline `<project>-flashmon.zip` bundle (where it finds its
+config/images/tool-wheels alongside itself and runs fully offline). Like the
+images, it's a gitignored generated artifact (`*-flashmon`), not tracked source.
 
 ## Configuration — `flashmon/flashmon.yaml`
 
