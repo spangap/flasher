@@ -68,8 +68,8 @@ remembered device). Once you pick a device it:
 
 The detector reports the board as `hw-<straddle>` (e.g. `hw-lilygo-tdeck`). The
 button looks for `builds/hw-<straddle>.zip`, trying successively shorter
-prefixes (so `hw-lilygo-t3s3-sx1262` falls back to the `hw-lilygo-t3s3` image),
-and finally `builds/generic.zip`. If none is published, no flash button appears
+prefixes (so an unlisted `hw-foo-bar-baz` falls back to a listed `hw-foo-bar`
+image), and finally `builds/generic.zip`. If none is published, no flash button appears
 — you still get the monitor.
 
 ## The monitor

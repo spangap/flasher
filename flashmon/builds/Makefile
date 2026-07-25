@@ -13,7 +13,8 @@
 # every image is present, so the offline bundle only comes from a full build.
 #
 #   make                         build every image + branded script + offline bundle
-#   make images                  build every image, no bundle
+#   make OFFLINE=0               build every image + branded script, skip the offline zip
+#   make images                  build every image, no branded script, no bundle
 #   make images BUILD=hw-x       rebuild just one image (re-stamps only its entry)
 #   make brand                   just the branded standalone script (fast, no net)
 #   make bundle                  same as `make`
@@ -21,6 +22,9 @@
 # All outputs (images, branded script, zips) are gitignored build artifacts.
 
 BUILD ?=
+# OFFLINE=0 skips the slow offline bundle (wheel fetch + zip); the branded script
+# is still written, so you get everything but ../<project>_<DATETIME>.zip.
+OFFLINE ?= 1
 
 .PHONY: all images brand bundle
 all: bundle
@@ -35,4 +39,9 @@ brand:
 bundle:
 	@[ -z "$(BUILD)" ] || { echo "make bundle packages ALL images — drop BUILD= (use 'make images BUILD=$(BUILD)' to rebuild one)" >&2; exit 1; }
 	cd .. && python3 make-builds.py
+ifeq ($(OFFLINE),0)
+	cd .. && python3 flashmon.py make-brand
+	@echo "make: OFFLINE=0 — wrote the branded script, skipped the offline bundle zip." >&2
+else
 	cd .. && python3 flashmon.py make-zip
+endif

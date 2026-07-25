@@ -1051,9 +1051,9 @@ function detectedHw(lines) {
 }
 
 // Image names to try for a detected board, most-specific first: the exact name,
-// then successively shorter hw- prefixes (so hw-lilygo-t3s3-sx1262 falls to the
-// hw-lilygo-t3s3 image), then `generic`. Only names present in the catalogue are
-// returned.
+// then successively shorter hw- prefixes (so an unlisted hw-foo-bar-baz falls to
+// a listed hw-foo-bar image), then `generic`. Only names present in the catalogue
+// are returned.
 function buildCandidates(hw) {
   const names = new Set(BUILD_NAMES);
   const out = [];
