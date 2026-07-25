@@ -3,40 +3,240 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Spangap Flasher</title>
+<title>flashmon</title>
 <style>
-  :root{--bg:#0e1116;--fg:#e6edf3;--accent:#2ea043;--err:#f85149;--muted:#8b949e;--panel:#161b22;--line:#30363d}
+  :root{--bg:#000;--fg:#e6edf3;--accent:#2ea043;--err:#f85149;--muted:#8b949e;--panel:#161b22;--line:#30363d}
   *{box-sizing:border-box}
   body{margin:0;font:15px/1.5 system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);
        display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}
-  .card{width:100%;max-width:660px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1.5rem 1.75rem}
-  h1{margin:0 0 .25rem;font-size:1.4rem}
-  .sub{color:var(--muted);margin:0 0 1.1rem}
-  button{font:inherit;font-weight:600;color:#fff;background:var(--accent);border:0;border-radius:8px;padding:.7rem 1.2rem;cursor:pointer}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  .row{display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;margin-bottom:.5rem}
+  #intro{width:100%;max-width:560px;text-align:center}
+  #title{margin:0;font-size:2rem;font-weight:700;letter-spacing:.01em}
+  #intro-hint{color:var(--muted);margin:.6rem 0 0}
+
+  /* Big, unmissable call-to-action. People don't read the page — they wait for
+   * something to click, so the "click anywhere" instruction IS the button. */
+  #start{display:block;width:100%;margin:1.5rem 0 .2rem;font:inherit;font-weight:600;
+       font-size:1rem;line-height:1.35;color:#fff;background:#ff1f1f;border:3px solid #fff;
+       border-radius:14px;padding:.9rem 1.2rem;cursor:pointer;text-wrap:balance;
+       animation:start-pulse 1.6s ease-in-out infinite}
+  #start[hidden]{display:none}
+  #start:hover{background:#fff;color:#ff1f1f;border-color:#ff1f1f;animation:none}
+  #start:active{transform:translateY(1px)}
+  @keyframes start-pulse{
+    0%,100%{box-shadow:0 0 0 0 rgba(255,31,31,.5)}
+    50%{box-shadow:0 0 0 12px rgba(255,31,31,0)}
+  }
   code{background:#0d1117;border:1px solid var(--line);border-radius:5px;padding:.1rem .4rem;font-size:.85em}
   #log{white-space:pre-wrap;font:12px/1.45 ui-monospace,SFMono-Regular,monospace;background:#0d1117;
-       border:1px solid var(--line);border-radius:8px;padding:.75rem;max-height:42vh;overflow:auto;margin-top:1rem}
+       border:1px solid var(--line);border-radius:8px;padding:.75rem;max-height:42vh;overflow:auto;
+       margin-top:1.25rem;text-align:left}
   .bar{height:8px;background:#0d1117;border:1px solid var(--line);border-radius:5px;overflow:hidden;margin-top:1rem;display:none}
   .bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s}
   .err{color:var(--err)} .ok{color:var(--accent)} a{color:#58a6ff}
+
+  #monitor{position:fixed;inset:0;z-index:20;background:#000}
+  #monitor[hidden]{display:none}
+  /* Lift the terminal off the bottom edge so the cursor's row never sits under
+   * the very edge of the window. */
+  #monitor-term{position:absolute;top:.5rem;left:.6rem;right:.6rem;bottom:.8rem}
+
+  /* Top-right action row: [Open Device UI] [Reset]. */
+  /* Above the modal overlays (z-index 30): the action buttons stay clickable
+   * while a dialog is up, and clicking one also dismisses the dialog. */
+  #monitor-actions{position:absolute;top:.7rem;right:1.6rem;z-index:40;display:flex;gap:.6rem;align-items:center}
+  #monitor-reset{font:inherit;font-weight:700;
+       font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;
+       color:#fff;background:#ff1f1f;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
+  #monitor-reset:hover{animation:reset-flicker .5s infinite}
+  #open-ui{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;
+       color:#fff;background:#1f6feb;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
+  #open-ui[hidden]{display:none}
+  #open-ui:hover{background:#fff;color:#1f6feb;border-color:#1f6feb}
+  #monitor-flash{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;
+       color:#fff;background:#2ea043;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
+  #monitor-flash[hidden]{display:none}
+  #monitor-flash:hover{background:#fff;color:#2ea043;border-color:#2ea043}
+  @keyframes reset-flicker{
+    0%,50%{background:#ff1f1f;color:#fff;border-color:#fff}
+    50.01%,100%{background:#fff;color:#ff1f1f;border-color:#ff1f1f}
+  }
+
+  #monitor-baud{position:absolute;bottom:.5rem;right:.9rem;z-index:21;font:inherit;font-size:.72rem;
+       color:var(--muted);background:transparent;border:0;padding:.1rem .2rem;cursor:pointer}
+  #monitor-baud:hover{color:var(--fg)}
+
+  /* Invisible catch-all: a click anywhere off the settings box dismisses it. */
+  #cfg-overlay{position:fixed;inset:0;z-index:22;background:transparent}
+  #cfg-overlay[hidden]{display:none}
+  #serial-cfg{position:absolute;bottom:2.1rem;right:.9rem;z-index:23;background:var(--panel);
+       border:1px solid var(--line);border-radius:8px;padding:.7rem .8rem;
+       display:grid;grid-template-columns:auto auto;gap:.5rem .6rem;align-items:center;font-size:.8rem}
+  #serial-cfg[hidden]{display:none}
+  #serial-cfg label{color:var(--muted)}
+  #serial-cfg select{font:inherit;color:var(--fg);background:#0d1117;border:1px solid var(--line);
+       border-radius:5px;padding:.2rem .3rem}
+  #cfg-apply{grid-column:1 / -1;font:inherit;font-weight:600;color:#fff;background:var(--accent);
+       border:0;border-radius:6px;padding:.35rem;cursor:pointer;margin-top:.2rem}
+
+  /* Modal dialogs over the monitor: WiFi connect helper + reachability report. */
+  .modal-overlay{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.6);
+       display:flex;align-items:center;justify-content:center;padding:1.5rem}
+  .modal-overlay[hidden]{display:none}
+  .modal{width:100%;max-width:420px;background:var(--panel);border:1px solid var(--line);
+       border-radius:10px;padding:1.2rem 1.3rem;text-align:left}
+  .modal h2{margin:0 0 .2rem;font-size:1.15rem}
+  .modal .sub{color:var(--muted);font-size:.85rem;margin:0 0 1rem}
+  .modal label{display:block;color:var(--muted);font-size:.78rem;margin:.7rem 0 .25rem}
+  .modal input,.modal select{width:100%;font:inherit;font-size:.9rem;color:var(--fg);background:#0d1117;
+       border:1px solid var(--line);border-radius:6px;padding:.4rem .5rem}
+  .modal .row{display:flex;gap:.6rem;justify-content:flex-end;margin-top:1.1rem}
+  .modal button{font:inherit;font-weight:600;border:0;border-radius:6px;padding:.45rem .9rem;cursor:pointer}
+  .modal .btn-primary{color:#fff;background:var(--accent)}
+  .modal .btn-ghost{color:var(--fg);background:#0d1117;border:1px solid var(--line)}
+  #info-body{font-size:.9rem;line-height:1.55}
+  #info-body p{margin:0 0 .8rem}
+  #info-body p:last-child{margin-bottom:0}
+  #info-overlay .modal{max-width:500px}
+  .modal .k{color:var(--muted)}
+  .modal label .hint{color:var(--muted);font-weight:400;text-transform:none}
+  /* "Don't ask again" row: an inline checkbox, not a full-width field label. */
+  .modal label.check{display:flex;align-items:center;gap:.5rem;color:var(--fg);font-size:.85rem;
+       text-transform:none;margin:1rem 0 0;cursor:pointer}
+  .modal label.check input{width:auto;margin:0}
+  #uichoice-overlay .row button{flex:1}
+  /* Suggest sits INSIDE the password field, small, flush right. */
+  .pw-row{position:relative}
+  .pw-row input{padding-right:4.6rem}
+  #pw-suggest{position:absolute;right:.35rem;top:50%;transform:translateY(-50%);
+       padding:.12rem .5rem;font-size:.72rem;line-height:1.5;white-space:nowrap;border-radius:5px}
+  .pw-msg{min-height:1.1em;margin-top:.5rem;font-size:.82rem;color:var(--err)}
+  .pw-msg.ok{color:var(--accent)}
+  .modal input:invalid{border-color:var(--err)}
 </style>
+<link rel="stylesheet" href="vendor/xterm.css">
 </head>
 <body>
-  <div class="card">
-    <h1>Spangap Flasher</h1>
-    <p class="sub" id="tagline">Flash firmware to your device over USB, right from the browser.</p>
-    <div class="row">
-      <button id="flash">Connect &amp; Flash</button>
-      <span id="build-label" class="sub" style="margin:0"></span>
-    </div>
+  <div id="intro">
+    <h1 id="title"></h1>
+    <button id="start" type="button" hidden></button>
+    <p id="intro-hint"></p>
     <div class="bar" id="bar"><i id="barfill"></i></div>
     <div id="log" hidden></div>
-    <p class="sub" id="hint" style="margin-top:1rem"></p>
   </div>
+
+  <div id="monitor" hidden>
+    <div id="monitor-term"></div>
+    <div id="monitor-actions">
+      <button id="monitor-flash" type="button" hidden>Flash</button>
+      <button id="open-ui" type="button" hidden>Open Device UI</button>
+      <button id="monitor-reset" type="button">Reset</button>
+    </div>
+    <button id="monitor-baud" type="button">115200 N 8 1</button>
+    <div id="cfg-overlay" hidden></div>
+    <div id="serial-cfg" hidden>
+      <label for="cfg-baud">Baud</label>
+      <select id="cfg-baud">
+        <option>300</option><option>1200</option><option>2400</option><option>4800</option>
+        <option>9600</option><option>19200</option><option>38400</option><option>57600</option>
+        <option>74880</option><option selected>115200</option><option>230400</option>
+        <option>460800</option><option>921600</option>
+      </select>
+      <label for="cfg-data">Data</label>
+      <select id="cfg-data"><option selected>8</option><option>7</option></select>
+      <label for="cfg-parity">Parity</label>
+      <select id="cfg-parity">
+        <option value="none" selected>None</option><option value="even">Even</option><option value="odd">Odd</option>
+      </select>
+      <label for="cfg-stop">Stop</label>
+      <select id="cfg-stop"><option selected>1</option><option>2</option></select>
+      <button id="cfg-apply" type="button">Apply</button>
+    </div>
+
+    <!-- Device password: shown when the device reports it has no admin password. -->
+    <div id="passwd-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Set a device password</h2>
+        <p class="sub">This device has no admin password set. Enter one now. It protects the web UI and CLI, so pick something hard to guess.</p>
+        <label for="pw-1">Password</label>
+        <div class="pw-row">
+          <input id="pw-1" type="password" autocomplete="off" spellcheck="false">
+          <button id="pw-suggest" class="btn-ghost" type="button">Suggest</button>
+        </div>
+        <label for="pw-2">Password again</label>
+        <input id="pw-2" type="password" autocomplete="off" spellcheck="false">
+        <div id="pw-msg" class="pw-msg"></div>
+        <div class="row">
+          <button id="pw-ok" class="btn-primary" type="button">Set password</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- WiFi connect helper: shown when the device falls back to its own AP. -->
+    <div id="connect-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Connect device to WiFi</h2>
+        <p class="sub">The device found no known network and started its own access point.</p>
+        <label for="ch-hostname">Hostname <span class="hint">(letters, digits, _ — max 16)</span></label>
+        <input id="ch-hostname" type="text" autocomplete="off" spellcheck="false"
+               pattern="[A-Za-z0-9_]{1,16}" maxlength="16" inputmode="latin">
+        <label for="ch-ssid">Network</label>
+        <select id="ch-ssid"></select>
+        <div id="ch-ssid-other" hidden>
+          <label for="ch-ssid-custom">SSID</label>
+          <input id="ch-ssid-custom" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div id="ch-pass-wrap" hidden>
+          <label for="ch-pass">Password</label>
+          <input id="ch-pass" type="password" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="row">
+          <button id="ch-cancel" class="btn-ghost" type="button">Cancel</button>
+          <button id="ch-send" class="btn-primary" type="button">Connect</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Generic info dialog (subnet/reachability notes for the Open Device UI button). -->
+    <div id="info-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2 id="info-title"></h2>
+        <div id="info-body"></div>
+        <div class="row">
+          <button id="info-ok" class="btn-primary" type="button">OK</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- .local-vs-IP choice for the Open Device UI button (from the 2nd press). -->
+    <div id="uichoice-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Open which address?</h2>
+        <p class="sub" id="uichoice-sub"></p>
+        <label class="check"><input id="uichoice-remember" type="checkbox"> Don't ask again on this computer</label>
+        <div class="row">
+          <button id="uichoice-mdns" class="btn-ghost" type="button"></button>
+          <button id="uichoice-ip" class="btn-primary" type="button"></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Shown when the serial port wedges after RNG init and reopening it didn't help. -->
+    <div id="stuck-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Please reset the device</h2>
+        <div>The serial connection stopped responding right after the device initialized
+          its random-number generator, and reopening the port didn't recover it. This
+          happens occasionally at that point in boot. Press the device's reset button
+          (or power-cycle it) to continue.</div>
+        <div class="row">
+          <button id="stuck-ok" class="btn-primary" type="button">OK</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Vendored (no CDN at runtime): see vendor/VERSIONS.txt -->
   <script src="vendor/jszip.min.js"></script>
-  <script type="module" src="flasher.js"></script>
+  <script type="module" src="flashmon.js"></script>
 </body>
 </html>
