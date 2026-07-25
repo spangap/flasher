@@ -1,0 +1,50 @@
+name: Build firmware images
+
+# Manually triggered: builds every entry in flashmon/flashmon.yaml and uploads
+# the resulting flashmon/builds/*.zip as a downloadable artifact. The zips are
+# gitignored build artifacts, so they are NOT committed back to the repo — deploy
+# them alongside the page from this artifact (or run `make` locally).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # Check the repo out INTO a spangap workspace, as the straddle `flashmon`,
+      # so the build can clone its deps (reticulous/…) as siblings and build in
+      # the container.
+      - name: Checkout flashmon
+        uses: actions/checkout@v4
+        with:
+          path: ws/flashmon
+
+      - name: Install spangap
+        run: |
+          set -eu
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://raw.githubusercontent.com/spangap/spangap/refs/heads/main/spangap \
+            -o "$HOME/.local/bin/spangap"
+          chmod +x "$HOME/.local/bin/spangap"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build all images
+        run: |
+          set -eu
+          # Turn the checkout's parent into a spangap workspace, then build the
+          # catalogue. `make images` runs make-builds.py, which reads
+          # flashmon/flashmon.yaml and writes each flasher.zip to
+          # flashmon/flashmon/builds/<slug>_<name>_<datetime>.zip.
+          spangap init "$GITHUB_WORKSPACE/ws"
+          make -C "$GITHUB_WORKSPACE/ws/flashmon/flashmon/builds" images
+
+      - name: Upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-images
+          path: ws/flashmon/flashmon/builds/*.zip
+          if-no-files-found: error
