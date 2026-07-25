@@ -1326,11 +1326,18 @@ def make_brand():
     print("wrote %s" % path)
 
 
-def _installer_index_html(project, brand, zipname, mb):
+def _installer_index_html(project, brand, zipname, mb, version):
     """The download page placed next to the bundle in offline-installer/. Offers the
-    zip with download disposition (the `download` attribute) and says how to run it.
+    zip with download disposition (the `download` attribute), names the packaged
+    build, and says how to run it. Links to the sibling browser + online terminal
+    flashers are relative (this page sits one level below the web root).
     Self-contained and theme-aware — no external assets, works served or opened."""
     import html
+    # version is the catalogue stamp YYYYMMDDhhmmss; show it human-readable.
+    vshow = version
+    if len(version) == 14 and version.isdigit():
+        vshow = "%s-%s-%s %s:%s:%s UTC" % (version[0:4], version[4:6], version[6:8],
+                                           version[8:10], version[10:12], version[12:14])
     tmpl = """<!doctype html>
 <html lang="en">
 <head>
@@ -1355,6 +1362,8 @@ def _installer_index_html(project, brand, zipname, mb):
         background:var(--accent); color:var(--accentfg); padding:.85rem 1rem;
         border-radius:10px; font-size:1.05rem; }
   .dl small { font-weight:400; opacity:.85; }
+  .ver { text-align:center; color:var(--mut); font-size:.9rem; margin:.6rem 0 0; }
+  .ver code { font-size:.95em; }
   h2 { font-size:.95rem; text-transform:uppercase; letter-spacing:.04em;
        color:var(--mut); margin:1.75rem 0 .5rem; }
   ol { margin:0; padding-left:1.2rem; }
@@ -1362,6 +1371,7 @@ def _installer_index_html(project, brand, zipname, mb):
   code { background:rgba(127,127,127,.15); padding:.1rem .35rem; border-radius:5px;
          font:0.9em ui-monospace,SFMono-Regular,Menlo,monospace; }
   .note { color:var(--mut); font-size:.9rem; margin-top:1.5rem; }
+  .note a { color:var(--accent); }
 </style>
 </head>
 <body>
@@ -1370,6 +1380,7 @@ def _installer_index_html(project, brand, zipname, mb):
     <p class="sub">The flasher and serial monitor with every firmware image and the
        flashing tools bundled in — nothing else to download, no internet needed.</p>
     <a class="dl" href="__ZIP__" download>Download for all platforms &nbsp;<small>(__MB__ MB)</small></a>
+    <p class="ver">Packaged build <code>__VERSION__</code></p>
     <h2>Run it</h2>
     <ol>
       <li>Unzip the download.</li>
@@ -1377,8 +1388,10 @@ def _installer_index_html(project, brand, zipname, mb):
           (macOS / Linux; needs Python 3.10+).</li>
       <li>On Windows, run <code>python __BRAND__\\__BRAND__</code> from the unzipped folder.</li>
     </ol>
-    <p class="note">Prefer the browser? A Chromium-based browser (Chrome, Edge, Brave,
-       Opera) can flash straight from the page — no download needed.</p>
+    <p class="note">No download needed if you're online: flash from the
+       <a href="../">browser flasher</a> (Chromium — Chrome, Edge, Brave, Opera),
+       or, on other browsers, grab the terminal flasher
+       <a href="../flashmon.py"><code>flashmon.py</code></a> and point it at this server.</p>
   </main>
 </body>
 </html>
@@ -1386,6 +1399,7 @@ def _installer_index_html(project, brand, zipname, mb):
     return (tmpl.replace("__PROJECT__", html.escape(project))
                 .replace("__ZIP__", html.escape(zipname, quote=True))
                 .replace("__BRAND__", html.escape(brand))
+                .replace("__VERSION__", html.escape(vshow))
                 .replace("__MB__", "%.0f" % mb))
 
 
@@ -1483,7 +1497,7 @@ def make_zip():
         shutil.make_archive(os.path.join(newdir, zipstem), "zip", staging)
         mb = os.path.getsize(os.path.join(newdir, zipname)) / (1024 * 1024)
         with open(os.path.join(newdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write(_installer_index_html(cfg.get("project", "flashmon"), brand, zipname, mb))
+            f.write(_installer_index_html(cfg.get("project", "flashmon"), brand, zipname, mb, bundle_dt))
         shutil.rmtree(served, ignore_errors=True)
         os.replace(newdir, served)
         print("make-zip: wrote offline-installer/%s (%.0f MB) — serve /offline-installer/ "
