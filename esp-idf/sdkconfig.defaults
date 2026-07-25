@@ -1,0 +1,24 @@
+# Build the detector as a RAM app: `load_ram` drops it into SRAM and the ROM
+# jumps to it — the flasher runs it after the probe with no flash write at all.
+CONFIG_APP_BUILD_TYPE_RAM=y
+
+# No PSRAM: the boards differ (quad vs octal) and the detector doesn't need it;
+# dropping it avoids a per-board init mismatch and shrinks the RAM image. (Not a
+# PURE_RAM_APP — that strips the cache driver esp_driver_spi links against.)
+CONFIG_SPIRAM=n
+
+# Console on BOTH UART0 (CP2102/CH9102 bridge boards) and native USB-Serial-JTAG
+# (native-USB boards), so "DETECTED:" reaches whichever port the flasher picked.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# The probe sweep holds the CPU for a moment (SPI resets, I2C timeouts) — don't
+# let the task watchdog trip.
+CONFIG_ESP_TASK_WDT_INIT=n
+
+# Trim the RAM footprint (IRAM/DRAM are tight for a RAM app).
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
