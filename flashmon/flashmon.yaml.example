@@ -1,0 +1,39 @@
+# flashmon configuration — copy this to `flashmon.yaml` (which is gitignored) and
+# make it yours. flashmon is a generic installer; this file is the ONLY thing
+# that brands it and lists its images, so each deployment ships its own and
+# nothing here needs to be committed upstream.
+#
+#   project:  the brand shown throughout the UI. Every place the tool would say
+#             its own name ("<project> Flasher", the flash button, the default
+#             device hostname) uses this, so your deployment reads as its own
+#             product rather than "flashmon". Also names the branded terminal
+#             flasher `make` produces: <project>-flashmon (+ .zip).
+#   url:      where THIS deployment is served. `make` bakes it into the branded
+#             flashmon.py so a downloaded copy knows where to fetch config +
+#             images from. Omit for a purely local/bundled setup.
+#   builds:   the catalogue of ready-to-flash images. Each entry is:
+#               name        the image name. Name it after the hw-<straddle> the
+#                           detector reports, so the browser can match a detected
+#                           board to its image. `generic` is the fallback for any
+#                           board without a dedicated image.
+#               invocation  the `spangap build` arguments that produce it.
+#               version     DO NOT hand-edit. `make` in builds/ writes this per
+#                           entry — the build datetime it stamped that image with
+#                           — and names the image builds/<slug>_<name>_<version>.zip.
+#                           A subset build re-stamps only the entries it rebuilt.
+#             The browser (and flashmon.py) fetch that stamped image for the
+#             detected board, falling back to builds/generic.zip.
+#
+# The browser prefers flashmon.local.yaml over flashmon.yaml when present, so you
+# can override branding/catalogue per-machine without touching your own file.
+#
+# Order matters for `make`: each build rewrites the workspace's remembered target
+# (.spangap-build), so the LAST entry is what a later bare `spangap build`
+# resolves to.
+project: MyProject
+url: https://myproject.example/flashmon/
+builds:
+  - name: hw-lilygo-tdeck
+    invocation: myorg/myproject --with spangap/hw-lilygo-tdeck
+  - name: generic
+    invocation: myorg/myproject
