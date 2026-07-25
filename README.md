@@ -37,6 +37,12 @@ GitHub Pages, an S3 bucket, `python3 -m http.server`, the device's own web
 server. Web Serial needs a **secure context**, so serve over HTTPS (or
 `http://localhost`).
 
+Deploying is just copying that whole web root to the server (e.g. `rsync` the
+`flashmon/flashmon/` directory) — so the **gitignored generated artifacts** ride
+along and get served even though they aren't tracked: the branded
+`<project>-flashmon` script, `builds/*.zip`, and `offline-installer/`. Run a full
+`make` (below) before deploying so they're present.
+
 ## What it does when you connect
 
 The page shows its title (**`<project> Flasher`**) and goes straight to the
