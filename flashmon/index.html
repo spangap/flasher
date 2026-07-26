@@ -237,6 +237,13 @@
 
   <!-- Vendored (no CDN at runtime): see vendor/VERSIONS.txt -->
   <script src="vendor/jszip.min.js"></script>
-  <script type="module" src="flashmon.js"></script>
+  <!-- Load flashmon.js through a per-load cache-bust query: the page has no build
+       step to fingerprint the file, so a redeploy would otherwise be masked by the
+       browser's module cache. The random token is on the subresource request only,
+       never the page URL. Static ./vendor/* imports resolve relative to the module,
+       so the token doesn't propagate to them. -->
+  <script type="module">
+    import(`./flashmon.js?cachebust=${Math.random().toString(36).slice(2)}`);
+  </script>
 </body>
 </html>

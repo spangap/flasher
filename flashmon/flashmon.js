@@ -64,6 +64,15 @@ function log(msg, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// Window/tab title and the top `<h1>`. `host` is the device's real hostname once
+// it has been seen in the serial log, else null. Until then both read plain
+// "FlashMon - <project>" / "<project>"; once seen, the hostname leads:
+// "<hostname> - FlashMon - <project>" / "<hostname> - <project>".
+function setMonTitle(host) {
+  document.title = host ? `${host} - FlashMon - ${PROJECT}` : `FlashMon - ${PROJECT}`;
+  $('title').textContent = host ? `${host} - ${PROJECT}` : PROJECT;
+}
+
 // esptool-js writes its own progress/log through this terminal adapter.
 const terminal = {
   clean() { logEl.textContent = ''; },
@@ -269,6 +278,7 @@ async function closeMonitor() {
   await detachStreams(m);
   m.resizeObserver.disconnect();
   m.term.dispose();
+  setMonTitle(null);   // back to the flasher landing: drop the device hostname
 }
 
 // Hard-reset into the app: assert RTS (EN low = reset), hold, then release. DTR
@@ -320,6 +330,7 @@ async function openMonitor(port, doReset, banner) {
               hw: null, deviceVersion: null, versionSettled: false, versionTimer: null,
               rxSeq: 0, rngArmed: false, rngJustArmed: false, rngTimer: null, rngRecovering: false };
   $('monitor-baud').textContent = fmtCfg(monitor.cfg);
+  setMonTitle(null);   // new session: no hostname until the device logs one
 
   // Forward keystrokes to the current writer. The device's serial line stays in
   // log mode until it receives input, then switches to the interactive CLI.
@@ -516,6 +527,7 @@ function handleNetLine(m, line) {
   if (mm) {
     m.hostname = mm[1];
     deviceUiHost = mm[1];
+    if (m === monitor) setMonTitle(mm[1]);
     if (!$('info-overlay').hidden)
       showInfo(`Device connected to ${deviceUiSsid || 'WiFi'}`, deviceInfoHtml());
     return;
@@ -530,6 +542,7 @@ function handleNetLine(m, line) {
     m.connectedSeen = true;
     if (mm[4]) {
       m.hostname = mm[4];            // device reported its actual hostname
+      if (m === monitor) setMonTitle(mm[4]);
     } else if (!m.hostnameQueried) {
       m.hostnameQueried = true;      // firmware didn't log it — query it directly
       sendToDevice(m, 'show s.net.hostname\n\n');
@@ -1285,9 +1298,7 @@ async function boot() {
     if (monitor) refreshFlashOffer();
   }, 60000);
 
-  const name = `${PROJECT} Flasher / Monitor`;
-  document.title = name;
-  $('title').textContent = name;
+  setMonTitle(null);
   $('monitor-baud').textContent = fmtCfg(DEFAULT_CFG);
   $('ch-hostname').value = HOSTNAME_DEFAULT;
   initCfgControls();
