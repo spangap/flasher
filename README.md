@@ -30,6 +30,7 @@ flashmon/                     ← this repo
     Makefile                  ← `make` builds + stages ../flashmon/detect/…
     main/detect.c, …
   docs/detect.md              ← how each peripheral is identified (NOT served)
+  docs/fnb58.md               ← how the FNB58 current graph works (NOT served)
 ```
 
 Serve the **`flashmon/`** subdirectory (the web root) from anywhere static —
@@ -87,6 +88,17 @@ it:
   data bits, parity, and stop bits; the port re-opens with the new settings and
   the terminal buffer is kept. Defaults to 115200 N 8 1 (`?monitor_baud=<n>`
   sets the initial baud).
+- **FNB58 current graph** (bottom-right, above the line settings) — if you have a
+  FNIRSI FNB58/FNB48 USB power meter inline on the device's power, click to graph
+  its current draw live across the top of the monitor. It rides **WebHID**
+  alongside the serial monitor in the same tab. A row of pills picks the visible
+  span (10s / 30s / 1m / 3m / 5m); left unpinned it auto-tracks the smallest span
+  that holds all captured samples, starting at 10s. The graph averages and
+  interpolates one column per screen pixel (not per sample) so a shared-pixel
+  spike doesn't read too high and scrolling doesn't shimmer; the left box shows
+  the running average and clears the buffer (back to auto) on click. See
+  [`docs/fnb58.md`](docs/fnb58.md) for the HID protocol and rendering. Browser
+  only — `flashmon.py` has no equivalent.
 
 A fresh device (no admin password, or falling back to its own AP) is walked
 through a one-time setup: a password dialog, then a WiFi-connect dialog, sent to
@@ -202,4 +214,6 @@ To update, re-fetch the pinned files and bump `VERSIONS.txt`.
 ## Browser support
 
 Web Serial is Chromium-only (Chrome, Edge, Opera, Brave) on desktop. Firefox and
-Safari don't support it.
+Safari don't support it. The FNB58 current graph needs **WebHID**, same
+Chromium-only story; where it's missing the feature just stays off and the rest
+of the monitor works.

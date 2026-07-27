@@ -61,9 +61,53 @@
     50.01%,100%{background:#fff;color:#ff1f1f;border-color:#ff1f1f}
   }
 
-  #monitor-baud{position:absolute;bottom:.5rem;right:.9rem;z-index:21;font:inherit;font-size:.72rem;
+  /* Sits clear of the terminal's right-hand scrollbar (~.9rem was under it). */
+  #monitor-baud{position:absolute;bottom:.5rem;right:1.6rem;z-index:21;font:inherit;font-size:.72rem;
        color:var(--muted);background:transparent;border:0;padding:.1rem .2rem;cursor:pointer}
   #monitor-baud:hover{color:var(--fg)}
+  /* One line above the baud button, same right edge. Green while streaming. */
+  #monitor-fnb58{position:absolute;bottom:2.5rem;right:1.6rem;z-index:21;font:inherit;font-size:.72rem;
+       color:var(--muted);background:transparent;border:0;padding:.1rem .2rem;cursor:pointer}
+  #monitor-fnb58:hover{color:var(--fg)}
+  #monitor-fnb58.on{color:var(--accent);font-weight:700}
+
+  /* Live current graph, pinned across the top; the monitor's terminal and action
+   * row slide down to clear it while it's open (see .fnb58-open below). */
+  #fnb58-panel{position:fixed;top:0;left:0;right:0;height:150px;z-index:25;background:#0d1117;
+       border-bottom:1px solid var(--line);display:flex;align-items:stretch}
+  #fnb58-panel[hidden]{display:none}
+  #fnb58-avg{flex:0 0 120px;display:flex;flex-direction:column;align-items:center;justify-content:center;
+       gap:.15rem;border-right:1px solid var(--line);cursor:pointer;user-select:none;text-align:center}
+  #fnb58-avg:hover{background:var(--panel)}
+  #fnb58-avg-val{font:600 1.3rem ui-monospace,SFMono-Regular,monospace;color:var(--accent)}
+  #fnb58-avg-lbl{font-size:.62rem;color:var(--muted);letter-spacing:.04em}
+  #fnb58-avg-win{font-size:.62rem;color:var(--muted);letter-spacing:.04em}
+  #fnb58-main{flex:1;min-width:0;display:flex;flex-direction:column}
+  /* Window-span pills, above the graph. */
+  #fnb58-controls{display:flex;gap:.3rem;align-items:center;padding:.25rem .45rem;
+       border-bottom:1px solid var(--line)}
+  .fnb58-pill{font:600 .66rem ui-monospace,SFMono-Regular,monospace;color:var(--muted);
+       background:transparent;border:1px solid var(--line);border-radius:999px;padding:.05rem .5rem;
+       cursor:pointer;user-select:none;letter-spacing:.02em}
+  .fnb58-pill:hover{color:var(--fg);border-color:var(--muted)}
+  .fnb58-pill.on{color:#fff;background:var(--accent);border-color:var(--accent)}
+  /* Auto-picked (not user-pinned): highlighted, but dashed to signal it will move. */
+  .fnb58-pill.auto{color:var(--accent);background:transparent;border-color:var(--accent);border-style:dashed}
+  #fnb58-graph{position:relative;flex:1;min-width:0}
+  #fnb58-canvas{position:absolute;inset:0;width:100%;height:100%}
+  /* Live current, pinned to the right of the top bar (margin-left absorbs the gap). */
+  #fnb58-now{margin-left:auto;font:600 .74rem ui-monospace,SFMono-Regular,monospace;color:var(--fg)}
+  /* Peak marker: black-on-white pill placed against the tallest column, like the
+   * web UI's traffic-graph peak label (positioned imperatively per frame). */
+  #fnb58-peak{position:absolute;top:2px;left:0;padding:0 4px;border-radius:3px;background:#fff;color:#000;
+       font:10px/1.4 ui-monospace,SFMono-Regular,'Menlo',monospace;white-space:nowrap;pointer-events:none}
+  #fnb58-peak[hidden]{display:none}
+  /* Time-axis labels under the graph, spread left→right (oldest→now). */
+  #fnb58-times{display:flex;justify-content:space-between;padding:.1rem .45rem .2rem;
+       border-top:1px solid var(--line)}
+  #fnb58-times span{font:.6rem ui-monospace,SFMono-Regular,monospace;color:var(--muted)}
+  #monitor.fnb58-open #monitor-term{top:158px}
+  #monitor.fnb58-open #monitor-actions{top:calc(150px + .7rem)}
 
   /* Invisible catch-all: a click anywhere off the settings box dismisses it. */
   #cfg-overlay{position:fixed;inset:0;z-index:22;background:transparent}
@@ -131,6 +175,7 @@
       <button id="open-ui" type="button" hidden>Open Device UI</button>
       <button id="monitor-reset" type="button">Reset</button>
     </div>
+    <button id="monitor-fnb58" type="button">FNB58</button>
     <button id="monitor-baud" type="button">115200 N 8 1</button>
     <div id="cfg-overlay" hidden></div>
     <div id="serial-cfg" hidden>
@@ -150,6 +195,39 @@
       <label for="cfg-stop">Stop</label>
       <select id="cfg-stop"><option selected>1</option><option>2</option></select>
       <button id="cfg-apply" type="button">Apply</button>
+    </div>
+
+    <!-- Live current graph (WebHID); hidden until an FNB58 is connected. -->
+    <div id="fnb58-panel" hidden>
+      <div id="fnb58-avg" title="Average current over the whole buffer. Click to clear the buffer and restart.">
+        <div id="fnb58-avg-val">— mA</div>
+        <div id="fnb58-avg-lbl">avg. current</div>
+        <div id="fnb58-avg-win">last — s</div>
+      </div>
+      <div id="fnb58-main">
+        <!-- Top bar: window pills (click to pin a span; else auto-picks the
+             smallest that holds every sample — populated by flashmon.js) on the
+             left, live current readout on the right. -->
+        <div id="fnb58-controls"><div id="fnb58-now">—</div></div>
+        <div id="fnb58-graph">
+          <canvas id="fnb58-canvas"></canvas>
+          <div id="fnb58-peak" hidden></div>
+        </div>
+        <!-- Time-axis labels under the graph; filled per frame. -->
+        <div id="fnb58-times"></div>
+      </div>
+    </div>
+
+    <!-- FNB58 opt-in: offered from the FNB58 button in the monitor. -->
+    <div id="fnb58-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>FNB58 power meter</h2>
+        <p class="sub">If you have a FNIRSI FNB58 USB power meter, you can hook it up to graph the device's current draw live while you monitor it.</p>
+        <div class="row">
+          <button id="fnb58-cancel" class="btn-ghost" type="button">Cancel</button>
+          <button id="fnb58-setup" class="btn-primary" type="button">Set up FNB58</button>
+        </div>
+      </div>
     </div>
 
     <!-- Device password: shown when the device reports it has no admin password. -->

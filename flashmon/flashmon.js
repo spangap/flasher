@@ -341,6 +341,7 @@ async function openMonitor(port, doReset, banner) {
   });
 
   await attachStreams(monitor);
+  rememberPort(port);   // the port opened — remember it so next load's Start skips the chooser
 
   if (banner && banner.length) {
     for (const line of banner) term.writeln(`\x1b[36m${line}\x1b[0m`);
@@ -407,6 +408,357 @@ $('monitor-baud').addEventListener('click', () => {
 });
 $('cfg-overlay').addEventListener('click', closeCfg);
 $('cfg-apply').addEventListener('click', applyCfg);
+
+// ── FNB58 USB power meter (WebHID) ──────────────────────────────────────────
+// A FNIRSI FNB58/FNB48 is a USB-HID device (not a serial port), so it rides
+// WebHID alongside the device's Web Serial monitor in this same tab. We open it,
+// kick the vendor stream with three 64-byte 0xaa commands, and each 64-byte
+// input report carries four 15-byte samples (voltage u32 LE, current u32 LE,
+// /100000 → volts/amps). At ~100 samples/s we ring-buffer each reading with its
+// arrival timestamp (up to 5 minutes) and paint a scrolling bar graph across the
+// top of the monitor.
+const FNB58_MAX_SEC = 300;                     // keep at most 5 minutes of samples
+const FNB58_CAP = 100 * FNB58_MAX_SEC;         // ring size at the nominal ~100 Hz
+const FNB58_WINDOWS = [10, 30, 60, 180, 300];  // selectable display spans (seconds)
+const FNB58_FILTERS = [{ vendorId: 0x2e3c }, { vendorId: 0x0483 }];
+const isFnb58 = (d) => FNB58_FILTERS.some((f) => f.vendorId === d.vendorId);
+// Per-column band shades, bottom→top: the sustained floor (0→min) brightest, then
+// the spread up to the mean, then the peak (avg→max) darkest; above max is the
+// panel background, drawn per column so each frame overdraws the last (no clear).
+const FNB_MIN_COL = '#56d364';   // 0 → min
+const FNB_AVG_COL = '#2ea043';   // min → avg
+const FNB_MAX_COL = '#166b2c';   // avg → max
+const FNB_BG_COL  = '#0d1117';   // max → top (matches #fnb58-panel background)
+
+// ma/ts: parallel rings of current (mA) and arrival time (ms, performance.now).
+// wpos/len: ring write head + fill. winSel: index into FNB58_WINDOWS when the
+// user has pinned a span, else null (auto: smallest window that holds every
+// sample). shownWin: the span the pills currently reflect, so we only touch the
+// DOM when it changes.
+const fnb = { device: null, refreshTimer: null, raf: 0,
+  ma: new Float32Array(FNB58_CAP), ts: new Float64Array(FNB58_CAP),
+  wpos: 0, len: 0, winSel: null, shownWin: -1, shownAuto: false };
+
+// A vendor command is 64 bytes: 0xaa, type byte, 61 zeros, trailing checksum.
+function fnbCmd(type, csum) { const p = new Uint8Array(64); p[0] = 0xaa; p[1] = type; p[63] = csum; return p; }
+
+function fnbPush(mA, t) {
+  fnb.ma[fnb.wpos] = mA;
+  fnb.ts[fnb.wpos] = t;
+  fnb.wpos = (fnb.wpos + 1) % FNB58_CAP;
+  if (fnb.len < FNB58_CAP) fnb.len++;
+}
+// Empty the buffer and hand the window back to auto (→ smallest span, 10 s).
+function fnbClear() { fnb.wpos = 0; fnb.len = 0; fnb.winSel = null; }
+// Ring index of the k-th oldest stored sample (k = 0 → oldest, len-1 → newest).
+function fnbIdx(k) { return (fnb.wpos - fnb.len + k + FNB58_CAP * 2) % FNB58_CAP; }
+// Timestamp span of the buffer in seconds (0 with fewer than two samples).
+function fnbSpanSec() {
+  if (fnb.len < 2) return 0;
+  return (fnb.ts[fnbIdx(fnb.len - 1)] - fnb.ts[fnbIdx(0)]) / 1000;
+}
+// Active display span: the pinned window, or the smallest that holds the buffer.
+function fnbWindowSec() {
+  if (fnb.winSel != null) return FNB58_WINDOWS[fnb.winSel];
+  const span = fnbSpanSec();
+  return FNB58_WINDOWS.find((w) => span <= w) || FNB58_WINDOWS[FNB58_WINDOWS.length - 1];
+}
+
+// Place the peak pill against its column (frac = 0..1 across the graph), to the
+// right of it, flipping left only when it would overflow — mirrors the web UI.
+function placeFnbPeak(frac) {
+  const el = $('fnb58-peak');
+  const gw = el.parentElement.clientWidth;
+  const peakX = frac * gw, gap = 3;
+  if (peakX + gap + el.offsetWidth <= gw) { el.style.left = `${peakX + gap}px`; el.style.right = 'auto'; }
+  else { el.style.right = `${Math.max(0, gw - peakX + gap)}px`; el.style.left = 'auto'; }
+}
+
+function onFnb58Report(e) {
+  const d = e.data;                            // DataView, report id stripped
+  if (d.byteLength < 62 || d.getUint8(0) !== 0xaa || d.getUint8(1) !== 0x04) return;
+  // One arrival stamp for the report; the four readings within it fall in the
+  // same ~10 ms and get resolved by the per-pixel averaging at draw time.
+  const t = performance.now();
+  for (let i = 0; i < 4; i++) {
+    const o = 2 + i * 15;
+    fnbPush(d.getUint32(o + 4, true) / 100, t); // raw/100000 A → mA
+  }
+}
+
+// Short pill label for a window span: "10s", "30s", "1m", "3m", "5m".
+function fnbFmtWin(sec) { return sec < 60 ? `${sec}s` : `${sec / 60}m`; }
+
+// Build the window pills once, when the meter opens. Clicking a pill pins that
+// span; clicking the pinned one again hands the window back to auto.
+function fnbBuildPills() {
+  const row = $('fnb58-controls');
+  const now = $('fnb58-now');                   // live readout lives in this bar; keep it
+  row.querySelectorAll('.fnb58-pill').forEach((b) => b.remove());
+  FNB58_WINDOWS.forEach((sec, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'fnb58-pill';
+    b.textContent = fnbFmtWin(sec);
+    b.dataset.i = i;
+    b.addEventListener('click', () => {
+      fnb.winSel = (fnb.winSel === i) ? null : i;
+      fnb.shownWin = -1;                        // force fnbSyncPills to repaint
+    });
+    row.insertBefore(b, now);                   // pills left, the now readout stays right
+  });
+  fnb.shownWin = -1;
+}
+
+// Reflect the active span on the pills: the current window is highlighted —
+// solid when pinned, dashed while auto-tracking the buffer (the dashed border is
+// the only "auto" signal we need; no separate tag).
+function fnbSyncPills(winSec) {
+  const auto = fnb.winSel == null;
+  if (fnb.shownWin === winSec && fnb.shownAuto === auto) return;
+  fnb.shownWin = winSec; fnb.shownAuto = auto;
+  const row = $('fnb58-controls');
+  row.querySelectorAll('.fnb58-pill').forEach((b) => {
+    const active = FNB58_WINDOWS[+b.dataset.i] === winSec;
+    b.classList.toggle('on', active && !auto);
+    b.classList.toggle('auto', active && auto);
+  });
+}
+
+// Relative time label for the axis: "now", "−45s", or "−3:20" past a minute.
+function fnbFmtAgo(sec) {
+  if (sec <= 0.5) return 'now';
+  if (sec < 60) return `−${Math.round(sec)}s`;
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return s ? `−${m}:${String(s).padStart(2, '0')}` : `−${m}:00`;
+}
+
+// Paint the axis labels under the graph: a handful of evenly spaced marks from
+// the window's left edge (oldest) to "now" at the right.
+function fnbRenderTimes(winSec) {
+  const row = $('fnb58-times');
+  const n = 5;
+  if (row.childElementCount !== n) {
+    row.textContent = '';
+    for (let i = 0; i < n; i++) row.appendChild(document.createElement('span'));
+  }
+  for (let i = 0; i < n; i++)
+    row.children[i].textContent = fnbFmtAgo(winSec * (1 - i / (n - 1)));
+}
+
+function fnbRender() {
+  const cv = $('fnb58-canvas');
+  const wrap = cv.parentElement;
+  const dpr = window.devicePixelRatio || 1;
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // No clearRect: the draw loop paints every column full-height (bands + the
+  // background remainder above max), so each frame fully overdraws the previous
+  // one. Clearing first is what let the graph flash to blank between frames.
+
+  const winSec = fnbWindowSec();
+  fnbSyncPills(winSec);
+  fnbRenderTimes(winSec);
+
+  // One column per pixel. The right edge is the newest sample's time; each
+  // column averages every reading whose timestamp lands in its dt-wide slice.
+  // Averaging (not max) keeps a single spike from inflating a whole pixel, and
+  // anchoring by time — not sample index — is what stops the scroll shimmering.
+  const cols = Math.max(1, Math.floor(w));
+  const dt = (winSec * 1000) / cols;           // ms of history per pixel column
+  const tEnd = fnb.len ? fnb.ts[fnbIdx(fnb.len - 1)] : 0;
+  // Bin on an ABSOLUTE dt grid (floor(t/dt)), not relative to the moving newest
+  // sample: a reading then keeps its column until real time crosses a whole dt,
+  // so the graph steps exactly one pixel at a time. Relative binning re-slices
+  // every frame — a stationary peak shimmers between adjacent columns, and that
+  // sub-pixel jitter is what makes equal peaks trade the label.
+  const lastBin = Math.floor(tEnd / dt);
+  const firstBin = lastBin - cols + 1;
+  const sum = new Float64Array(cols);
+  const cnt = new Uint32Array(cols);
+  const mn = new Float64Array(cols).fill(Infinity);
+  const mx = new Float64Array(cols).fill(-Infinity);
+  let avgSum = 0;
+  for (let k = 0; k < fnb.len; k++) {
+    const r = fnbIdx(k);
+    const v = fnb.ma[r];
+    avgSum += v;                                // avg spans the whole buffer
+    const col = Math.floor(fnb.ts[r] / dt) - firstBin;
+    if (col < 0 || col >= cols) continue;
+    sum[col] += v; cnt[col]++;
+    if (v < mn[col]) mn[col] = v;
+    if (v > mx[col]) mx[col] = v;
+  }
+
+  // Per column: min / avg / max, or NaN where no sample landed. Interior gaps get
+  // all three linearly interpolated from their nearest filled neighbours; runs
+  // with no data (left of the oldest sample, or a stall) stay NaN → drawn as
+  // background, so the graph still fills from the right.
+  const aMin = new Float64Array(cols);
+  const aAvg = new Float64Array(cols);
+  const aMax = new Float64Array(cols);
+  let prev = -1;
+  for (let c = 0; c < cols; c++) {
+    if (cnt[c]) {
+      aMin[c] = mn[c]; aAvg[c] = sum[c] / cnt[c]; aMax[c] = mx[c];
+      if (prev >= 0 && c - prev > 1) {
+        const span = c - prev;
+        for (let j = prev + 1; j < c; j++) {
+          const f = (j - prev) / span;
+          aMin[j] = aMin[prev] + (aMin[c] - aMin[prev]) * f;
+          aAvg[j] = aAvg[prev] + (aAvg[c] - aAvg[prev]) * f;
+          aMax[j] = aMax[prev] + (aMax[c] - aMax[prev]) * f;
+        }
+      }
+      prev = c;
+    } else {
+      aMin[c] = aAvg[c] = aMax[c] = NaN;
+    }
+  }
+
+  // Peak label tracks the drawn MAX, so the pill always lands on a bar that
+  // actually reaches it. Column = most-recent one whose max rounds to the peak
+  // integer — a stable tie-break so equal-height peaks don't trade the pill (and
+  // three don't cycle): the shown mA decides, not a hair of sub-mA jitter.
+  let peak = 0;
+  for (let c = 0; c < cols; c++)
+    if (!Number.isNaN(aMax[c]) && aMax[c] > peak) peak = aMax[c];
+  const niceMax = Math.max(10, Math.ceil(peak / 10) * 10);
+  const peakR = Math.round(peak);
+  let peakCol = -1;
+  for (let c = 0; c < cols; c++)
+    if (!Number.isNaN(aMax[c]) && aMax[c] > 0 && Math.round(aMax[c]) === peakR) peakCol = c;
+
+  // Draw each column full-height: background remainder on top, then the three
+  // stacked bands (avg→max darkest, min→avg, 0→min brightest). Painting every
+  // column — including empty ones as solid background — fully overdraws the frame.
+  const scale = (h - 2) / niceMax;               // px per mA (2px headroom at the top)
+  for (let c = 0; c < cols; c++) {
+    if (Number.isNaN(aAvg[c])) {                 // no data here → all background
+      ctx.fillStyle = FNB_BG_COL; ctx.fillRect(c, 0, 1, h);
+      continue;
+    }
+    const yMax = h - Math.max(0, aMax[c]) * scale;
+    const yAvg = h - Math.max(0, aAvg[c]) * scale;
+    const yMin = h - Math.max(0, aMin[c]) * scale;
+    ctx.fillStyle = FNB_BG_COL;  ctx.fillRect(c, 0,    1, yMax);         // max → top
+    ctx.fillStyle = FNB_MAX_COL; ctx.fillRect(c, yMax, 1, yAvg - yMax);  // avg → max
+    ctx.fillStyle = FNB_AVG_COL; ctx.fillRect(c, yAvg, 1, yMin - yAvg);  // min → avg
+    ctx.fillStyle = FNB_MIN_COL; ctx.fillRect(c, yMin, 1, h - yMin);     // 0 → min
+  }
+
+  const pill = $('fnb58-peak');
+  if (peakCol >= 0) {
+    pill.textContent = peak.toFixed(0) + ' mA';
+    pill.hidden = false;
+    placeFnbPeak((peakCol + 0.5) / cols);
+  } else {
+    pill.hidden = true;
+  }
+
+  const now = fnb.len ? fnb.ma[fnbIdx(fnb.len - 1)] : null;
+  $('fnb58-now').textContent = now != null ? now.toFixed(0) + ' mA' : '—';
+  const avg = fnb.len ? avgSum / fnb.len : null;
+  const sec = fnbSpanSec();
+  $('fnb58-avg-val').textContent = avg != null ? avg.toFixed(0) + ' mA' : '— mA';
+  $('fnb58-avg-win').textContent = avg != null ? `last ${Math.round(sec)} s` : 'last — s';
+}
+
+function fnbLoop() {
+  if ($('fnb58-panel').hidden) return;
+  fnbRender();
+  fnb.raf = requestAnimationFrame(fnbLoop);
+}
+
+async function startFnb58(device) {
+  try { if (!device.opened) await device.open(); }
+  catch (e) { showInfo('FNB58', `<p>Could not open the meter: ${e && e.message ? e.message : e}</p>`); return; }
+  fnb.device = device;
+  fnbClear();
+  fnbBuildPills();
+  device.addEventListener('inputreport', onFnb58Report);
+  try {                                        // kick the stream (some units auto-stream)
+    await device.sendReport(0, fnbCmd(0x81, 0x8e));
+    await device.sendReport(0, fnbCmd(0x82, 0x96));
+    await device.sendReport(0, fnbCmd(0x82, 0x96));
+  } catch (_) { /* keep going; the refresh below may still start it */ }
+  clearInterval(fnb.refreshTimer);
+  fnb.refreshTimer = setInterval(() => {
+    if (fnb.device) fnb.device.sendReport(0, fnbCmd(0x83, 0x9e)).catch(() => {});
+  }, 1000);
+  $('fnb58-panel').hidden = false;
+  $('monitor').classList.add('fnb58-open');    // slide the terminal + actions clear
+  $('monitor-fnb58').classList.add('on');
+  cancelAnimationFrame(fnb.raf);
+  fnbLoop();
+}
+
+async function stopFnb58() {
+  clearInterval(fnb.refreshTimer); fnb.refreshTimer = null;
+  cancelAnimationFrame(fnb.raf); fnb.raf = 0;
+  if (fnb.device) {
+    try { fnb.device.removeEventListener('inputreport', onFnb58Report); } catch (_) {}
+    try { await fnb.device.close(); } catch (_) {}
+  }
+  fnb.device = null;
+  $('fnb58-panel').hidden = true;
+  $('monitor').classList.remove('fnb58-open');
+  $('monitor-fnb58').classList.remove('on');
+}
+
+async function setupFnb58() {
+  if (!('hid' in navigator)) {
+    showInfo('FNB58', '<p>This browser has no WebHID support. Use Chrome or Edge, served over HTTPS (or localhost).</p>');
+    return;
+  }
+  let device = null;
+  try {
+    // Explicit setup always opens the chooser. A WebHID grant persists per-origin,
+    // so reusing getDevices() here would short-circuit the picker after the first
+    // grant — and these meters have no stable serial (see below), so the persisted
+    // device can be stale. requestDevice still lists an already-granted meter, and
+    // needs this click's user gesture — so it's the first await, no getDevices()
+    // ahead of it to spend the activation.
+    device = (await navigator.hid.requestDevice({ filters: FNB58_FILTERS })).filter(isFnb58)[0];
+  } catch (_) { return; }                       // chooser dismissed
+  if (device) await startFnb58(device);
+}
+
+// Silent reconnect on page load: a prior grant persists per-origin, so reopen a
+// meter that's actually present without prompting. These units expose no stable
+// serial and can leave stale grants behind, so we open() each granted meter and
+// stream the first that accepts it; the rest are absent. No user gesture needed
+// (getDevices/open don't require one), and no popup on failure — if none open we
+// just leave the FNB58 button idle for a manual Set up.
+async function reconnectFnb58() {
+  if (!('hid' in navigator) || fnb.device) return;
+  let devices = [];
+  try { devices = (await navigator.hid.getDevices()).filter(isFnb58); } catch (_) { return; }
+  for (const d of devices) {
+    try {
+      if (!d.opened) await d.open();
+    } catch (_) { continue; }                    // absent/stale grant — try the next
+    await startFnb58(d);                          // sees it already open, just streams
+    return;
+  }
+}
+
+// The button toggles: opt-in dialog when idle, disconnect when streaming.
+$('monitor-fnb58').addEventListener('click', () => {
+  if (fnb.device) { stopFnb58(); return; }
+  $('fnb58-overlay').hidden = false;
+});
+$('fnb58-cancel').addEventListener('click', () => { $('fnb58-overlay').hidden = true; });
+$('fnb58-setup').addEventListener('click', () => { $('fnb58-overlay').hidden = true; setupFnb58(); });
+// Clear the buffer and restart: the average empties and the window auto-tracks
+// from scratch (back to the smallest span).
+$('fnb58-avg').addEventListener('click', () => { fnbClear(); });
+if ('hid' in navigator)
+  navigator.hid.addEventListener('disconnect', (e) => { if (e.device === fnb.device) stopFnb58(); });
 
 // ── WiFi connect helper ─────────────────────────────────────────────────────
 // The device logs its WiFi progress over serial. We tail that log to:
@@ -1008,6 +1360,18 @@ async function flash(port, zipURL) {
   fileArray.sort((a, b) => a.address - b.address);
   log(`Unpacked ${fileArray.length} image(s).`);
 
+  // esptool-js reports progress per image (written/total reset to 0 at each new
+  // image), so a naive bar restarts every blob. Fold every image onto one bar:
+  // weight each image by its byte size (offsets from the sorted array give the
+  // running base) so the fill tracks total bytes written and advances roughly
+  // linearly — the app image dominates the sum, which is where the time goes.
+  const imageBase = [];
+  let flashTotalBytes = 0;
+  for (const img of fileArray) {
+    imageBase.push(flashTotalBytes);
+    flashTotalBytes += img.data.length;
+  }
+
   const transport = new Transport(port, true);
   try {
     // Record the chip info (also shown in the flash log via the tee) so the same
@@ -1018,6 +1382,7 @@ async function flash(port, zipURL) {
     const bannerLines = chipInfoLines(cap.lines);   // chip facts, no stub/baud noise
 
     bar.style.display = 'block';
+    barfill.style.width = '0';
     await esploader.writeFlash({
       fileArray,
       flashSize: settings.flash_size || 'keep',
@@ -1025,8 +1390,10 @@ async function flash(port, zipURL) {
       flashFreq: settings.flash_freq || 'keep',
       eraseAll: false,
       compress: true,
-      reportProgress: (_idx, written, total) => {
-        if (total) barfill.style.width = `${Math.round((written / total) * 100)}%`;
+      reportProgress: (idx, written, total) => {
+        const frac = total ? written / total : 0;
+        const done = imageBase[idx] + frac * fileArray[idx].data.length;
+        barfill.style.width = `${Math.round((done / flashTotalBytes) * 100)}%`;
       },
     });
     barfill.style.width = '100%';
@@ -1050,6 +1417,41 @@ function usbInfoLine(port) {
   } catch (_) {
     return null;
   }
+}
+
+// The FNB58 is a composite device: its CDC serial port sits in the Web Serial
+// chooser right next to the real board. Opening it as "the device" just yields a
+// dead monitor (no ESP to probe, no boot log), so recognise it by VID and steer
+// the user to the right port. Its power graph rides WebHID (the FNB58 button),
+// never this serial path. Matches the same VIDs as the HID picker.
+function isFnb58Port(port) {
+  try {
+    const i = port.getInfo ? port.getInfo() : {};
+    return i.usbVendorId != null && FNB58_FILTERS.some((f) => f.vendorId === i.usbVendorId);
+  } catch (_) {
+    return false;
+  }
+}
+
+// Remember the last-used port so next load's Start can reconnect to it without the
+// chooser. Web Serial exposes no path/name/serial — only USB VID/PID — so that's
+// all we can store and match on (same limit as sameDevice()). Two identical boards
+// are indistinguishable.
+const LAST_PORT_KEY = 'flashmon.lastPort';        // LocalSettings: "vid:pid"
+function rememberPort(port) {
+  try {
+    const i = port.getInfo ? port.getInfo() : {};
+    if (i.usbVendorId == null) return;
+    localStorage.setItem(LAST_PORT_KEY, `${i.usbVendorId}:${i.usbProductId}`);
+  } catch (_) { /* storage blocked / no info */ }
+}
+function portMatchesLast(port) {
+  try {
+    const saved = localStorage.getItem(LAST_PORT_KEY);
+    if (!saved) return false;
+    const i = port.getInfo ? port.getInfo() : {};
+    return i.usbVendorId != null && `${i.usbVendorId}:${i.usbProductId}` === saved;
+  } catch (_) { return false; }
 }
 
 // ── build catalogue ───────────────────────────────────────────────────────
@@ -1209,6 +1611,14 @@ async function connect(prePort) {
   $('intro-hint').textContent = 'Opening serial monitor…';
   try {
     const port = prePort || await navigator.serial.requestPort();
+    if (isFnb58Port(port)) {
+      $('intro-hint').innerHTML =
+        '<span class="err">That looks like the FNB58 power meter, not your device. ' +
+        'Pick your device&rsquo;s serial port instead — then use the FNB58 button in ' +
+        'the monitor to graph the meter.</span>';
+      $('start').hidden = false;      // let them re-pick; finally{} clears `connecting`
+      return;
+    }
     // Probe for the chip banner, then RAM-load the peripheral detector (no flash
     // write), capture its findings, and fold them into the banner. A non-ESP
     // device just gets the plain terminal.
@@ -1237,6 +1647,22 @@ async function connect(prePort) {
   } finally {
     connecting = false;
   }
+}
+
+// The last-used port to reuse on the Start click, or null. Resolved once at load
+// (getPorts needs no gesture) and passed to connect() straight from the click, so
+// Start skips the chooser when the device is already present. We do NOT connect on
+// load: connect() probes with a reset, and rebooting the device is the user's
+// call, not a page-reload side effect. Ambiguity (identical twin boards share
+// VID/PID, and Web Serial exposes nothing else) or absence leaves the chooser.
+async function findRememberedPort() {
+  try {
+    const ports = (await navigator.serial.getPorts()).filter((p) => !isFnb58Port(p));
+    if (!ports.length) return null;
+    const matches = ports.filter(portMatchesLast);
+    const cands = matches.length ? matches : ports;
+    return cands.length === 1 ? cands[0] : null;
+  } catch (_) { return null; }
 }
 
 // ── config ────────────────────────────────────────────────────────────────
@@ -1310,15 +1736,20 @@ async function boot() {
     return;
   }
 
-  // The instruction is a button, not prose people won't read. Only the button
-  // starts a connection.
-  $('start').textContent = 'Click here to select the serial port your device is connected to.';
+  // Resolve a reusable port up front (getPorts needs no gesture) so the Start
+  // click can hand it to connect() synchronously and skip the chooser — the click
+  // is still the trigger, so the reset that probing entails is user-initiated, not
+  // a silent page-load reboot. With none remembered, the click falls through to
+  // requestPort() (still synchronous in the handler, so its gesture stays valid).
+  const remembered = await findRememberedPort();
+  $('start').textContent = remembered
+    ? 'Click here to reconnect to your device.'
+    : 'Click here to select the serial port your device is connected to.';
   $('start').hidden = false;
+  $('start').addEventListener('click', () => connect(remembered || undefined));
 
-  // Start only from the button. Web Serial's port chooser needs a user gesture,
-  // and a button click is one; we never silently reuse a previously-authorized
-  // device. (connect() no-ops once connected.)
-  $('start').addEventListener('click', () => connect());
+  // FNB58 (WebHID, no reset) has no such cost, so it does reconnect on its own.
+  reconnectFnb58();
 }
 
 boot();
