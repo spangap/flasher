@@ -121,16 +121,23 @@ function chipInfoLines(lines) {
 // board without the auto-reset wiring). Leaves the chip in the ROM loader; the
 // caller resets it back into the app.
 async function probeChip(port) {
-  const cap = captureTerminal();
-  const transport = new Transport(port, false);
-  try {
-    await gatherChipInfo(new ESPLoader({ transport, baudrate: 460800, terminal: cap }));
-    return chipInfoLines(cap.lines);
-  } catch (_) {
-    return null;
-  } finally {
-    try { await transport.disconnect(); } catch (_) { /* already gone */ }
+  // A freshly (re)opened native-USB port sometimes misses the first ROM sync, so
+  // the probe — and with it the reset + peripheral detection it gates — would be
+  // skipped for a device that's actually there. Retry once before giving up.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const cap = captureTerminal();
+    const transport = new Transport(port, false);
+    try {
+      await gatherChipInfo(new ESPLoader({ transport, baudrate: 460800, terminal: cap }));
+      return chipInfoLines(cap.lines);
+    } catch (_) {
+      /* first miss: settle briefly and try again; second miss: not an ESP */
+    } finally {
+      try { await transport.disconnect(); } catch (_) { /* already gone */ }
+    }
+    if (attempt === 0) await sleep(200);
   }
+  return null;
 }
 
 // ── peripheral detection (RAM-loaded, non-destructive) ──────────────────────
@@ -341,7 +348,6 @@ async function openMonitor(port, doReset, banner) {
   });
 
   await attachStreams(monitor);
-  rememberPort(port);   // the port opened — remember it so next load's Start skips the chooser
 
   if (banner && banner.length) {
     for (const line of banner) term.writeln(`\x1b[36m${line}\x1b[0m`);
@@ -422,6 +428,24 @@ const FNB58_CAP = 100 * FNB58_MAX_SEC;         // ring size at the nominal ~100 
 const FNB58_WINDOWS = [10, 30, 60, 180, 300];  // selectable display spans (seconds)
 const FNB58_FILTERS = [{ vendorId: 0x2e3c }, { vendorId: 0x0483 }];
 const isFnb58 = (d) => FNB58_FILTERS.some((f) => f.vendorId === d.vendorId);
+// These meters have NO stop command and freeze if the connection is closed while
+// their internal FIFO still holds data (a documented FNIRSI quirk) — a frozen meter
+// then crashes the next session, and because the freeze is in the meter's USB stack
+// it survives a Chrome restart and an FNB power-cycle; only a replug (or long wait)
+// clears it. The cure (mirroring baryluk's logger) is to DRAIN before closing: stop
+// the keepalive, keep reading for FNB58_DRAIN_MS so the browser empties the FIFO,
+// then close (fnbTeardown). Backing that up, a shared LocalSettings timestamp marks
+// when the meter was last active (refreshed every 5 s while streaming and stamped
+// again at disconnect) and imposes a short settle cooldown before the label returns;
+// that same stamp keeps two tabs off the meter at once — while one streams it stays
+// fresh, so other tabs stay dark.
+const FNB58_ACTIVE_KEY = 'flashmon.fnb58LastData';  // LocalSettings: epoch ms the meter was last active
+const FNB58_COOLDOWN_MS = 3000;                      // brief settle before the label returns (backup to the drain)
+const FNB58_DATA_WAIT_MS = 1500;                    // how long one open attempt gets to yield valid data
+const FNB58_LOSS_MS = 3000;                          // no data for this long → the stream stalled
+const FNB58_RETRY_MS = 250;                          // pause between clean open retries
+const FNB58_PROBE_MS = 400;                          // listen this long for an already-running stream before init
+const FNB58_DRAIN_MS = 1000;                         // keep reading (keepalive off) before close, to empty the meter's FIFO
 // Per-column band shades, bottom→top: the sustained floor (0→min) brightest, then
 // the spread up to the mean, then the peak (avg→max) darkest; above max is the
 // panel background, drawn per column so each frame overdraws the last (no clear).
@@ -437,7 +461,11 @@ const FNB_BG_COL  = '#0d1117';   // max → top (matches #fnb58-panel background
 // DOM when it changes.
 const fnb = { device: null, refreshTimer: null, raf: 0,
   ma: new Float32Array(FNB58_CAP), ts: new Float64Array(FNB58_CAP),
-  wpos: 0, len: 0, winSel: null, shownWin: -1, shownAuto: false };
+  wpos: 0, len: 0, winSel: null, shownWin: -1, shownAuto: false,
+  // lastData: performance.now() of the newest valid report (0 = none yet). Drives
+  // the stall watchdog and the LocalSettings active stamp. connecting/recovering/
+  // stopping guard the open, auto-recover, and teardown flows so they never overlap.
+  lastData: 0, connecting: false, recovering: false, stopping: false };
 
 // A vendor command is 64 bytes: 0xaa, type byte, 61 zeros, trailing checksum.
 function fnbCmd(type, csum) { const p = new Uint8Array(64); p[0] = 0xaa; p[1] = type; p[63] = csum; return p; }
@@ -480,14 +508,22 @@ function onFnb58Report(e) {
   // One arrival stamp for the report; the four readings within it fall in the
   // same ~10 ms and get resolved by the per-pixel averaging at draw time.
   const t = performance.now();
+  fnb.lastData = t;                              // valid report → the stream is alive
   for (let i = 0; i < 4; i++) {
     const o = 2 + i * 15;
-    fnbPush(d.getUint32(o + 4, true) / 100, t); // raw/100000 A → mA
+    // Current is a u32 in units of 1e-5 A (0.01 mA resolution); keep it as a float
+    // (raw/100 mA), not rounded, so the sub-mA detail survives to the readout.
+    fnbPush(d.getUint32(o + 4, true) / 100, t);
   }
 }
 
 // Short pill label for a window span: "10s", "30s", "1m", "3m", "5m".
 function fnbFmtWin(sec) { return sec < 60 ? `${sec}s` : `${sec / 60}m`; }
+
+// Format a current/average reading in mA. Below 20 mA one decimal shows the
+// sub-mA detail that matters at low draw; at 20 mA and up a whole number reads
+// cleaner and the tenths are noise.
+function fnbFmtMa(v) { return (v < 20 ? v.toFixed(1) : v.toFixed(0)) + ' mA'; }
 
 // Build the window pills once, when the meter opens. Clicking a pill pins that
 // span; clicking the pinned one again hands the window back to auto.
@@ -653,7 +689,7 @@ function fnbRender() {
 
   const pill = $('fnb58-peak');
   if (peakCol >= 0) {
-    pill.textContent = peak.toFixed(0) + ' mA';
+    pill.textContent = fnbFmtMa(peak);
     pill.hidden = false;
     placeFnbPeak((peakCol + 0.5) / cols);
   } else {
@@ -661,10 +697,10 @@ function fnbRender() {
   }
 
   const now = fnb.len ? fnb.ma[fnbIdx(fnb.len - 1)] : null;
-  $('fnb58-now').textContent = now != null ? now.toFixed(0) + ' mA' : '—';
+  $('fnb58-now').textContent = now != null ? fnbFmtMa(now) : '—';
   const avg = fnb.len ? avgSum / fnb.len : null;
   const sec = fnbSpanSec();
-  $('fnb58-avg-val').textContent = avg != null ? avg.toFixed(0) + ' mA' : '— mA';
+  $('fnb58-avg-val').textContent = avg != null ? fnbFmtMa(avg) : '— mA';
   $('fnb58-avg-win').textContent = avg != null ? `last ${Math.round(sec)} s` : 'last — s';
 }
 
@@ -674,86 +710,253 @@ function fnbLoop() {
   fnb.raf = requestAnimationFrame(fnbLoop);
 }
 
-async function startFnb58(device) {
-  try { if (!device.opened) await device.open(); }
-  catch (e) { showInfo('FNB58', `<p>Could not open the meter: ${e && e.message ? e.message : e}</p>`); return; }
+// Stamp "the meter was active just now" into shared LocalSettings. Written every
+// 5 s while streaming and once more at disconnect, so the cooldown always runs a
+// full FNB58_COOLDOWN_MS from the last real activity.
+function fnbMarkActive() { try { localStorage.setItem(FNB58_ACTIVE_KEY, String(Date.now())); } catch (_) {} }
+// How long ago (ms) the meter was last active, per the shared stamp — Infinity if
+// never. Ours or another tab's, it's the same physical meter needing the same idle.
+function fnbActiveAgo() {
+  try {
+    const v = localStorage.getItem(FNB58_ACTIVE_KEY);
+    if (!v) return Infinity;
+    return Date.now() - parseInt(v, 10);
+  } catch (_) { return Infinity; }
+}
+// Still cooling down: the meter was active within FNB58_COOLDOWN_MS, so reopening
+// it now would re-init a not-yet-idle unit and crash it. Blocks the open and hides
+// the label until it clears. (True only when WE aren't the one holding it.)
+function fnbCoolingDown() { return fnbActiveAgo() < FNB58_COOLDOWN_MS; }
+
+// Bind a present meter and start its stream: open a CLEAN handle (close any stale
+// one this tab still holds first, so our open() is never a second connect on top
+// of our own leftover), wire the report handler, arm the 1 Hz keep-alive + stall
+// watchdog, then start the stream ONLY if it isn't already running. Does not decide
+// success — the caller waits for valid data (fnbAwaitData).
+async function fnbBind(device, allowInit) {
+  if (device.opened) { try { await device.close(); } catch (_) {} }   // never stack a second open
+  await device.open();
   fnb.device = device;
+  fnb.lastData = 0;
   fnbClear();
   fnbBuildPills();
   device.addEventListener('inputreport', onFnb58Report);
-  try {                                        // kick the stream (some units auto-stream)
-    await device.sendReport(0, fnbCmd(0x81, 0x8e));
-    await device.sendReport(0, fnbCmd(0x82, 0x96));
-    await device.sendReport(0, fnbCmd(0x82, 0x96));
-  } catch (_) { /* keep going; the refresh below may still start it */ }
   clearInterval(fnb.refreshTimer);
-  fnb.refreshTimer = setInterval(() => {
-    if (fnb.device) fnb.device.sendReport(0, fnbCmd(0x83, 0x9e)).catch(() => {});
-  }, 1000);
+  fnb.refreshTimer = setInterval(fnbTick, 1000);
+  // Closing our USB handle doesn't stop the meter — it keeps streaming on its own —
+  // so a reopened unit is usually already sending data. Re-sending the start
+  // sequence to a live meter is exactly what crashes its firmware. Listen briefly
+  // first; only kick the stream if it stays silent (a fresh/idle meter). The stall
+  // recovery passes allowInit=false: it only re-latches a stream that's still
+  // running, never re-inits (a truly stopped meter must idle out the cooldown first).
+  await sleep(FNB58_PROBE_MS);
+  if (allowInit && !fnb.lastData) {
+    try {                                      // kick the stream (some units auto-stream)
+      await device.sendReport(0, fnbCmd(0x81, 0x8e));
+      await device.sendReport(0, fnbCmd(0x82, 0x96));
+      await device.sendReport(0, fnbCmd(0x82, 0x96));
+    } catch (_) { /* keep going; the keep-alive may still start it */ }
+  }
+}
+
+// 1 Hz while bound: hold the stream open, and if valid data has dried up for
+// FNB58_LOSS_MS the stream stalled — actively recover (close and recycle our own
+// handle once, else disconnect). We never sit on a silently-open, data-less meter.
+function fnbTick() {
+  if (!fnb.device) return;
+  fnb.device.sendReport(0, fnbCmd(0x83, 0x9e)).catch(() => {});
+  if (!fnb.recovering && fnb.lastData && performance.now() - fnb.lastData > FNB58_LOSS_MS)
+    fnbAutoRecover();
+}
+
+// Reveal the graph panel and light the label — called once a bound meter yields data.
+function fnbShowPanel() {
+  fnbMarkActive();
   $('fnb58-panel').hidden = false;
-  $('monitor').classList.add('fnb58-open');    // slide the terminal + actions clear
+  $('monitor').classList.add('fnb58-open');     // slide the terminal + actions clear
   $('monitor-fnb58').classList.add('on');
   cancelAnimationFrame(fnb.raf);
   fnbLoop();
 }
 
-async function stopFnb58() {
+// Detach the meter (streams + timers) without touching the panel, and AWAIT the
+// close so the OS handle is truly released before anything opens it again — an
+// un-awaited close is exactly what lets the next open() land as a second connect.
+async function fnbUnbind() {
   clearInterval(fnb.refreshTimer); fnb.refreshTimer = null;
-  cancelAnimationFrame(fnb.raf); fnb.raf = 0;
-  if (fnb.device) {
-    try { fnb.device.removeEventListener('inputreport', onFnb58Report); } catch (_) {}
-    try { await fnb.device.close(); } catch (_) {}
+  const d = fnb.device;
+  fnb.device = null;                            // clear first so fnbTick stops acting on it
+  fnb.lastData = 0;
+  if (d) {
+    try { d.removeEventListener('inputreport', onFnb58Report); } catch (_) {}
+    try { await d.close(); } catch (_) {}
   }
-  fnb.device = null;
-  $('fnb58-panel').hidden = true;
-  $('monitor').classList.remove('fnb58-open');
-  $('monitor-fnb58').classList.remove('on');
 }
 
-async function setupFnb58() {
+// Close every granted meter handle this tab still holds — belt-and-suspenders
+// before a connect, so no leftover open() from a prior session is live when we
+// open a fresh one. (close() only reaches this tab's own handles.)
+async function fnbCloseGranted() {
+  let devices = [];
+  try { devices = (await navigator.hid.getDevices()).filter(isFnb58); } catch (_) { return; }
+  for (const d of devices) if (d.opened) { try { await d.close(); } catch (_) {} }
+}
+
+// Wait up to FNB58_DATA_WAIT_MS for the just-bound meter to deliver a valid
+// report. A stale or wedged unit opens but never streams, so "opened" is not
+// "working" — actual data is the only proof.
+async function fnbAwaitData(ms) {
+  const deadline = performance.now() + ms;
+  while (performance.now() < deadline) {
+    if (fnb.lastData) return true;
+    await sleep(120);
+  }
+  return !!fnb.lastData;
+}
+
+// Bind a candidate and confirm it streams, up to `tries` clean open→wait→close
+// cycles (each close awaited before the next open — never overlapping handles).
+// `allowInit` (default true) lets a fresh/idle meter be kicked into streaming; the
+// stall recovery passes false to only re-latch an already-running stream. On success
+// reveal the panel; on failure nothing is left open. Returns whether it's now live.
+async function fnbTryDevice(device, tries, allowInit = true) {
+  for (let a = 0; a < tries; a++) {
+    try { await fnbBind(device, allowInit); }
+    catch (_) { await fnbUnbind(); if (a + 1 < tries) await sleep(FNB58_RETRY_MS); continue; }
+    if (await fnbAwaitData(FNB58_DATA_WAIT_MS)) { fnbShowPanel(); return true; }
+    await fnbUnbind();
+    if (a + 1 < tries) await sleep(FNB58_RETRY_MS);
+  }
+  return false;
+}
+
+// Try each already-granted meter; stream the first that yields data (with retries).
+async function fnbTryGranted(tries) {
+  let devices = [];
+  try { devices = (await navigator.hid.getDevices()).filter(isFnb58); } catch (_) { return false; }
+  for (const d of devices) if (await fnbTryDevice(d, tries)) return true;
+  return false;
+}
+
+function fnbShowTrouble() {
+  showInfo('FNB58', '<p>Couldn’t get a reading from the FNB58. These meters can freeze if a ' +
+    'session ends abruptly — the surest fix is to <b>unplug the FNB58 and plug it back in</b>, ' +
+    'then click <b>FNB58</b> again.</p>');
+}
+
+// Connect the meter — only ever from the user clicking the FNB58 label. Opening
+// the panel is always a deliberate act; nothing connects on its own. First honour
+// the cooldown (a recently-active meter isn't idle enough to re-init — that's the
+// crash), then reuse an existing grant silently; if that yields no data it re-asks
+// the HID chooser; if that too yields nothing, it points the user at a power-cycle.
+async function fnbConnect() {
   if (!('hid' in navigator)) {
     showInfo('FNB58', '<p>This browser has no WebHID support. Use Chrome or Edge, served over HTTPS (or localhost).</p>');
     return;
   }
-  let device = null;
-  try {
-    // Explicit setup always opens the chooser. A WebHID grant persists per-origin,
-    // so reusing getDevices() here would short-circuit the picker after the first
-    // grant — and these meters have no stable serial (see below), so the persisted
-    // device can be stale. requestDevice still lists an already-granted meter, and
-    // needs this click's user gesture — so it's the first await, no getDevices()
-    // ahead of it to spend the activation.
-    device = (await navigator.hid.requestDevice({ filters: FNB58_FILTERS })).filter(isFnb58)[0];
-  } catch (_) { return; }                       // chooser dismissed
-  if (device) await startFnb58(device);
-}
-
-// Silent reconnect on page load: a prior grant persists per-origin, so reopen a
-// meter that's actually present without prompting. These units expose no stable
-// serial and can leave stale grants behind, so we open() each granted meter and
-// stream the first that accepts it; the rest are absent. No user gesture needed
-// (getDevices/open don't require one), and no popup on failure — if none open we
-// just leave the FNB58 button idle for a manual Set up.
-async function reconnectFnb58() {
-  if (!('hid' in navigator) || fnb.device) return;
-  let devices = [];
-  try { devices = (await navigator.hid.getDevices()).filter(isFnb58); } catch (_) { return; }
-  for (const d of devices) {
-    try {
-      if (!d.opened) await d.open();
-    } catch (_) { continue; }                    // absent/stale grant — try the next
-    await startFnb58(d);                          // sees it already open, just streams
+  if (fnb.connecting || fnb.recovering || fnb.stopping || fnb.device) return;
+  if (fnbCoolingDown()) {                          // meter not idle yet — reopening now would crash it
+    const wait = Math.ceil((FNB58_COOLDOWN_MS - fnbActiveAgo()) / 1000);
+    showInfo('FNB58', `<p>The FNB58 was just in use and needs a moment to settle — reopening it too soon crashes it. ` +
+      `Give it about <b>${wait}s</b> (the FNB58 button comes back on its own), then click again.</p>`);
     return;
+  }
+  fnb.connecting = true;
+  try {
+    await fnbCloseGranted();                        // drop any stale handle this tab still holds
+    // Grant phase is a SINGLE lean attempt: the common reconnect streams within a
+    // few hundred ms, and staying lean here keeps the click's ~5 s transient
+    // activation alive for the requestDevice() fallback below. The chooser device
+    // then gets the generous retries (no activation clock once it's picked).
+    if (await fnbTryGranted(1)) return;
+    let device = null;
+    try { device = (await navigator.hid.requestDevice({ filters: FNB58_FILTERS })).filter(isFnb58)[0]; }
+    catch (_) { /* chooser dismissed */ }
+    if (device && await fnbTryDevice(device, 3)) return;
+    fnbShowTrouble();
+  } finally {
+    fnb.connecting = false;
   }
 }
 
-// The button toggles: opt-in dialog when idle, disconnect when streaming.
-$('monitor-fnb58').addEventListener('click', () => {
-  if (fnb.device) { stopFnb58(); return; }
-  $('fnb58-overlay').hidden = false;
+// The stream stalled (no valid data for FNB58_LOSS_MS). Actively let go: close our
+// own handle, then try ONE clean recycle to re-latch a still-running stream WITHOUT
+// re-initing (sequential — never an overlapping open, and never a re-init that could
+// crash a meter that has actually stopped). If nothing comes back, disconnect for
+// real; the cooldown then holds reconnect off until the meter has idled.
+async function fnbAutoRecover() {
+  if (fnb.recovering || fnb.connecting || !fnb.device) return;
+  fnb.recovering = true;
+  const device = fnb.device;
+  try {
+    if (monitor) { try { monitor.term.writeln('\x1b[33m-- FNB58 stream stalled; reconnecting… --\x1b[0m'); } catch (_) {} }
+    await fnbUnbind();                             // release our handle before touching it again
+    await sleep(FNB58_RETRY_MS);
+    if (await fnbTryDevice(device, 1, false)) return;   // re-latch a live stream (no re-init)
+    await fnbTeardown();                           // gone quiet → disconnect; cooldown gates the reopen
+    if (monitor) { try { monitor.term.writeln('\x1b[31m-- FNB58 disconnected (no data) --\x1b[0m'); } catch (_) {} }
+  } finally {
+    fnb.recovering = false;
+  }
+}
+
+// Full teardown of the panel + HID session. The FNIRSI meters have no stop command
+// and FREEZE if you close while their internal FIFO is full (a documented quirk),
+// which is what crashes the next session — so first stop the keepalive and keep the
+// device open a moment (FNB58_DRAIN_MS) with reports still being consumed, letting
+// the browser empty that FIFO, THEN close. Hides the button at once and stamps the
+// meter active so a brief cooldown backs up the drain.
+async function fnbTeardown() {
+  cancelAnimationFrame(fnb.raf); fnb.raf = 0;
+  clearInterval(fnb.refreshTimer); fnb.refreshTimer = null;   // stop the keepalive FIRST
+  $('fnb58-panel').hidden = true;
+  $('monitor').classList.remove('fnb58-open');
+  $('monitor-fnb58').classList.remove('on');
+  $('monitor-fnb58').hidden = true;            // hide the button immediately (no 5 s poll lag)
+  if (fnb.device) await sleep(FNB58_DRAIN_MS); // drain: browser keeps reading the endpoint until we close
+  await fnbUnbind();                           // awaited: the handle is fully released on return
+  fnbMarkActive();                             // start the settle cooldown from now
+  fnbPollStatus();                             // reconcile the label state right away
+}
+
+// User/idle disconnect, serialized via fnb.stopping so a fast reconnect click can't
+// race the in-flight close.
+async function stopFnb58() {
+  if (fnb.stopping) return;
+  fnb.stopping = true;
+  try { await fnbTeardown(); } finally { fnb.stopping = false; }
+}
+
+// Every 5 s: while streaming, keep the shared active stamp fresh (holds the label on
+// and keeps other tabs off the meter). Otherwise show the FNB58 label only once the
+// cooldown has elapsed — a recently-active meter can't be reopened without crashing,
+// so hide the button until it's safe. This is the "keep checking every 5 s".
+function fnbPollStatus() {
+  const btn = $('monitor-fnb58');
+  if (fnb.device) {
+    btn.hidden = false;
+    if (fnb.lastData && performance.now() - fnb.lastData < 7000) fnbMarkActive();
+  } else {
+    btn.hidden = fnbCoolingDown();
+  }
+}
+
+// Close the meter when the tab is navigated away or closed: stamp it active (so a
+// reload can't reopen inside the cooldown) and best-effort close the HID session.
+function fnbCleanup() {
+  if (fnb.device) { fnbMarkActive(); try { fnb.device.close(); } catch (_) {} }
+}
+window.addEventListener('pagehide', fnbCleanup);
+window.addEventListener('beforeunload', fnbCleanup);
+
+// The button toggles: connect (grant → chooser) when idle, clean disconnect when
+// streaming. Awaiting stopFnb58 (with its fnb.stopping guard) serializes a fast
+// disconnect→reconnect so the second click can't race the in-flight close.
+$('monitor-fnb58').addEventListener('click', async () => {
+  if (fnb.connecting || fnb.recovering || fnb.stopping) return;
+  if (fnb.device) { await stopFnb58(); return; }
+  fnbConnect();
 });
-$('fnb58-cancel').addEventListener('click', () => { $('fnb58-overlay').hidden = true; });
-$('fnb58-setup').addEventListener('click', () => { $('fnb58-overlay').hidden = true; setupFnb58(); });
 // Clear the buffer and restart: the average empties and the window auto-tracks
 // from scratch (back to the smallest span).
 $('fnb58-avg').addEventListener('click', () => { fnbClear(); });
@@ -1433,27 +1636,6 @@ function isFnb58Port(port) {
   }
 }
 
-// Remember the last-used port so next load's Start can reconnect to it without the
-// chooser. Web Serial exposes no path/name/serial — only USB VID/PID — so that's
-// all we can store and match on (same limit as sameDevice()). Two identical boards
-// are indistinguishable.
-const LAST_PORT_KEY = 'flashmon.lastPort';        // LocalSettings: "vid:pid"
-function rememberPort(port) {
-  try {
-    const i = port.getInfo ? port.getInfo() : {};
-    if (i.usbVendorId == null) return;
-    localStorage.setItem(LAST_PORT_KEY, `${i.usbVendorId}:${i.usbProductId}`);
-  } catch (_) { /* storage blocked / no info */ }
-}
-function portMatchesLast(port) {
-  try {
-    const saved = localStorage.getItem(LAST_PORT_KEY);
-    if (!saved) return false;
-    const i = port.getInfo ? port.getInfo() : {};
-    return i.usbVendorId != null && `${i.usbVendorId}:${i.usbProductId}` === saved;
-  } catch (_) { return false; }
-}
-
 // ── build catalogue ───────────────────────────────────────────────────────
 // The detector's `DETECTED: hw-<board>` line, if any (extras in parentheses are
 // dropped): the hw-<board> token to match against the catalogue.
@@ -1597,10 +1779,10 @@ $('monitor-flash').addEventListener('click', runPendingFlash);
 
 let connecting = false;
 
-// Select a port (or use a pre-authorized one), probe + detect, open the monitor,
-// and offer a flash for the detected board. requestPort() is called first, while
-// the user gesture is fresh, before any long await.
-async function connect(prePort) {
+// Pop the serial chooser, probe + detect, open the monitor, and offer a flash for
+// the detected board. requestPort() is called first, while the user gesture is
+// fresh, before any long await.
+async function connect() {
   if (connecting || monitor) return;
   connecting = true;
   $('start').hidden = true;          // the action is underway — drop the CTA
@@ -1610,7 +1792,7 @@ async function connect(prePort) {
   logEl.hidden = true;
   $('intro-hint').textContent = 'Opening serial monitor…';
   try {
-    const port = prePort || await navigator.serial.requestPort();
+    const port = await navigator.serial.requestPort();
     if (isFnb58Port(port)) {
       $('intro-hint').innerHTML =
         '<span class="err">That looks like the FNB58 power meter, not your device. ' +
@@ -1647,22 +1829,6 @@ async function connect(prePort) {
   } finally {
     connecting = false;
   }
-}
-
-// The last-used port to reuse on the Start click, or null. Resolved once at load
-// (getPorts needs no gesture) and passed to connect() straight from the click, so
-// Start skips the chooser when the device is already present. We do NOT connect on
-// load: connect() probes with a reset, and rebooting the device is the user's
-// call, not a page-reload side effect. Ambiguity (identical twin boards share
-// VID/PID, and Web Serial exposes nothing else) or absence leaves the chooser.
-async function findRememberedPort() {
-  try {
-    const ports = (await navigator.serial.getPorts()).filter((p) => !isFnb58Port(p));
-    if (!ports.length) return null;
-    const matches = ports.filter(portMatchesLast);
-    const cands = matches.length ? matches : ports;
-    return cands.length === 1 ? cands[0] : null;
-  } catch (_) { return null; }
 }
 
 // ── config ────────────────────────────────────────────────────────────────
@@ -1736,20 +1902,21 @@ async function boot() {
     return;
   }
 
-  // Resolve a reusable port up front (getPorts needs no gesture) so the Start
-  // click can hand it to connect() synchronously and skip the chooser — the click
-  // is still the trigger, so the reset that probing entails is user-initiated, not
-  // a silent page-load reboot. With none remembered, the click falls through to
-  // requestPort() (still synchronous in the handler, so its gesture stays valid).
-  const remembered = await findRememberedPort();
-  $('start').textContent = remembered
-    ? 'Click here to reconnect to your device.'
-    : 'Click here to select the serial port your device is connected to.';
+  // Always open the chooser on the Start click. Web Serial exposes only USB
+  // VID/PID, so a remembered grant can't be told apart from a same-model board on
+  // a different port — silently reusing it would land on the wrong device. The
+  // chooser also gives the port a moment to settle, so probe → reset → detect
+  // runs cleanly every time.
+  $('start').textContent = 'Click here to select the serial port your device is connected to.';
   $('start').hidden = false;
-  $('start').addEventListener('click', () => connect(remembered || undefined));
+  $('start').addEventListener('click', () => connect());
 
-  // FNB58 (WebHID, no reset) has no such cost, so it does reconnect on its own.
-  reconnectFnb58();
+  // The FNB58 graph never opens on its own — only the user clicking the FNB58
+  // label connects it. A 5 s poll keeps the shared active stamp fresh while
+  // streaming and the label in step with the settle cooldown (hidden until the
+  // meter has idled long enough to be safely reopened).
+  fnbPollStatus();
+  setInterval(fnbPollStatus, 5000);
 }
 
 boot();

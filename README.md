@@ -96,7 +96,17 @@ it:
   that holds all captured samples, starting at 10s. The graph averages and
   interpolates one column per screen pixel (not per sample) so a shared-pixel
   spike doesn't read too high and scrolling doesn't shimmer; the left box shows
-  the running average and clears the buffer (back to auto) on click. See
+  the running average and clears the buffer (back to auto) on click. Current is
+  kept at the meter's full 0.01 mA resolution; readouts below 20 mA show one
+  decimal. It never grabs the meter on its own — only your click opens the panel,
+  which pops the HID chooser to pick the meter. These units are fragile: they have
+  no stop command and **freeze if the connection is closed while their internal FIFO
+  is full** (a documented FNIRSI quirk), which then crashes the next session — so on
+  disconnect flashmon **drains the FIFO** (keeps reading ~1 s with the keepalive
+  stopped) before closing, backed by a short settle cooldown during which the FNB58
+  button is hidden. One shared LocalSettings timestamp drives that cooldown and also
+  keeps two tabs off the same meter. If a meter does freeze anyway, unplug/replug it.
+  See
   [`docs/fnb58.md`](docs/fnb58.md) for the HID protocol and rendering. Browser
   only — `flashmon.py` has no equivalent.
 
