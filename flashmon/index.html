@@ -287,6 +287,37 @@
     </div>
 
     <!-- Shown when the serial port wedges after RNG init and reopening it didn't help. -->
+    <!-- The device announced it is moving its console to a different USB device.
+         requestPort() needs a user gesture, so the grant is asked for from this
+         dialog's OK rather than straight off the log line. -->
+    <div id="cdcmove-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Console moving to a new port</h2>
+        <div>This device is switching its USB console to a new serial port, and it
+          will appear in the chooser as a new device with <em>two</em> ports. Pick the
+          <strong>first</strong> one — that is the console. The current port stays open
+          until it goes away on its own.</div>
+        <div class="row">
+          <button id="cdcmove-ok" class="btn-primary" type="button">OK</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Shown when a returning port keeps refusing to open: the handle the
+         browser remembered for it is stale, and only a fresh pick from the
+         chooser (which needs a user gesture) replaces it. -->
+    <div id="reconnect-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Reconnect to the device</h2>
+        <div>The device is back, but the browser cannot reopen its serial port from
+          the remembered permission. Re-select the port to continue — the session and
+          its scrollback carry on.</div>
+        <div class="row">
+          <button id="reconnect-pick" class="btn-primary" type="button">Re-select port</button>
+        </div>
+      </div>
+    </div>
+
     <div id="stuck-overlay" class="modal-overlay" hidden>
       <div class="modal">
         <h2>Please reset the device</h2>

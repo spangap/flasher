@@ -30,6 +30,8 @@ flashmon/                     ← this repo
     Makefile                  ← `make` builds + stages ../flashmon/detect/…
     main/detect.c, …
   docs/detect.md              ← how each peripheral is identified (NOT served)
+  docs/serial.md              ← how the monitor session survives the device
+                                re-enumerating or moving its console (NOT served)
   docs/fnb58.md               ← how the FNB58 current graph works (NOT served)
 ```
 
@@ -114,9 +116,26 @@ A fresh device (no admin password, or falling back to its own AP) is walked
 through a one-time setup: a password dialog, then a WiFi-connect dialog, sent to
 the device's CLI in one batch.
 
-If the device is powered off or unplugged, the port's permission is retained:
-the stream notes `-- Serial port gone --`, and when it reappears (matched by USB
-VID/PID) it reconnects automatically with `-- Serial port came back --`.
+### Keeping the session across a vanishing port
+
+The monitor session outlives the port under it. If the device is powered off,
+unplugged, or resets, the port's permission is retained: the stream notes
+`-- <transport> gone --`, a background rescan keeps looking for a granted port
+belonging to the same device (matched by USB vendor/product id, since it comes
+back as a fresh port object), and reconnecting says `-- <transport> came back --`
+into the same scrollback. When every remembered port refuses to open, a
+**Reconnect to the device** dialog asks you to re-pick it from the chooser — the
+browser only opens that chooser on a click — and the session carries on.
+
+The device's CLI can also **move its console** between the USB-Serial-JTAG
+controller and a two-port CDC device (`usb cdc` / `usb jtag`), which is a
+different USB device to the host. flashmon follows the move: it reads the
+announcement in the log, adopts the new port (auditioning both CDC ports to find
+which one is the console), and keeps the old one rendering into the same terminal
+until the device drops it. A **Console moving to a new port** dialog asks for a
+pick only when the new device has no grant yet. See
+[`docs/serial.md`](docs/serial.md) for the full mechanism and the notice
+vocabulary.
 
 ## The terminal flasher — `flashmon.py`
 

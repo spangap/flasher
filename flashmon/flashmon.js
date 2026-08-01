@@ -237,16 +237,103 @@ async function captureDetection(port) {
 // torn down and re-opened, so the terminal buffer survives a reconfigure.
 let monitor = null;
 
+// A port that has just been opened delivers whatever the device buffered while
+// nobody was attached, and that backlog begins wherever the ring happened to
+// wrap — mid-word, or mid-escape-sequence, which is how a raw "[0;90m" ends up
+// on screen. Discard until a line boundary, the way any terminal joining a
+// stream part-way should. Bounded both ways so a device that simply never sends
+// a newline is not silenced.
+function trimToLineStart(m, buf) {
+  const s = m.lineSync;
+  s.bytes += buf.length;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] !== 0x0a && buf[i] !== 0x0d) continue;
+    s.pending = false;
+    let start = i + 1;
+    while (start < buf.length && (buf[start] === 0x0a || buf[start] === 0x0d)) start++;
+    return buf.subarray(start);
+  }
+  if (s.bytes > 4096 || Date.now() - s.since > 2000) { s.pending = false; return buf; }
+  return null;   // still inside the partial line
+}
+
+// Bring a freshly opened port to a known state before anything reaches the
+// terminal. The device buffers output while nobody holds the port, so the first
+// thing a new session would otherwise see is history — starting wherever the
+// ring happened to wrap. A carriage return makes the console speak, which
+// flushes what it was holding; that whole exchange happens muted and is thrown
+// away, and only then does a second return produce the greeting the user sees.
+async function syncConsole(m) {
+  const CR = () => new Uint8Array([0x0d]);
+  const wasMuted = m.muted;
+  m.muted = true;                       // the reader drops everything meanwhile
+  try {
+    await m.writer.write(CR());
+    await sleep(100);
+  } catch (_) { /* port went away mid-handshake */ }
+  // The mute window has already discarded the partial opening line, so the
+  // byte-level trim has nothing left to do and would only eat the greeting.
+  if (m.lineSync) m.lineSync.pending = false;
+  m.muted = wasMuted;
+  if (!wasMuted) { try { await m.writer.write(CR()); } catch (_) { /* gone */ } }
+}
+
+// Ask the console to say where it is. The firmware answers a bare CR with the
+// transport it is running on ("Spangap console on serial jtag" / "… cdc 0"),
+// which is the only thing that confirms the port just opened is the console and
+// not the device's second CDC port. Nothing is muted around it: a port that has
+// just come back may be mid-boot-log, and that is precisely what must survive.
+async function pokeConsole(m) {
+  try { await m.writer.write(new Uint8Array([0x0d])); } catch (_) { /* port went away */ }
+}
+
+// Emit one of flashmon's own "-- … --" notices, with exactly one empty line
+// above and below and never two. Neither can be written literally at each site:
+// the device leaves the cursor wherever its last write ended — mid-prompt, as
+// often as not — so a bare writeln lands on that line, and a blank written
+// unconditionally doubles up whenever notices arrive back to back. So the
+// terminal is asked where the cursor is, and whether a blank is already there.
+function note(target, text) {
+  const t = (target && target.term) || target;
+  if (!t) return;
+  // Finish a partial line first: the device leaves the cursor wherever its last
+  // write ended — mid-prompt, as often as not — and a bare writeln would land
+  // on it, running the notice onto the end of whatever was there.
+  let atLineStart = true;
+  try { atLineStart = t.buffer.active.cursorX === 0; } catch (_) { atLineStart = false; }
+  if (!atLineStart) t.write('\r\n');
+  // One blank above, and none below. The blank below is left to whatever comes
+  // next to provide: the next notice opens with one, and the firmware's own
+  // messages lead with a newline. Writing one here as well is what put two
+  // empty lines above every "Spangap console on serial …".
+  t.writeln('');
+  t.writeln(text);
+}
+
 // Detach the reader/writer and close the port (leaving the terminal intact).
 async function detachStreams(m) {
   if (m.reader) { try { await m.reader.cancel(); } catch (_) { /* gone */ } m.reader = null; }
   if (m.writer) { try { await m.writer.abort(); } catch (_) { /* gone */ } m.writer = null; }
-  try { await m.port.close(); } catch (_) { /* already closed */ }
+  // Only close a port that still has a device behind it. With the device gone
+  // the OS handle is already dead — close() has nothing to release, and on a
+  // vanished port it is one of Web Serial's known hang spots, which would wedge
+  // every caller that awaits this (the detect and flash flows among them).
+  if (m.port.connected !== false) { try { await m.port.close(); } catch (_) { /* already closed */ } }
 }
 
 // Open the port at m.cfg and pump it both ways: bytes → xterm, keystrokes → port.
-async function attachStreams(m) {
+//
+// `sync` runs the opening handshake muted, discarding the first ~100 ms. That is
+// right exactly once — on a port nobody was holding, whose backlog starts
+// wherever the device's ring happened to wrap. It is wrong everywhere else, and
+// not by a margin: the bytes arriving just after a port comes back are as often
+// a boot log, from a device that reset or was power-cycled, as they are stale.
+// Nothing here can tell those apart — same bytes, same position — so a reattach
+// keeps everything and leaves it to the device not to replay its own history.
+async function attachStreams(m, sync = false) {
   await m.port.open(m.cfg);
+  holdPort(m.port);              // it opened — the live object for its identity
+  m.lineSync = sync ? { pending: true, bytes: 0, since: Date.now() } : null;
   m.reader = m.port.readable.getReader();
   m.writer = m.port.writable.getWriter();
 
@@ -260,9 +347,13 @@ async function attachStreams(m) {
         if (value && !m.muted) {
           m.rxSeq++;                 // any byte activity (watched by the stuck watchdog)
           if (!$('stuck-overlay').hidden) $('stuck-overlay').hidden = true;  // device came back
-          m.term.write(value);       // xterm decodes as UTF-8
+          // Activity counts above even while the opening partial line is being
+          // dropped; only what reaches the terminal and the parser is trimmed.
+          const out = m.lineSync && m.lineSync.pending ? trimToLineStart(m, value) : value;
+          if (!out || out.length === 0) continue;
+          m.term.write(out);         // xterm decodes as UTF-8
           m.rngJustArmed = false;
-          feedNetParser(m, value);   // watch the boot log for WiFi state lines
+          feedNetParser(m, out);     // watch the boot log for WiFi state lines
           // If the RNG-stuck watchdog was armed by an EARLIER chunk and more
           // output has now arrived, the device kept going — it wasn't stuck.
           if (m.rngArmed && !m.rngJustArmed) { clearTimeout(m.rngTimer); m.rngArmed = false; }
@@ -274,12 +365,20 @@ async function attachStreams(m) {
       try { reader.releaseLock(); } catch (_) { /* */ }
     }
   })();
+
+  // Either way the console is asked to identify itself; `sync` only decides
+  // whether the exchange runs muted, discarding what the port was holding.
+  if (sync) await syncConsole(m);
+  else      await pokeConsole(m);
 }
 
 async function closeMonitor() {
   if (!monitor) return;
   const m = monitor;
   monitor = null;
+  // A handover's outgoing session renders into the terminal disposed below, so
+  // it cannot outlive it.
+  if (priorSession) { const old = priorSession; priorSession = null; await detachStreams(old); }
   clearTimeout(m.rngTimer);
   clearTimeout(m.versionTimer);
   await detachStreams(m);
@@ -299,6 +398,85 @@ async function resetDevice(port) {
 // Open the fullscreen monitor on a (closed) port. `banner` (an array of chip-info
 // lines, printed first) is followed by a blank line; doReset then resets the chip
 // once the terminal is listening so the boot log that follows is captured.
+// One port's worth of session state. The terminal and its resize observer are
+// passed in rather than owned, so a handover can build a second session that
+// renders into the terminal the first one was already using.
+function makeSession(port, term, resizeObserver, muted) {
+  return { port, term, resizeObserver, cfg: { ...DEFAULT_CFG }, reader: null, writer: null,
+           gone: false, reattaching: false, muted,
+           lineBuf: '', decoder: new TextDecoder(), aps: new Map(), hostname: HOSTNAME_DEFAULT,
+           // Setup coordinator: password dialog → wifi dialog → one batched send.
+           needPasswd: false, passwdResolved: false, newPasswd: null, passwdOpen: false,
+           wifiNeeded: false, wifiResolved: false, wifiCfg: null, wifiOpen: false,
+           connectedSeen: false, setupSent: false, hostnameQueried: false,
+           // Flash offer: the identified board and the running firmware's build
+           // stamp (from its boot log), which gate whether a newer image is offered.
+           // hwDetected records that the board came from a detection run (which
+           // reads the hardware), so the boot log's weaker claim can't overwrite it.
+           // versionSettled goes true once the stamp arrives or the grace expires,
+           // so an up-to-date device never flashes the button on the way there.
+           hw: null, hwDetected: false, deviceVersion: null, versionSettled: false, versionTimer: null,
+           rxSeq: 0, rngArmed: false, rngJustArmed: false, rngTimer: null, rngRecovering: false };
+}
+
+// The port a console handover moved away from. Its streams stay up and keep
+// rendering into the shared terminal until the device drops it, so the last
+// words of the outgoing port are not lost. Never the target of typed input.
+let priorSession = null;
+
+// The composite device the firmware presents while running two CDC ports.
+// Espressif's shared VID; the PID is TinyUSB's class-derived one, 0x4000 with
+// the CDC count in the low bits.
+const CDC_FILTER = { usbVendorId: 0x303A, usbProductId: 0x4002 };
+
+// The USB-Serial-JTAG controller, the device's other console transport.
+const JTAG_ID = { usbVendorId: 0x303A, usbProductId: 0x1001 };
+
+// Name the transport a port belongs to. During a console move two devices are
+// in play and "Serial port gone" leaves the reader guessing which one it means.
+function portLabel(port) {
+  try {
+    const { usbVendorId: vid, usbProductId: pid } = port.getInfo();
+    if (vid === JTAG_ID.usbVendorId && pid === JTAG_ID.usbProductId) return 'JTAG serial port';
+    if (vid === CDC_FILTER.usbVendorId && pid === CDC_FILTER.usbProductId) return 'CDC serial port';
+  } catch (_) { /* info unavailable */ }
+  return 'Serial port';
+}
+
+// Every USB identity this one physical device has enumerated under. A console
+// handover changes it — the USB-Serial-JTAG controller and the TinyUSB
+// composite are different devices to the host — and a reset changes it back, so
+// matching a returning port against the current session alone loses it.
+let knownIds = [];
+
+function noteDeviceId(port) {
+  try {
+    const { usbVendorId: vid, usbProductId: pid } = port.getInfo();
+    if (vid == null || pid == null) return;
+    const add = (v, p2) => {
+      if (!knownIds.some((k) => k.vid === v && k.pid === p2)) knownIds.push({ vid: v, pid: p2 });
+    };
+    add(vid, pid);
+    // The two transports are one device: a console switch swaps between them,
+    // and a reset out of CDC mode comes back as the JTAG controller. Learning
+    // one means the other must be followed too — a session opened straight on
+    // CDC would otherwise refuse the JTAG identity the device reboots into.
+    if (vid === JTAG_ID.usbVendorId && pid === JTAG_ID.usbProductId)
+      add(CDC_FILTER.usbVendorId, CDC_FILTER.usbProductId);
+    if (vid === CDC_FILTER.usbVendorId && pid === CDC_FILTER.usbProductId)
+      add(JTAG_ID.usbVendorId, JTAG_ID.usbProductId);
+  } catch (_) { /* info unavailable */ }
+}
+
+function isKnownDevice(port) {
+  if (!knownIds.length) return true;      // nothing learned yet — accept
+  try {
+    const { usbVendorId: vid, usbProductId: pid } = port.getInfo();
+    if (vid == null || pid == null) return true;
+    return knownIds.some((k) => k.vid === vid && k.pid === pid);
+  } catch (_) { return true; }
+}
+
 async function openMonitor(port, doReset, banner) {
   $('monitor').hidden = false;
 
@@ -324,18 +502,11 @@ async function openMonitor(port, doReset, banner) {
 
   // Drop incoming bytes until the first reset (below); a plain terminal with no
   // reset shows everything from the start.
-  monitor = { port, term, resizeObserver, cfg: { ...DEFAULT_CFG }, reader: null, writer: null, gone: false, reattaching: false, muted: doReset,
-              lineBuf: '', decoder: new TextDecoder(), aps: new Map(), hostname: HOSTNAME_DEFAULT,
-              // Setup coordinator: password dialog → wifi dialog → one batched send.
-              needPasswd: false, passwdResolved: false, newPasswd: null, passwdOpen: false,
-              wifiNeeded: false, wifiResolved: false, wifiCfg: null, wifiOpen: false,
-              connectedSeen: false, setupSent: false, hostnameQueried: false,
-              // Flash offer: the detected board and the running firmware's build
-              // stamp (from its boot log), which gate whether a newer image is offered.
-              // versionSettled goes true once the stamp arrives or the grace expires,
-              // so an up-to-date device never flashes the button on the way there.
-              hw: null, deviceVersion: null, versionSettled: false, versionTimer: null,
-              rxSeq: 0, rngArmed: false, rngJustArmed: false, rngTimer: null, rngRecovering: false };
+  monitor = makeSession(port, term, resizeObserver, doReset);
+  knownIds = [];              // a fresh session: forget the previous device
+  presence.clear();
+  noteDeviceId(port);
+  presence.set(idKey(port), true);
   $('monitor-baud').textContent = fmtCfg(monitor.cfg);
   setMonTitle(null);   // new session: no hostname until the device logs one
 
@@ -347,7 +518,7 @@ async function openMonitor(port, doReset, banner) {
     if (w) w.write(encoder.encode(data)).catch(() => { /* port gone */ });
   });
 
-  await attachStreams(monitor);
+  await attachStreams(monitor, true);   // fresh port: discard the wrapped backlog
 
   if (banner && banner.length) {
     for (const line of banner) term.writeln(`\x1b[36m${line}\x1b[0m`);
@@ -393,14 +564,11 @@ $('monitor-reset').addEventListener('click', async () => {
   resetSetup(monitor);
   // Print the label first — resetDevice holds the line for ~100 ms and the boot
   // log starts streaming during that window, so writing it after would interleave.
-  term.writeln('');
-  term.writeln('\x1b[31m-- Reset pressed --\x1b[0m');
-  term.writeln('');
+  note(term, '\x1b[31m-- Reset pressed --\x1b[0m');
   try {
     await resetDevice(port);
   } catch (e) {
-    term.writeln(`\x1b[31m-- reset failed: ${e && e.message ? e.message : e} --\x1b[0m`);
-    term.writeln('');
+    note(term, `\x1b[31m-- reset failed: ${e && e.message ? e.message : e} --\x1b[0m`);
   }
   term.scrollToBottom();   // snap to the bottom so the boot log scrolls into view
   term.focus();            // so the next Enter goes to the device, not this button
@@ -989,6 +1157,19 @@ function feedNetParser(m, chunk) {
     // sometimes wedges right here (stuck serial port) — arm a watchdog that
     // recovers on 2 s of silence; (2) a boot invalidates the previous session,
     // so drop the "Open Device UI" button and restart the setup flow.
+    // The console is about to move to a different USB device — offer to follow
+    // it. Only from the session that is currently taking input; the outgoing
+    // port of an earlier handover must not raise it again.
+    if (m === monitor && line.includes('USB JTAG serial port going away')) {
+      try { offerConsoleHandover(); } catch (_) { /* keep the monitor alive */ }
+    }
+    // The reverse move. The JTAG port that appears may have no grant in this
+    // session (grants are swept at load), and an ungranted port is invisible —
+    // no connect event, absent from getPorts() — so without this the rescan
+    // spins over an empty candidate list forever and nothing ever asks.
+    if (m === monitor && line.includes('USB CDC ports going away')) {
+      try { offerConsoleReturn(); } catch (_) { /* keep the monitor alive */ }
+    }
     if (line.includes('Disabling RNG early entropy source')) {
       armRngWatchdog(m);
       hideOpenUi();
@@ -1022,7 +1203,7 @@ async function onRngStuck(m) {
   if (monitor !== m || m.gone || m.rngRecovering) return;
   m.rngArmed = false;
   m.rngRecovering = true;
-  m.term.writeln('\r\n\x1b[33m-- Serial stuck after RNG init; closing and reopening the port… --\x1b[0m');
+  note(m, '\x1b[33m-- Serial stuck after RNG init; closing and reopening the port… --\x1b[0m');
   try {
     await detachStreams(m);
     await sleep(1000);
@@ -1039,15 +1220,26 @@ async function onRngStuck(m) {
   if (m.rxSeq === seq0) {
     $('stuck-overlay').hidden = false;   // still dead → the device needs a manual reset
   } else {
-    m.term.writeln('\x1b[32m-- Serial resumed. --\x1b[0m');
+    note(m, '\x1b[32m-- Serial resumed. --\x1b[0m');
   }
 }
 
 function handleNetLine(m, line) {
+  // `build: invocation spangap build <buildable> --with spangap/hw-<board> …` —
+  // the `spangap build` command that produced the running image, logged on boot.
+  // The hw-<straddle> in it names the board the firmware was compiled for, which
+  // identifies the device just as a detection run does — for free, without
+  // resetting anything. It is a claim about the image, not a reading of the
+  // hardware, so a real detection run (hwDetected) outranks it.
+  let mm = line.match(/build: invocation\b.*?\b(hw-[a-z0-9-]+)/);
+  if (mm) {
+    if (m === monitor && !m.hwDetected) armFlashGrace(mm[1], false);
+    return;
+  }
   // `build: datetime <YYYYMMDDhhmmss>` — the running firmware's catalogue build
   // stamp (spangap-core logs it on boot). Remember it and re-evaluate the flash
   // offer: we only offer an image the catalogue stamps NEWER than what's running.
-  let mm = line.match(/build: datetime (\d{14})/);
+  mm = line.match(/build: datetime (\d{14})/);
   if (mm) {
     m.deviceVersion = mm[1];
     m.versionSettled = true;
@@ -1457,65 +1649,539 @@ $('uichoice-overlay').addEventListener('click', (e) => {
 $('info-overlay').addEventListener('click', () => { $('info-overlay').hidden = true; });
 $('stuck-ok').addEventListener('click', () => { $('stuck-overlay').hidden = true; });
 
+// ── console handover ──────────────────────────────────────────────────────
+// The device logs that it is moving its console to a different USB device. We
+// cannot open the chooser from the log line itself — requestPort() needs a live
+// user gesture — so the line raises this dialog and its OK does the asking.
+// Set from the trigger line until the move resolves. While it is up the connect
+// handler must not adopt an arriving port on its own: the device is presenting a
+// different transport by design, and treating that as "the old port came back"
+// reattaches to the wrong thing and reports a return that never happened.
+let awaitingCdc = false;
+
+// Set for the whole of adoptConsolePort. A console move already owns the ports
+// it is auditioning, and the rescan must not reach for them meanwhile: both
+// would be opening the same handles, and the loser reads "The port is already
+// open" — which the audition scores as "did not answer" and the rescan as a
+// dead grant. Only one recovery mechanism may hold the wheel at a time, and
+// during a move it is the move.
+let adopting = false;
+
+// A grant already held for the CDC transport, if the device is presenting it.
+// Chrome only reports ports the origin may use, so anything listed here is
+// openable without asking again.
+// What we believe is currently attached, keyed by USB identity. Re-enumeration
+// fires connect and disconnect several times each and hands out fresh SerialPort
+// objects, so neither the event nor the object identifies a state change. The
+// device presents one instance of each transport; tracking that is what makes a
+// repeat a repeat rather than something to act on again.
+const presence = new Map();
+
+function idKey(port) {
+  try {
+    const i = port.getInfo();
+    return `${i.usbVendorId}:${i.usbProductId}`;
+  } catch (_) { return 'unknown'; }
+}
+
+// True when this is a real change. Repeats return false and are dropped whole:
+// no message, and no second reattach over a session that already has the port.
+function presenceChanged(port, here) {
+  const k = idKey(port);
+  if (presence.get(k) === here) return false;
+  presence.set(k, here);
+  return true;
+}
+
+// The freshest SerialPort object per USB identity. A re-enumeration mints a
+// NEW object; the old one keeps its name, identity, and grant, but not an
+// openable backing — open() on it fails "Failed to open serial port" forever.
+// getPorts() can hand back either, so it cannot be trusted to pick; the object
+// a connect event delivers is by definition the live one. Every connect event
+// deposits here, every successful open refreshes, and every recovery path
+// checks here before settling for a getPorts() snapshot.
+// A LIST per identity, in first-seen order, not one object per identity: the
+// composite device presents two CDC ports wearing the same VID/PID, and
+// getInfo() exposes nothing to tell them apart. Keeping one slot per identity
+// would collapse them — and, since these objects are preferred over a
+// getPorts() snapshot, would hand the console over to whichever interface
+// enumerated last. Order is the only signal there is: the console is
+// interface 0, so it enumerates, and connects, first.
+const heldPorts = new Map();
+// Bounded, newest last. Every connect event delivers a freshly minted object,
+// so an unbounded list grows by one per interface per re-enumeration — a dozen
+// entries after an evening of switching, all but the last pair belonging to
+// incarnations of the device that no longer exist. Two is the hardware maximum
+// (two CDC interfaces); keep a little slack and discard the oldest beyond it.
+const HELD_PER_ID_MAX = 3;
+function holdPort(port) {
+  if (!port) return;
+  const k = idKey(port);
+  const list = (heldPorts.get(k) || []).filter((x) => x !== port);
+  list.push(port);
+  while (list.length > HELD_PER_ID_MAX) list.shift();
+  heldPorts.set(k, list);
+}
+function heldList() { return [...heldPorts.values()].flat(); }
+
+// Drop a dead port OBJECT from our cache. Deliberately not forget(): that
+// revokes permission for the underlying port, and a dead object wears the same
+// identity as the live one, so revoking on its behalf takes the working
+// console's grant with it — turning one failed open into a permanent loss of
+// access, and a re-pick that mints yet another entry. Objects are ours to
+// discard; grants are the user's, cleared in the browser's own settings.
+function forgetPortObject(port) {
+  const k = idKey(port);
+  const rest = (heldPorts.get(k) || []).filter((x) => x !== port);
+  if (rest.length) heldPorts.set(k, rest); else heldPorts.delete(k);
+}
+
+function isCdcPort(port) {
+  try {
+    const i = port.getInfo();
+    return i.usbVendorId === CDC_FILTER.usbVendorId && i.usbProductId === CDC_FILTER.usbProductId;
+  } catch (_) { return false; }
+}
+
+function isJtagPort(port) {
+  try {
+    const i = port.getInfo();
+    return i.usbVendorId === JTAG_ID.usbVendorId && i.usbProductId === JTAG_ID.usbProductId;
+  } catch (_) { return false; }
+}
+
+// Held objects first: after a re-enumeration the getPorts() snapshot may still
+// carry the previous incarnation's dead object under the same identity.
+async function grantedCdcPorts() {
+  let ports = [];
+  try { ports = await navigator.serial.getPorts(); } catch (_) { /* held only */ }
+  const seen = new Set();
+  // Newest first. A re-enumeration invalidates every object that preceded it,
+  // so recency is the best available guess at which one is live — and the
+  // audition pays ~900 ms for each dud it tries before the console, so guessing
+  // well is the difference between an instant move and a visible stall.
+  return [...ports.reverse(), ...heldList().reverse()].filter((p) => {
+    if (!p || seen.has(p)) return false;
+    seen.add(p);
+    return p.connected !== false && isCdcPort(p);
+  });
+}
+
+function offerConsoleHandover() {
+  if (!monitor || awaitingCdc) return;
+  awaitingCdc = true;
+  // The device has only announced the move; its new ports appear a moment
+  // later. Wait for one we are already permitted to open before troubling the
+  // user — a second switch in the same session needs no dialog at all.
+  let waited = 0;
+  const poll = setInterval(async () => {
+    if (!awaitingCdc) { clearInterval(poll); return; }
+    const found = await grantedCdcPorts();
+    if (found.length) {
+      clearInterval(poll);
+      adoptConsolePort(found);
+      return;
+    }
+    if ((waited += 250) >= 3000) {
+      clearInterval(poll);
+      // Stop suppressing reattach either way: if no CDC device turned up, the
+      // move failed and following the device back is the only way its error
+      // message reaches anyone.
+      if (awaitingCdc) { awaitingCdc = false; $('cdcmove-overlay').hidden = false; }
+    }
+  }, 250);
+}
+
+// Move the console onto the device's new port, keeping the outgoing session
+// rendering into the same terminal until the device drops it.
+//
+// `cands` may hold both of the composite device's CDC ports — same VID/PID,
+// nothing in getInfo() to separate them, and only one is the console; the other
+// is silent in both directions, which is indistinguishable from a working
+// monitor on an idle device. So let them answer for themselves: attach, poke
+// (attachStreams sends a CR, which the firmware always answers), and keep the
+// first that produces a byte. Silence is a preference, not a veto — if none
+// answers we still take the first, because a silent monitor beats none.
+async function adoptConsolePort(cands) {
+  if (!monitor) { awaitingCdc = false; return; }
+  // Dedup by object: the same port can reach us from both heldPorts and the
+  // getPorts() snapshot, and auditioning it twice means opening one we already
+  // hold open — "The port is already open", read as a failure to answer.
+  const list = [...new Set(Array.isArray(cands) ? cands.filter(Boolean) : [cands])];
+  if (!list.length) { awaitingCdc = false; return; }
+  const outgoing = monitor;
+  adopting = true;                 // holds the rescan off these ports (see below)
+  try {
+
+  let chosen = null;
+  for (const port of list) {
+    // Someone else got there first — a reclaim, or a connect event that landed
+    // on a live handle — and that session is real and working. Yield to it: the
+    // whole point of this audition is to find a console, and one has been found.
+    if (monitor !== outgoing) break;
+    let probe = null;
+    try {
+      probe = makeSession(port, outgoing.term, outgoing.resizeObserver, true);  // muted while auditioning
+      await attachStreams(probe);
+      probe.muted = false;
+      const base = probe.rxSeq;
+      for (let waited = 0; waited < 900 && probe.rxSeq === base; waited += 100) await sleep(100);
+      if (probe.rxSeq !== base || list.length === 1) { chosen = probe; break; }
+      await detachStreams(probe);
+      forgetPortObject(port);        // opened but mute: not the console we want
+    } catch (e) {
+      if (probe) { try { await detachStreams(probe); } catch (_) { /* */ } }
+      const msg = e && e.message ? e.message : String(e);
+      // A grant that cannot be opened is spent — revoke it, so it is gone from
+      // the next audition instead of being waded through again. "Already open"
+      // is not that: it is one of our own handles, and must be kept.
+      if (!/already open/i.test(msg)) forgetPortObject(port);
+      else note(outgoing, `\x1b[90m-- a ${portLabel(port)} is already open here --\x1b[0m`);
+    }
+  }
+  // Re-check before committing: the loop above awaits, and a reclaim can have
+  // completed in any of those gaps. Overwriting `monitor` now would replace a
+  // proven-live session with an audition also-ran — which is exactly how a
+  // console that had come back got thrown away.
+  if (monitor !== outgoing) {
+    if (chosen) { try { await detachStreams(chosen); } catch (_) { /* */ } }
+    note(outgoing, '\x1b[90m-- console already recovered; audition abandoned --\x1b[0m');
+    return;
+  }
+
+  if (!chosen) {
+    // Every candidate opened but stayed mute. Take the first anyway and say so:
+    // the session stays usable, and a device that was merely busy delivers when
+    // it gets around to it.
+    try {
+      chosen = makeSession(list[0], outgoing.term, outgoing.resizeObserver, false);
+      await attachStreams(chosen);
+      note(outgoing, '\x1b[33m-- no port answered; taking the first --\x1b[0m');
+    } catch (e) {
+      note(outgoing, `\x1b[31m-- could not open the new port: ${e && e.message ? e.message : e} --\x1b[0m`);
+      scheduleRescan();
+      return;
+    }
+  }
+
+  const port = chosen.port;
+  noteDeviceId(port);                  // the identity to follow from here on
+  presence.set(idKey(port), true);     // we hold it; later connects are repeats
+  priorSession = outgoing.gone ? null : outgoing;
+  monitor = chosen;
+  outgoing.term.focus();
+  refreshFlashOffer();
+  } finally {
+    adopting = false;
+    awaitingCdc = false;
+  }
+}
+
+// The cdc→jtag counterpart of offerConsoleHandover. If this session holds a
+// grant for the JTAG side, the rescan reclaims it with no ceremony; if not,
+// the port is invisible to us and only a chooser pick (a gesture) reaches it —
+// raise the reconnect dialog to ask for one.
+function offerConsoleReturn() {
+  if (!monitor) return;
+  let waited = 0;
+  const poll = setInterval(async () => {
+    if (!monitor) { clearInterval(poll); return; }
+    let ports = [];
+    try { ports = await navigator.serial.getPorts(); } catch (_) { /* held only */ }
+    if ([...heldList(), ...ports].some((x) => x && x.connected !== false && isJtagPort(x))) {
+      clearInterval(poll);              // granted and present — the rescan takes it
+      return;
+    }
+    if ((waited += 250) >= 3000) {
+      clearInterval(poll);
+      // Only if the session actually lost its port — a switch the firmware
+      // announced but never carried out leaves the CDC session running, and
+      // popping a dialog over a working monitor would be noise.
+      if (monitor && (monitor.gone || !monitor.reader)) $('reconnect-overlay').hidden = false;
+    }
+  }, 250);
+}
+
+$('cdcmove-ok').addEventListener('click', async () => {
+  $('cdcmove-overlay').hidden = true;
+  if (!monitor) return;
+  let port;
+  try {
+    // Filtered to the composite device the firmware presents, so the chooser
+    // offers its two ports and nothing else.
+    port = await navigator.serial.requestPort({ filters: [CDC_FILTER] });
+  } catch (_) {
+    awaitingCdc = false;
+    return;                                          // chooser dismissed
+  }
+  await adoptConsolePort(port);
+});
+
+// Prove an attached port actually carries the console. attachStreams pokes it
+// with a CR, and the firmware always answers one — with its transport hint in
+// log mode, with a prompt in CLI mode — so a port that stays byte-silent after
+// attach is not slow, it is dead: opened mid-enumeration, or on a device node
+// the OS is still tearing down. Close and reopen it a couple of times, saying
+// so, rather than presenting a working-looking monitor that never speaks.
+async function verifyAlive(m) {
+  for (let attempt = 0; ; attempt++) {
+    const base = m.rxSeq;
+    for (let waited = 0; waited < 1200 && monitor === m && m.rxSeq === base; waited += 100)
+      await sleep(100);
+    if (monitor !== m) return false;            // superseded — not ours to fix
+    if (m.rxSeq !== base) return true;
+    if (attempt === 0) {
+      // Ask again before touching the port: a device mid-boot or mid-switch
+      // answers late, and a close/reopen cycle right now is a window in which
+      // its answer — written device-side with a short timeout — gets dropped.
+      await pokeConsole(m);
+      continue;
+    }
+    if (attempt >= 2) {
+      // Not a death sentence: the session stays attached, and a device that
+      // was merely busy delivers when it gets around to it — observed as live
+      // logs arriving seconds after this line.
+      note(m, '\x1b[33m-- no response; leaving the port open --\x1b[0m');
+      return false;
+    }
+    note(m, `\x1b[90m-- ${portLabel(m.port)} is silent, reopening… --\x1b[0m`);
+    try {
+      await detachStreams(m);
+      await sleep(300);
+      if (monitor !== m) return false;
+      await attachStreams(m);                   // re-pokes the console on the way up
+    } catch (e) {
+      note(m, `\x1b[31m-- reopen failed: ${e && e.message ? e.message : e} --\x1b[0m`);
+      // The port went away or won't open — the session now has no streams, so
+      // hand recovery to the rescan, which reclaims it once it is openable.
+      scheduleRescan();
+      return false;
+    }
+  }
+}
+
+// Re-open a returning port over the dead session. Shared by the connect event
+// and the rescan below, so a port that arrives before its predecessor's death
+// is reported gets the same treatment as one that arrives after.
+// `attempts` bounds the open retries: alone-in-the-list ports get the full
+// patient run (an OS still building the node needs time), but when several
+// objects wear one identity the dead twin fails instantly, so short passes
+// that rotate quickly find the live one sooner.
+let reclaimLastReport = null;   // last failure line printed; cleared on success
+async function reclaimPort(p, attempts = 8) {
+  monitor.reattaching = true;                 // set synchronously, before any await
+  monitor.port = p;                           // adopt the (possibly fresh) port object
+  let attached = false;
+  let lastErr = null;
+  try {
+    // The port may not accept open() the instant it appears (or the dead
+    // port's close() is still settling), so retry a few times.
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (!monitor || (!monitor.gone && monitor.reader)) return;   // resolved elsewhere
+      try {
+        // Once, not per retry: it releases anything the vanished session left
+        // half-open. After a failed open there is nothing open to close.
+        if (attempt === 0) { try { await p.close(); } catch (_) { /* wasn't open */ } }
+        await attachStreams(monitor);
+        monitor.gone = false;
+        note(monitor, `\x1b[32m-- ${portLabel(p)} came back --\x1b[0m`);
+        monitor.term.focus();
+        refreshFlashOffer();   // restore the green slot (detect, or the flash offer)
+        attached = true;
+        reclaimLastReport = null;   // next outage reports afresh
+        return;
+      } catch (e) {
+        lastErr = e;
+        await sleep(300);
+      }
+    }
+    if (monitor && monitor.gone) {
+      // Say why: "reopen failed" alone gives nothing to go on, and the reason —
+      // usually the OS still building or tearing down the device node — is in
+      // the error. Once per distinct reason: the rescan retries this every
+      // 800 ms, and a repeating line adds noise, not information.
+      const why = lastErr && lastErr.message ? ` (${lastErr.message})` : '';
+      const line = `\x1b[31m-- ${portLabel(p)} reopen failed${why}; retrying in background --\x1b[0m`;
+      if (line !== reclaimLastReport) { monitor.term.writeln(line); reclaimLastReport = line; }
+      scheduleRescan();
+    }
+  } finally {
+    if (monitor) monitor.reattaching = false;
+    // After the flag clears, so the verify's own close/reopen can't collide
+    // with a concurrent connect event's reclaim.
+    if (attached && monitor) verifyAlive(monitor);
+  }
+}
+
+// Keep looking for a replacement port while the session is dead. Events cannot
+// be trusted to drive this: the dead port's disconnect and its replacement's
+// connect come from two different USB devices, so the OS orders them freely —
+// a connect that lands while the session still looks live (or while a reclaim
+// holds the lock) is refused, and that one-shot event is spent. Ground truth
+// is polled instead: session dead + granted port attached → reclaim it. The
+// loop also outlasts a failed reclaim, because a port can be listed by the
+// browser well before the OS lets it open — the announced-then-quiet flag
+// keeps the narration to one line per outage rather than one per attempt.
+let rescanTimer = null;
+function scheduleRescan() {
+  if (rescanTimer) return;
+  let announced = false;
+  let failures = 0;
+  let rotate = 0;
+  rescanTimer = setInterval(async () => {
+    if (!monitor || (!monitor.gone && monitor.reader)) {   // recovered or torn down
+      clearInterval(rescanTimer);
+      rescanTimer = null;
+      $('reconnect-overlay').hidden = true;
+      return;
+    }
+    if (monitor.reattaching) return;          // a reclaim is already running
+    // A console move owns the ports it is auditioning; stay off them entirely
+    // rather than race it for handles.
+    if (adopting || awaitingCdc) return;
+    let ports = [];
+    try { ports = await navigator.serial.getPorts(); } catch (_) { /* held only */ }
+    // Held objects first — a connect event's object outranks the snapshot's,
+    // which after a re-enumeration can be the dead previous incarnation. A
+    // failed cycle rotates to the next candidate rather than retrying the same
+    // object forever: with two objects wearing one identity, only trying both
+    // finds the live one.
+    const seen = new Set();
+    const candidates = [...heldList(), ...ports].filter((x) => {
+      if (!x || seen.has(x)) return false;
+      seen.add(x);
+      return x.connected !== false && isKnownDevice(x) && !(awaitingCdc && isCdcPort(x));
+    });
+    if (!candidates.length) return;
+    const p = candidates[rotate % candidates.length];
+    if (!announced) {
+      note(monitor, `\x1b[90m-- following the ${portLabel(p)} already present --\x1b[0m`);
+      announced = true;
+    }
+    // One attempt: a stale handle does not fail transiently — it fails, it's
+    // dead. (A live port arriving by connect event gets the patient retries in
+    // that handler; this loop only ever reaches for remembered handles.)
+    await reclaimPort(p, 1);
+    if (monitor && !monitor.gone && monitor.reader) { failures = 0; return; }
+    rotate++;
+    // Every candidate has now failed once — the grant is stale, and nothing
+    // reachable through it will ever work. Drop it (a fresh chooser pick mints
+    // a fresh one) and ask for that pick. Dropping also quiets this loop: the
+    // identity vanishes from every snapshot, so the remaining ticks idle until
+    // the pick or a live arrival ends the outage.
+    if (++failures >= Math.max(candidates.length, 1)) {
+      for (const x of candidates) forgetPortObject(x);
+      failures = 0;
+      note(monitor, '\x1b[33m-- no remembered port for this device opens; pick it again --\x1b[0m');
+      $('reconnect-overlay').hidden = false;
+    }
+  }, 800);
+}
+
+$('reconnect-pick').addEventListener('click', async () => {
+  $('reconnect-overlay').hidden = true;
+  if (!monitor) return;
+  let port;
+  try {
+    // Offer only identities this device has worn — with a stale twin possibly
+    // still listed, the fresh entry is the one the chooser shows as present.
+    const filters = knownIds.map((k) => ({ usbVendorId: k.vid, usbProductId: k.pid }));
+    port = await navigator.serial.requestPort(filters.length ? { filters } : {});
+  } catch (_) {
+    return;   // dismissed — the rescan keeps trying and re-raises the dialog
+  }
+  noteDeviceId(port);
+  holdPort(port);
+  presence.set(idKey(port), true);
+  await reclaimPort(port);
+});
+
 // Hold on to the port's permission across physical disconnects: when the device
 // is powered off / unplugged, note it in the stream and tear the dead streams
 // down; when the device reappears (matched by USB VID/PID, since it may come back
 // as a fresh SerialPort object), re-open it and resume.
 navigator.serial.addEventListener('disconnect', (e) => {
   const p = e.port || e.target;
-  if (!monitor || p !== monitor.port || monitor.gone) return;
+  if (!p) return;
+  // Every cached object for this identity is now a dead incarnation: the device
+  // left the bus, and whatever it presents next comes as freshly minted objects
+  // via connect. Dropping them here is what keeps the cache at the two ports
+  // that actually exist, instead of accumulating a generation per switch for
+  // the audition to wade through.
+  heldPorts.delete(idKey(p));
+  if (!presenceChanged(p, false)) return;
+  // The port a handover moved away from, finally going. Expected, not a loss:
+  // say so plainly and let it go rather than holding the grant for a port the
+  // device has stopped presenting.
+  if (priorSession && idKey(p) === idKey(priorSession.port)) {
+    const old = priorSession;
+    priorSession = null;
+    note(old, `\x1b[36m-- previous ${portLabel(old.port)} gone --\x1b[0m`);
+    detachStreams(old);
+    return;
+  }
+  // By USB identity, not object: a device that re-enumerates is handed to us as
+  // a fresh SerialPort, so comparing objects misses its own session's departure
+  // — leaving the session marked live, never reattached, and its port closed
+  // under everything that later tries to use it.
+  if (!monitor || idKey(p) !== idKey(monitor.port)) {
+    // Not a session's port, or one already accounted for. Still worth saying:
+    // during a console move the device presents and withdraws transports on its
+    // own schedule, and a silent gap reads as the app having lost track.
+    if (monitor) note(monitor, `\x1b[90m-- ${portLabel(p)} gone --\x1b[0m`);
+    return;
+  }
   monitor.gone = true;
   hideOpenUi();            // the device is gone — drop its buttons
-  pendingFlash = null;     // can't flash a gone device
+  pendingFlash = null;     // can't flash (or detect on) a gone device
   $('monitor-flash').hidden = true;
-  monitor.term.writeln('');
-  monitor.term.writeln('\x1b[31m-- Serial port gone --\x1b[0m');
-  monitor.term.writeln('');
+  note(monitor, `\x1b[31m-- ${portLabel(p)} gone --\x1b[0m`);
   detachStreams(monitor);
+  // The replacement may have connected BEFORE this death was reported — its
+  // one-shot connect event refused while the session still looked live. Now
+  // that the session is known dead, keep looking for it. Not during a console
+  // move: this departure is that move's expected first half, and the arriving
+  // transport belongs to the audition, not to a recovery.
+  if (!adopting && !awaitingCdc) scheduleRescan();
 });
-
-// Same physical device? A native-USB ESP32-S3 re-enumerates with no stable USB
-// serial number, so on reconnect the browser often hands us a *different*
-// SerialPort object — match by USB VID/PID rather than object identity.
-function sameDevice(a, b) {
-  if (a === b) return true;
-  try {
-    const x = a.getInfo(), y = b.getInfo();
-    if (x.usbVendorId != null && y.usbVendorId != null)
-      return x.usbVendorId === y.usbVendorId && x.usbProductId === y.usbProductId;
-  } catch (_) { /* info unavailable — fall through */ }
-  return true;   // can't tell; we're waiting for our one device, so accept it
-}
 
 navigator.serial.addEventListener('connect', async (e) => {
   const p = e.port || e.target;
+  if (!p) return;
+  // Before any dedup or refusal: whatever else happens to this event, its port
+  // object is the live one for its identity — pin it, so the rescan reaches
+  // for this and not for a dead twin out of getPorts(). This is also how an
+  // arrival refused below (session still looks live, reclaim lock held) still
+  // ends up adopted: the rescan finds it here once the session's death lands.
+  holdPort(p);
   // Re-enumeration fires `connect` several times; the lock keeps a single
   // reattach running so concurrent handlers don't fight over the port.
-  if (!monitor || !monitor.gone || monitor.reattaching || !p || !sameDevice(p, monitor.port)) return;
-  monitor.reattaching = true;                 // set synchronously, before any await
-  monitor.port = p;                           // adopt the (possibly fresh) port object
-  try {
-    // The port may not accept open() the instant `connect` fires (or the dead
-    // port's close() is still settling), so retry a few times.
-    for (let attempt = 0; attempt < 8; attempt++) {
-      if (!monitor || !monitor.gone) return;  // torn down / already resolved elsewhere
-      try {
-        try { await p.close(); } catch (_) { /* wasn't open */ }
-        await attachStreams(monitor);
-        monitor.gone = false;
-        monitor.term.writeln('\x1b[32m-- Serial port came back --\x1b[0m');
-        monitor.term.writeln('');
-        monitor.term.focus();
-        return;
-      } catch (_) {
-        await sleep(300);
-      }
-    }
-    if (monitor && monitor.gone)
-      monitor.term.writeln('\x1b[31m-- serial port came back but reopen failed --\x1b[0m');
-  } finally {
-    if (monitor) monitor.reattaching = false;
+  // Match against every identity this device has worn, not just the one the
+  // dead session held: a reset out of CDC mode brings the device back as the
+  // USB-Serial-JTAG controller, which is a different VID/PID entirely.
+  if (!presenceChanged(p, true)) return;
+
+  // A CDC arrival during a move belongs to adoptConsolePort; taking it here
+  // would grab the wrong port and claim a return that did not happen. Every
+  // other arrival is ours to follow — including the device coming back on its
+  // old transport after a move failed, whose console carries the reason.
+  // Ground truth, not bookkeeping: a session with no reader has no working
+  // port, whatever `gone` was left saying. That flag has repeatedly gone stale
+  // — a missed disconnect leaves it false — and every time it does, an arriving
+  // port is announced and then not taken, which presents as a live-looking
+  // session that is mute and deaf until the page is reloaded.
+  const detached = monitor && (monitor.gone || !monitor.reader);
+  const mine = detached && !monitor.reattaching && isKnownDevice(p)
+               && !(awaitingCdc && isCdcPort(p));
+  if (!mine) {
+    // Announce it anyway. Ports appearing and disappearing is the whole shape
+    // of a console move, and hiding the ones we do not act on makes the
+    // sequence impossible to follow.
+    if (monitor) note(monitor, `\x1b[32m-- ${portLabel(p)} came back --\x1b[0m`);
+    return;
   }
+  if (awaitingCdc) { awaitingCdc = false; $('cdcmove-overlay').hidden = true; }
+  await reclaimPort(p);
 });
 
 // Populate the settings box from the defaults (adds the baud as an option if the
