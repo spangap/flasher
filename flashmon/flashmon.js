@@ -1371,12 +1371,10 @@ function openConnectDialog(m) {
 function closeConnectDialog() { $('connect-overlay').hidden = true; }
 
 $('ch-ssid').addEventListener('change', updateConnectFields);
-// Hostnames are DNS/mDNS labels: letters, digits, underscore only, max 16 chars.
-const HOSTNAME_RE = /^[A-Za-z0-9_]{1,16}$/;
 // Block any insertion that contains an illegal hostname char (typed or pasted)
-// before it lands, so nothing happens — the text and caret are untouched.
-// Deletions/navigation have null data and pass through. The 16-char cap is the
-// input's native maxlength.
+// before it lands, so nothing happens — the text and caret are untouched, and
+// nothing has to be reported after the fact. Deletions/navigation have null data
+// and pass through. The 20-char cap is the input's native maxlength.
 $('ch-hostname').addEventListener('beforeinput', (e) => {
   if (e.data && /[^A-Za-z0-9_]/.test(e.data)) e.preventDefault();
 });
@@ -1397,8 +1395,10 @@ $('ch-cancel').addEventListener('click', () => {
 $('ch-send').addEventListener('click', () => {
   const m = monitor;
   if (!m) { closeConnectDialog(); return; }
-  const hostname = ($('ch-hostname').value || HOSTNAME_DEFAULT).trim();
-  if (!HOSTNAME_RE.test(hostname)) { $('ch-hostname').focus(); $('ch-hostname').select(); return; }
+  // The field can only ever hold legal hostname characters (the beforeinput
+  // filter above) up to its maxlength, so whatever is in it is usable as-is; an
+  // empty field means "keep the default".
+  const hostname = $('ch-hostname').value.trim() || HOSTNAME_DEFAULT;
   const sel = $('ch-ssid');
   const opt = sel.selectedOptions[0];
   const isOther = !!(opt && opt.dataset.other === '1');
@@ -2759,7 +2759,7 @@ async function boot() {
   SLUG = projectSlug(PROJECT);
   BUILDS = cfg.builds;
   BUILD_NAMES = cfg.builds.map((b) => b.name).filter(Boolean);
-  HOSTNAME_DEFAULT = (PROJECT.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'flashmon').slice(0, 16);
+  HOSTNAME_DEFAULT = (PROJECT.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'flashmon').slice(0, 20);
 
   // Re-read the catalogue once a minute so a build published while the page is
   // open becomes available without a reload; re-evaluate the live flash offer

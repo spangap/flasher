@@ -160,7 +160,6 @@
        padding:.12rem .5rem;font-size:.72rem;line-height:1.5;white-space:nowrap;border-radius:5px}
   .pw-msg{min-height:1.1em;margin-top:.5rem;font-size:.82rem;color:var(--err)}
   .pw-msg.ok{color:var(--accent)}
-  .modal input:invalid{border-color:var(--err)}
 </style>
 <link rel="stylesheet" href="vendor/xterm.css">
 </head>
@@ -248,9 +247,9 @@
       <div class="modal">
         <h2>Connect device to WiFi</h2>
         <p class="sub">The device found no known network and started its own access point.</p>
-        <label for="ch-hostname">Hostname <span class="hint">(letters, digits, _ — max 16)</span></label>
+        <label for="ch-hostname">Hostname <span class="hint">(letters, digits, _ — max 20)</span></label>
         <input id="ch-hostname" type="text" autocomplete="off" spellcheck="false"
-               pattern="[A-Za-z0-9_]{1,16}" maxlength="16" inputmode="latin">
+               maxlength="20" inputmode="latin">
         <label for="ch-ssid">Network</label>
         <select id="ch-ssid"></select>
         <div id="ch-ssid-other" hidden>
