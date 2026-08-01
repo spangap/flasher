@@ -1,9 +1,10 @@
 # flashmon
 
 A tiny, static, browser-based firmware **flasher + serial monitor** for spangap
-devices. Point a Chromium browser at it, plug in a device over USB, and it
-probes the chip, auto-detects the board, offers the right firmware image to
-flash, and drops into an interactive serial monitor — no install, no toolchain.
+devices. Point a Chromium browser at it, plug in a device over USB, and it drops
+into an interactive serial monitor without touching the device; one button then
+identifies the board and offers the right firmware image to flash — no install,
+no toolchain.
 
 It brands itself from a config file (`flashmon/flashmon.yaml`), so a deployment
 reads as its own product (e.g. **Reticulous**) rather than "flashmon".
@@ -51,29 +52,61 @@ along and get served even though they aren't tracked: the branded
 The page shows its title (**`<project> Flasher`**) and goes straight to the
 serial port picker on your first click/keypress (the browser only lets the
 chooser open in response to a user gesture; it never silently reuses a
-remembered device). Once you pick a device it:
+remembered device). Once you pick a device it **only opens the port** and shows
+the **serial monitor**: the device is not probed and not reset, so whatever it is
+doing keeps running and its output just starts streaming.
 
-1. **Probes** the chip over the ROM loader (esptool-js) — chip, revision,
-   features, flash size — for the monitor banner.
-2. **RAM-loads the peripheral detector** (`detect/spangap_detect.bin`) into SRAM
-   and jumps to it — **no flash write** — captures its one-shot findings, and
-   folds them into the cyan banner (which board, which peripherals). See
-   [`esp-idf/`](esp-idf) and [`docs/detect.md`](docs/detect.md).
-3. **Resets** the device into its real firmware and opens the **serial monitor**
-   on it, so the boot log streams live.
-4. **Offers the matching image.** If the detected board has an image in the
-   catalogue, a green **Flash `<project>` to `<board>`** button appears (left of
-   *Open Device UI* and *Reset*). Pressing it downloads that image, unzips it in
-   the browser (JSZip), flashes every image at its offset over Web Serial, then
-   reopens the monitor and resets into the freshly-flashed firmware.
+Everything past that is board-specific, so it waits until the board is known. The
+board is identified either way round:
+
+- **From the log, for free.** spangap-core logs `build: invocation spangap build
+  … --with spangap/hw-<board>` on boot — the `spangap build` command the running
+  image was compiled with. The `hw-<board>` in it names the board, so a device
+  that boots (or is reset) while the monitor is open identifies itself with no
+  probe at all.
+- **From the hardware, on demand.** A green **Detect Hardware** button sits where
+  the flash button goes (left of *Open Device UI* and *Reset*). Pressing it
+  **probes** the chip over the ROM loader (esptool-js — chip, revision, features,
+  flash size), **RAM-loads the peripheral detector**
+  (`detect/spangap_detect.bin`) into SRAM and jumps to it (**no flash write**),
+  captures its one-shot findings into the cyan banner (which board, which
+  peripherals), then **resets** the device back into its real firmware. See
+  [`esp-idf/`](esp-idf) and [`docs/detect.md`](docs/detect.md). This reads the
+  actual hardware, so it outranks the log's claim about the image.
+
+Once the board is known, that same green slot turns into **Flash `<project>` to
+`<board>`** if the catalogue holds a newer image for it. Pressing it downloads
+that image, unzips it in the browser (JSZip), flashes every image at its offset
+over Web Serial, then reopens the monitor and resets into the freshly-flashed
+firmware.
 
 ### How an image is matched
 
-The detector reports the board as `hw-<straddle>` (e.g. `hw-lilygo-tdeck`). The
-button looks for `builds/hw-<straddle>.zip`, trying successively shorter
-prefixes (so an unlisted `hw-foo-bar-baz` falls back to a listed `hw-foo-bar`
-image), and finally `builds/generic.zip`. If none is published, no flash button appears
-— you still get the monitor.
+The board is named `hw-<straddle>` (e.g. `hw-lilygo-tdeck`) whichever way it was
+identified. The button looks for `builds/hw-<straddle>.zip`, trying successively
+shorter prefixes (so an unlisted `hw-foo-bar-baz` falls back to a listed
+`hw-foo-bar` image), and finally `builds/generic.zip`. If none is published, or
+the published image is no newer than the running firmware's build stamp, no flash
+button appears — you still get the monitor.
+
+### When flashing would erase the device's data
+
+A **Detect Hardware** run also reports the device's `state` partition — the
+LittleFS store holding its settings, keys and files (see
+[`docs/detect.md`](docs/detect.md)). Before writing anything, the flash compares
+the image's own offsets against it: flash erases in 4 KB sectors, so an image is
+counted as reaching into the store if the sectors it erases touch it at all. The
+margin is real — a current tdeck image ends its last segment exactly at the
+`0x800000` store boundary — so a firmware that grows, or a device whose store sits
+lower, lands inside it.
+
+When it does, a **warning dialog** names the store (address and size) and the
+range the image writes inside it, and offers **Cancel** or **Erase and flash**.
+The image is fetched and checked while the monitor is still open and the device
+still running, so cancelling costs the session nothing — nothing has been written,
+and the monitor carries on. Without a detection run there is nothing to compare
+against and no warning is raised, since the boot log never states where the store
+is. `flashmon.py` makes the same check and asks the same question on the terminal.
 
 ## The monitor
 
@@ -81,8 +114,11 @@ A fullscreen xterm.js terminal, fully interactive — keystrokes are sent to the
 device, so its serial line switches to the interactive CLI. Controls float over
 it:
 
-- **Flash `<project>` to `<board>`** (green, left) — flash the matched image (see
-  above). Only shown when an image is available for the detected board.
+- **Detect Hardware** (green, left) — identify the board (see above). Shown while
+  the board is unknown; it costs the device a reset.
+- **Flash `<project>` to `<board>`** (green, same slot) — flash the matched image
+  (see above). Replaces *Detect Hardware* once the board is known and a newer
+  image is available for it.
 - **Open Device UI** (blue) — appears once the device reports it joined WiFi;
   opens `<hostname>.local` (then the IP) in a new tab.
 - **Reset** (red, top-right) — hard-resets the attached device on demand.

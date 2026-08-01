@@ -154,6 +154,11 @@ chip**, not by re-deriving that math:
 This means a change to spangap's floor/alignment logic can't desync the detector:
 it reads the store that exists, wherever it landed.
 
+The flasher keeps this line: a flash whose sectors reach into that region would
+wipe the device's own settings, keys and files, so it warns and asks before
+writing (see the README). A chip that reports no store gets no warning — there is
+nothing to lose there.
+
 ### Not host-detectable
 
 These are on the PCB but have no bus identity — presence is a board fact, not a

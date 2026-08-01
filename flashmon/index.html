@@ -52,10 +52,13 @@
        color:#fff;background:#1f6feb;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
   #open-ui[hidden]{display:none}
   #open-ui:hover{background:#fff;color:#1f6feb;border-color:#1f6feb}
-  #monitor-flash{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;
-       color:#fff;background:#2ea043;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
-  #monitor-flash[hidden]{display:none}
-  #monitor-flash:hover{background:#fff;color:#2ea043;border-color:#2ea043}
+  /* The green slot: "Detect Hardware" until the board is known, the flash offer
+   * once it is. Same look either way — one action in one place. */
+  #monitor-flash,#monitor-detect{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;
+       letter-spacing:.04em;color:#fff;background:#2ea043;border:2px solid #fff;border-radius:8px;
+       padding:.4rem .85rem;cursor:pointer}
+  #monitor-flash[hidden],#monitor-detect[hidden]{display:none}
+  #monitor-flash:hover,#monitor-detect:hover{background:#fff;color:#2ea043;border-color:#2ea043}
   @keyframes reset-flicker{
     0%,50%{background:#ff1f1f;color:#fff;border-color:#fff}
     50.01%,100%{background:#fff;color:#ff1f1f;border-color:#ff1f1f}
@@ -137,10 +140,12 @@
   .modal button{font:inherit;font-weight:600;border:0;border-radius:6px;padding:.45rem .9rem;cursor:pointer}
   .modal .btn-primary{color:#fff;background:var(--accent)}
   .modal .btn-ghost{color:var(--fg);background:#0d1117;border:1px solid var(--line)}
-  #info-body{font-size:.9rem;line-height:1.55}
-  #info-body p{margin:0 0 .8rem}
-  #info-body p:last-child{margin-bottom:0}
-  #info-overlay .modal{max-width:500px}
+  /* The destructive choice in a warning dialog — never the green "go" green. */
+  .modal .btn-danger{color:#fff;background:var(--err)}
+  #info-body,#statewarn-body{font-size:.9rem;line-height:1.55}
+  #info-body p,#statewarn-body p{margin:0 0 .8rem}
+  #info-body p:last-child,#statewarn-body p:last-child{margin-bottom:0}
+  #info-overlay .modal,#statewarn-overlay .modal{max-width:500px}
   .modal .k{color:var(--muted)}
   .modal label .hint{color:var(--muted);font-weight:400;text-transform:none}
   /* "Don't ask again" row: an inline checkbox, not a full-width field label. */
@@ -171,6 +176,7 @@
   <div id="monitor" hidden>
     <div id="monitor-term"></div>
     <div id="monitor-actions">
+      <button id="monitor-detect" type="button" hidden>Detect Hardware</button>
       <button id="monitor-flash" type="button" hidden>Flash</button>
       <button id="open-ui" type="button" hidden>Open Device UI</button>
       <button id="monitor-reset" type="button">Reset</button>
@@ -258,6 +264,21 @@
         <div class="row">
           <button id="ch-cancel" class="btn-ghost" type="button">Cancel</button>
           <button id="ch-send" class="btn-primary" type="button">Connect</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Raised before a flash whose write range reaches into the state partition
+         the detector found on this chip: writing there erases the device's own
+         stored data, so the flash waits on an explicit choice. -->
+    <div id="statewarn-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>This flash erases the device&rsquo;s stored data</h2>
+        <p class="sub" id="statewarn-sub"></p>
+        <div id="statewarn-body"></div>
+        <div class="row">
+          <button id="statewarn-cancel" class="btn-ghost" type="button">Cancel</button>
+          <button id="statewarn-go" class="btn-danger" type="button">Erase and flash</button>
         </div>
       </div>
     </div>

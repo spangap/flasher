@@ -1,12 +1,19 @@
 // flashmon — browser firmware flasher / serial monitor.
 //
-// On connect it probes the chip, RAM-loads the peripheral detector (no flash
-// write), and folds its findings into the monitor banner. If the detected board
-// has an image in the catalogue (flashmon.yaml → builds/<name>.zip, or the
-// generic fallback), a "Flash <project> to <device>" button appears in the
-// monitor; pressing it unzips that image in the browser and flashes every
-// segment at its offset over Web Serial (vendored esptool-js), then drops back
-// into the monitor and resets the device so its boot log streams live.
+// Connecting only opens the port: the device is not touched, not reset, and the
+// monitor shows whatever it is already doing. Identifying the board is a
+// separate, deliberate act — the green "Detect Hardware" button, which probes
+// the chip and RAM-loads the peripheral detector (no flash write) and folds its
+// findings into the monitor banner. A board also identifies itself for free when
+// the running firmware logs its `build: invocation` line, which names the
+// hw-<straddle> it was compiled for.
+//
+// Once the board is known and the catalogue (flashmon.yaml → builds/<name>.zip,
+// or the generic fallback) holds a newer image for it, that same green slot
+// becomes "Flash <project> to <device>"; pressing it unzips that image in the
+// browser and flashes every segment at its offset over Web Serial (vendored
+// esptool-js), then drops back into the monitor and resets the device so its
+// boot log streams live.
 //
 // The catalogue and the UI brand come from flashmon.yaml (or a gitignored
 // flashmon.local.yaml, preferred when present), fetched at boot.
@@ -38,6 +45,18 @@ let HOSTNAME_DEFAULT = 'flashmon';
 // The image resolved for the connected board, if any: { url, label, name }.
 // Set when the flash button is shown; read by its click handler.
 let pendingFlash = null;
+// True while a detection run owns the port (monitor torn down, ROM loader busy):
+// keeps the Detect Hardware button off the screen and the run non-reentrant.
+let detecting = false;
+// The user-state partition a detection run read off the attached chip —
+// { addr, size } — or null while the chip has not been probed (or has no store
+// yet). Only a detection run knows this: the boot log never states it. A flash
+// whose write reaches into it wipes the device's own data, which is what the
+// state-warning dialog is for.
+let statePart = null;
+// Resolves the open state-warning dialog (see confirmStateOverlap), or null when
+// none is up.
+let stateWarnClose = null;
 
 // Default line settings. The device console runs at 115200/N/8/1 (ESP-IDF
 // default); ?monitor_baud= overrides the baud for firmware that logs elsewhere.
@@ -1607,6 +1626,7 @@ function closeDialogs(m) {
   $('info-overlay').hidden = true;
   $('stuck-overlay').hidden = true;
   closeUiChoice();
+  cancelStateWarn();       // an unanswered warning means: don't flash
   if (m && m.passwdOpen) { m.passwdOpen = false; m.passwdResolved = true; closePasswdDialog(); }
   if (m && m.wifiOpen)   { m.wifiOpen = false;   m.wifiResolved = true;   closeConnectDialog(); }
 }
@@ -2134,7 +2154,9 @@ navigator.serial.addEventListener('disconnect', (e) => {
   monitor.gone = true;
   hideOpenUi();            // the device is gone — drop its buttons
   pendingFlash = null;     // can't flash (or detect on) a gone device
+  cancelStateWarn();       // …so a warning waiting on an answer is moot
   $('monitor-flash').hidden = true;
+  $('monitor-detect').hidden = true;
   note(monitor, `\x1b[31m-- ${portLabel(p)} gone --\x1b[0m`);
   detachStreams(monitor);
   // The replacement may have connected BEFORE this death was reported — its
@@ -2201,9 +2223,11 @@ function initCfgControls() {
 
 // ── flashing ────────────────────────────────────────────────────────────────
 // Download the image zip at `zipURL` (a flasher.zip produced by `spangap
-// build`), unzip it in the browser, and flash every image at its offset over
-// Web Serial. Returns the chip-info banner lines so the monitor can reprint them.
-async function flash(port, zipURL) {
+// build`) and unzip it in the browser: the images to write, each at its offset,
+// plus the flash settings. Separate from the write, and touching neither the
+// device nor the monitor, so the plan's offsets can be weighed against what is
+// on the chip (see stateOverlaps) while there is still nothing to undo.
+async function loadFlashPlan(zipURL) {
   log(`Downloading ${zipURL}`);
   const res = await fetch(zipURL, { cache: 'no-store' });
   if (!res.ok) throw new Error(`could not fetch ${zipURL} (HTTP ${res.status}) — is the build published?`);
@@ -2228,6 +2252,13 @@ async function flash(port, zipURL) {
   }
   fileArray.sort((a, b) => a.address - b.address);
   log(`Unpacked ${fileArray.length} image(s).`);
+  return { fileArray, settings };
+}
+
+// Flash a loaded plan's images at their offsets over Web Serial. Returns the
+// chip-info banner lines so the monitor can reprint them.
+async function flash(port, plan) {
+  const { fileArray, settings } = plan;
 
   // esptool-js reports progress per image (written/total reset to 0 at each new
   // image), so a naive bar restarts every blob. Fold every image onto one bar:
@@ -2302,7 +2333,7 @@ function isFnb58Port(port) {
   }
 }
 
-// ── build catalogue ───────────────────────────────────────────────────────
+// ── detector output ─────────────────────────────────────────────────────────
 // The detector's `DETECTED: hw-<board>` line, if any (extras in parentheses are
 // dropped): the hw-<board> token to match against the catalogue.
 function detectedHw(lines) {
@@ -2313,6 +2344,100 @@ function detectedHw(lines) {
   return null;
 }
 
+// The detector's `DETECTED: spangap state partition at 0x… size 0x…` line, if
+// any: where the device keeps its own data (settings, keys, files), as read off
+// this chip — { addr, size } — or null if the detector found no store there.
+function detectedStatePart(lines) {
+  for (const l of lines) {
+    const m = l.match(/^DETECTED:\s+spangap state partition at 0x([0-9a-f]+) size 0x([0-9a-f]+)/i);
+    if (m) {
+      const addr = parseInt(m[1], 16);
+      const size = parseInt(m[2], 16);
+      if (size > 0) return { addr, size };
+    }
+  }
+  return null;
+}
+
+// ── state-partition warning ─────────────────────────────────────────────────
+// Flash erases whole sectors, so a write erases from the start of the sector its
+// first byte lands in through the end of the sector its last byte lands in — one
+// byte past a boundary costs the whole next sector.
+const SECTOR = 0x1000;
+
+// The images in `fileArray` whose erase range reaches into `state`, each as the
+// range it erases. Empty when the write leaves the state store alone — and when
+// nothing is known about the store, since an unprobed chip is no evidence of a
+// clash.
+function stateOverlaps(fileArray, state) {
+  if (!state) return [];
+  const stateEnd = state.addr + state.size;
+  const out = [];
+  for (const img of fileArray) {
+    const from = Math.floor(img.address / SECTOR) * SECTOR;
+    const to = Math.ceil((img.address + img.data.length) / SECTOR) * SECTOR;
+    if (from < stateEnd && to > state.addr) out.push({ from, to });
+  }
+  return out;
+}
+
+// Byte counts the way flash layouts are read: whole MB/KB where they divide.
+function fmtBytes(n) {
+  for (const [unit, div] of [['MB', 1024 * 1024], ['KB', 1024]]) {
+    if (n >= div) {
+      const v = n / div;
+      return `${Number.isInteger(v) ? v : v.toFixed(1)} ${unit}`;
+    }
+  }
+  return `${n} bytes`;
+}
+
+// Raise the warning for a flash that would write into the state store, and
+// resolve to the user's choice: true to go ahead and erase it, false to cancel.
+// Nothing has been written (or even torn down) at this point, so a cancel simply
+// returns to the running monitor. Dismissals from elsewhere — the backdrop,
+// closeDialogs(), the device going away — come back as a cancel through
+// `stateWarnClose`, so the flash flow is never left waiting on a dialog that is
+// no longer on screen.
+function confirmStateOverlap(state, hits) {
+  const hex = (n) => `0x${n.toString(16)}`;
+  const stateEnd = state.addr + state.size;
+  const ranges = hits
+    .map((h) => `${hex(Math.max(h.from, state.addr))}–${hex(Math.min(h.to, stateEnd))}`)
+    .join(', ');
+  $('statewarn-sub').innerHTML =
+    `Hardware detection found this device&rsquo;s state partition at <b>${hex(state.addr)}</b> ` +
+    `(${fmtBytes(state.size)}) — where it keeps its settings, keys and stored files.`;
+  $('statewarn-body').innerHTML =
+    `<p>The image for this board writes <b>${ranges}</b>, inside that partition. Flashing it ` +
+    `erases what is there: the device comes back up as if factory-fresh and has to be set up ` +
+    `again (password, WiFi, identity keys).</p>` +
+    `<p>Cancel to leave the device exactly as it is — nothing has been written yet.</p>`;
+  $('statewarn-overlay').hidden = false;
+  return new Promise((resolve) => {
+    const done = (go) => {
+      stateWarnClose = null;
+      $('statewarn-overlay').hidden = true;
+      $('statewarn-go').removeEventListener('click', onGo);
+      $('statewarn-cancel').removeEventListener('click', onCancel);
+      $('statewarn-overlay').removeEventListener('click', onBackdrop);
+      resolve(go);
+    };
+    const onGo = () => done(true);
+    const onCancel = () => done(false);
+    // Click off the dialog (on the backdrop) cancels, like the other choices.
+    const onBackdrop = (e) => { if (e.target === $('statewarn-overlay')) done(false); };
+    $('statewarn-go').addEventListener('click', onGo);
+    $('statewarn-cancel').addEventListener('click', onCancel);
+    $('statewarn-overlay').addEventListener('click', onBackdrop);
+    stateWarnClose = done;
+  });
+}
+
+// Take an open state warning off the screen as a cancel.
+function cancelStateWarn() { if (stateWarnClose) stateWarnClose(false); }
+
+// ── build catalogue ─────────────────────────────────────────────────────────
 // Image names to try for a detected board, most-specific first: the exact name,
 // then successively shorter hw- prefixes (so an unlisted hw-foo-bar-baz falls to
 // a listed hw-foo-bar image), then `generic`. Only names present in the catalogue
@@ -2365,14 +2490,16 @@ function catalogueNewer(name, deviceVersion) {
   return cv > deviceVersion;
 }
 
-// Record the detected board on the live monitor and arm the grace window: the
-// firmware logs its build stamp a moment after the reset, so hold the offer until
-// that lands (or the window expires), then evaluate. Used on connect and after an
-// in-monitor flash, so a build published later still surfaces.
-function armFlashGrace(hw) {
+// Record the identified board on the live monitor and arm the grace window: the
+// firmware logs its build stamp a moment after the reset (and immediately after
+// the invocation line the board can come from), so hold the offer until that
+// lands (or the window expires), then evaluate. `fromDetector` marks a board read
+// off the hardware by a detection run, which the boot log may not overwrite.
+function armFlashGrace(hw, fromDetector) {
   if (!monitor) return;
   const m = monitor;
   m.hw = hw;
+  m.hwDetected = !!fromDetector && !!hw;
   m.deviceVersion = null;
   m.versionSettled = false;
   clearTimeout(m.versionTimer);
@@ -2382,14 +2509,18 @@ function armFlashGrace(hw) {
   refreshFlashOffer();
 }
 
-// Resolve the detected board to the best available image and show the flash button
-// — but only when that image is newer than the running firmware. Reactive: re-run
-// whenever the board, the device's build stamp, or the catalogue changes. A
+// Resolve the identified board to the best available image and show the flash
+// button — but only when that image is newer than the running firmware. Reactive:
+// re-run whenever the board, the device's build stamp, or the catalogue changes. A
 // board-specific image names the device in the button; the generic fallback says so.
+//
+// The green slot falls back to "Detect Hardware" while the board is unknown —
+// nothing can be resolved until either the boot log or a detection run names it.
 async function refreshFlashOffer() {
   const m = monitor;
   pendingFlash = null;
   $('monitor-flash').hidden = true;
+  $('monitor-detect').hidden = !m || !!m.hw || detecting;
   if (!m || !m.hw) return;
   // Hold off until the device's stamp has had a chance to arrive, so a current
   // device doesn't briefly show (and let you click) a pointless re-flash.
@@ -2410,28 +2541,56 @@ async function refreshFlashOffer() {
   }
 }
 
-// Flash the pending image, then reopen the monitor and reset into it. Runs from
-// the intro screen (its log + progress bar) with the monitor torn down, so the
-// flow mirrors a fresh flash: flash → openMonitor(reset).
+// Flash the pending image, then reopen the monitor and reset into it. The image
+// is fetched and weighed against the chip first, while the monitor is still up
+// and the device untouched — a download that fails, or a warning the user
+// declines, costs the session nothing. Only past that does the monitor come down
+// and the write run from the intro screen (its log + progress bar), so the flow
+// mirrors a fresh flash: flash → openMonitor(reset).
 async function runPendingFlash() {
   if (!monitor || !pendingFlash) return;
+  const m = monitor;
   const { url } = pendingFlash;
-  const port = monitor.port;
-  const hw = monitor.hw;                      // carry the board across the re-open
-  closeDialogs(monitor);                     // clear any dialog on the way out
-  await closeMonitor();
-  $('monitor').hidden = true;               // reveal the intro screen behind it
+  const port = m.port;
+  const hw = m.hw;                            // carry the board across the re-open
+  const hwDetected = m.hwDetected;            // …and how we came to know it
+  closeDialogs(m);                            // clear any dialog on the way out
   bar.style.display = 'none';
   barfill.style.width = '0';
   logEl.textContent = '';
   logEl.hidden = true;
   $('intro-hint').textContent = '';
+
+  // Fetch and unpack with the monitor still up and the device still running: the
+  // image's own offsets are the only way to tell whether the write reaches into
+  // the device's state store, and if it does the answer may be "don't" — which
+  // has to leave the session exactly as it was.
+  let plan;
+  note(m, '\x1b[36m-- fetching firmware image --\x1b[0m');
   try {
-    let banner = await flash(port, url);
+    plan = await loadFlashPlan(url);
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    log(`Error: ${msg}`, 'err');
+    note(m, `\x1b[31m-- flash aborted: ${msg} --\x1b[0m`);
+    return;
+  }
+  if (monitor !== m) return;                  // session replaced while downloading
+  const hits = stateOverlaps(plan.fileArray, statePart);
+  if (hits.length && !(await confirmStateOverlap(statePart, hits))) {
+    if (monitor === m) note(m, '\x1b[33m-- flash cancelled; the device was not touched --\x1b[0m');
+    return;
+  }
+  if (monitor !== m) return;                  // …or while the warning was up
+
+  await closeMonitor();
+  $('monitor').hidden = true;                 // reveal the intro screen behind it
+  try {
+    let banner = await flash(port, plan);
     const usb = usbInfoLine(port);
     if (usb) banner = [usb, ...(banner || [])];
     await openMonitor(port, true, banner);   // reset into the freshly-flashed firmware
-    armFlashGrace(hw);                        // re-arm: the new build should read as current
+    armFlashGrace(hw, hwDetected);            // re-arm: the new build should read as current
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     log(`Error: ${msg}`, 'err');
@@ -2443,14 +2602,83 @@ async function runPendingFlash() {
 
 $('monitor-flash').addEventListener('click', runPendingFlash);
 
+// ── hardware detection ──────────────────────────────────────────────────────
+// Identify the board on demand, from the monitor's green slot. Probing needs the
+// ROM loader, which means resetting the device and owning the port alone, so the
+// monitor is torn down for the run and reopened after — the same shape as an
+// in-monitor flash, minus the write. Runs on the intro screen so the detector's
+// upload progress is visible, and ends by resetting into the real firmware.
+async function runDetect() {
+  if (!monitor || detecting) return;
+  detecting = true;
+  const port = monitor.port;
+  closeDialogs(monitor);                    // clear any dialog on the way out
+  await closeMonitor();
+  $('monitor').hidden = true;               // reveal the intro screen behind it
+  $('monitor-detect').hidden = true;
+  bar.style.display = 'none';
+  barfill.style.width = '0';
+  logEl.textContent = '';
+  logEl.hidden = true;
+  $('intro-hint').textContent = 'Probing device…';
+
+  // Probe for the chip banner, then RAM-load the peripheral detector (no flash
+  // write) and capture its findings. A non-ESP device just gets the plain
+  // terminal back.
+  let info = null;
+  let hw = null;
+  let banner;
+  try {
+    info = await probeChip(port);
+    if (info) {
+      const detected = await runDetection(port);
+      hw = detectedHw(detected);
+      // What the run read off the flash outranks whatever a previous one did —
+      // including "no state store", which is a real answer (a never-booted chip).
+      // A run that captured nothing at all is no answer, so it changes nothing.
+      if (detected.length) statePart = detectedStatePart(detected);
+      banner = detected.length ? [...info, '', ...detected] : info;
+    } else {
+      banner = ['No ESP32 detected.'];
+    }
+  } catch (e) {
+    banner = [`Detection failed: ${e && e.message ? e.message : e}`];
+  }
+  const usb = usbInfoLine(port);
+  if (usb) banner = [usb, ...banner];
+  // Reset back into the real firmware (this wipes the RAM detector) whenever the
+  // ROM loader answered — the chip is sitting in it and would stay there.
+  try {
+    await openMonitor(port, !!info, banner);
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    log(`Error: ${msg}`, 'err');
+    // Detection may have left the port closed; drop back to a plain monitor so
+    // the user can retry or reset manually.
+    try { await openMonitor(port, false, [`Detection failed: ${msg}`]); } catch (_) { /* */ }
+  } finally {
+    detecting = false;   // before the offer refresh, so an empty result re-offers detection
+  }
+  // Record what we learned (nothing, on a failed run — which puts the Detect
+  // Hardware button back) and offer a flash only if a newer build is published.
+  armFlashGrace(hw, true);
+}
+
+$('monitor-detect').addEventListener('click', runDetect);
+
 let connecting = false;
 
-// Pop the serial chooser, probe + detect, open the monitor, and offer a flash for
-// the detected board. requestPort() is called first, while the user gesture is
-// fresh, before any long await.
+// Pop the serial chooser and open the monitor on the port — nothing more. The
+// device is not probed and not reset: it keeps doing whatever it was doing, and
+// the monitor just watches. Identifying the board (which costs a reset) waits for
+// the Detect Hardware button, or for the firmware's own `build: invocation` line.
+// requestPort() is called first, while the user gesture is fresh, before any long
+// await.
 async function connect() {
   if (connecting || monitor) return;
   connecting = true;
+  statePart = null;                  // a fresh pick may be a different chip
+
   $('start').hidden = true;          // the action is underway — drop the CTA
   bar.style.display = 'none';
   barfill.style.width = '0';
@@ -2467,27 +2695,11 @@ async function connect() {
       $('start').hidden = false;      // let them re-pick; finally{} clears `connecting`
       return;
     }
-    // Probe for the chip banner, then RAM-load the peripheral detector (no flash
-    // write), capture its findings, and fold them into the banner. A non-ESP
-    // device just gets the plain terminal.
-    $('intro-hint').textContent = 'Probing device…';
-    const info = await probeChip(port);
-    let banner;
-    let hw = null;
-    if (info) {
-      const detected = await runDetection(port);
-      hw = detectedHw(detected);
-      banner = detected.length ? [...info, '', ...detected] : info;
-    } else {
-      banner = ['No ESP32 detected.'];
-    }
-    // Reset back into the real firmware (this wipes the RAM detector), then the
-    // monitor shows the firmware's own boot output.
-    const doReset = !!info;
+    const banner = ['Monitoring only — the device has not been reset.',
+                    'Press “Detect Hardware” to identify the board (that resets it).'];
     const usb = usbInfoLine(port);
-    if (usb) banner = [usb, ...(banner || [])];
-    await openMonitor(port, doReset, banner);
-    armFlashGrace(hw);   // offer a flash only if a newer build than the one booting
+    await openMonitor(port, false, usb ? [usb, ...banner] : banner);
+    refreshFlashOffer();   // board unknown → the green slot offers detection
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     $('intro-hint').innerHTML = `<span class="err">${msg}</span>`;

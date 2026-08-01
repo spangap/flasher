@@ -230,6 +230,20 @@ def detected_hw(lines):
     return None
 
 
+def detected_state_part(lines):
+    """The detector's `DETECTED: spangap state partition at 0x… size 0x…` line,
+    if any: where the device keeps its own data (settings, keys, files), as read
+    off this chip — (addr, size) — or None if it found no store there."""
+    for l in lines:
+        m = re.match(r"^DETECTED:\s+spangap state partition at 0x([0-9a-fA-F]+) "
+                     r"size 0x([0-9a-fA-F]+)", l)
+        if m:
+            addr, size = int(m.group(1), 16), int(m.group(2), 16)
+            if size > 0:
+                return (addr, size)
+    return None
+
+
 def _project_slug(project):
     return re.sub(r"[^a-z0-9]+", "-", (project or "").lower()).strip("-") or "flashmon"
 
@@ -367,21 +381,89 @@ def run_detection(src, port, attempts=2):
     return (True, result)
 
 
-def flash_image(src, rel, port):
+# Flash erases whole sectors, so a write erases from the start of the sector its
+# first byte lands in through the end of the sector its last byte lands in — one
+# byte past a boundary costs the whole next sector.
+SECTOR = 0x1000
+
+
+def state_overlaps(files, tmpdir, state):
+    """The (from, to) erase ranges of `files` (a flasher_args flash_files map,
+    offset → filename, unpacked in `tmpdir`) that reach into the state partition
+    `state` = (addr, size). Empty when the write leaves the store alone — and
+    when nothing is known about it, since an unprobed chip is no evidence of a
+    clash."""
+    if not state:
+        return []
+    addr, size = state
+    end = addr + size
+    hits = []
+    for off, fname in files.items():
+        start = int(off, 16)
+        try:
+            length = os.path.getsize(os.path.join(tmpdir, fname))
+        except OSError:
+            continue
+        frm = start // SECTOR * SECTOR
+        to = -(-(start + length) // SECTOR) * SECTOR
+        if frm < end and to > addr:
+            hits.append((frm, to))
+    return hits
+
+
+def fmt_bytes(n):
+    """Byte counts the way flash layouts are read: whole MB/KB where they divide."""
+    for unit, div in (("MB", 1024 * 1024), ("KB", 1024)):
+        if n >= div:
+            v = n / div
+            return "%g %s" % (round(v, 1), unit)
+    return "%d bytes" % n
+
+
+def confirm_state_overlap(state, hits):
+    """Warn that this image writes into the device's state partition and ask
+    whether to go ahead. True to erase it and flash, False to cancel."""
+    addr, size = state
+    end = addr + size
+    ranges = ", ".join("0x%x–0x%x" % (max(f, addr), min(t, end)) for f, t in hits)
+    hr()
+    print("WARNING: this flash erases the device's stored data.")
+    print("  Hardware detection found the state partition at 0x%x (%s) — where the"
+          % (addr, fmt_bytes(size)))
+    print("  device keeps its settings, keys and stored files.")
+    print("  This image writes %s, inside it. Flashing erases what is there:" % ranges)
+    print("  the device comes back up as if factory-fresh and has to be set up again")
+    print("  (password, WiFi, identity keys).")
+    hr()
+    try:
+        ans = input("Erase it and flash anyway? [y/N]: ").strip().lower()
+    except EOFError:
+        ans = ""
+    return ans in ("y", "yes")
+
+
+def flash_image(src, rel, port, state=None):
     """Download the image zip at `rel`, unpack it, and write every image at its
-    offset. Returns True on success."""
+    offset. `state` is the state partition read off this chip, if it has been
+    detected: a write reaching into it is confirmed first, since it erases the
+    device's own data. Returns "ok", "failed", or "cancelled"."""
     zbytes = src.read_bytes(rel)
     tmpdir = tempfile.mkdtemp(prefix="flashmon-")
     zipfile.ZipFile(io.BytesIO(zbytes)).extractall(tmpdir)
     args_path = os.path.join(tmpdir, "flasher_args.json")
     if not os.path.exists(args_path):
-        print("flasher.zip has no flasher_args.json"); return False
+        print("flasher.zip has no flasher_args.json"); return "failed"
     with open(args_path) as f:
         fargs = json.load(f)
     settings = fargs.get("flash_settings", {})
     files = fargs.get("flash_files", {})
     if not files:
-        print("flasher_args.json lists no flash_files"); return False
+        print("flasher_args.json lists no flash_files"); return "failed"
+
+    # Asked before the first write, so a "no" leaves the device untouched.
+    hits = state_overlaps(files, tmpdir, state)
+    if hits and not confirm_state_overlap(state, hits):
+        return "cancelled"
 
     args = ["--chip", "esp32s3", "-p", port, "-b", "460800", "write_flash"]
     if settings.get("flash_mode"):
@@ -393,7 +475,7 @@ def flash_image(src, rel, port):
     for off, fname in sorted(files.items(), key=lambda kv: int(kv[0], 16)):
         args += [off, os.path.join(tmpdir, fname)]
     rc, _ = _esptool(args)
-    return rc == 0
+    return "ok" if rc == 0 else "failed"
 
 
 # ── guided setup + web-UI address (plain, line-oriented) ─────────────────────
@@ -1194,7 +1276,7 @@ def choose_port(preset=None):
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
-def _simple_flow(src, cfg, args, ui_port, hw, project, host_default):
+def _simple_flow(src, cfg, args, ui_port, hw, project, host_default, state=None):
     """`--simple` fallback: esp-idf-monitor can't host our live, version-gated flash
     offer, so give a one-shot pre-monitor flash choice (unconditional — we can't
     observe the running build here), then guided setup and esp-idf-monitor."""
@@ -1216,10 +1298,12 @@ def _simple_flow(src, cfg, args, ui_port, hw, project, host_default):
             return
         if i == 0:
             hr(); print("Flashing %s…" % chosen); hr()
-            if not flash_image(src, chosen_rel, ui_port):
+            res = flash_image(src, chosen_rel, ui_port, state)
+            if res == "failed":
                 print("Flash FAILED — not opening the monitor.")
                 return
-            print("Flash complete.")
+            print("Flash complete." if res == "ok"
+                  else "Flash cancelled — the device was not touched.")
     guided_setup(ui_port, host_default)
     launch_monitor(ui_port)          # replaces this process; never returns
 
@@ -1237,6 +1321,7 @@ def run(src, cfg, args):
     if not found:
         print("No ESP32 detected (or couldn't connect) — you can still open the monitor.")
     hw = detected_hw(detected)
+    state = detected_state_part(detected)   # guards the flash offers below
     if hw:
         print("Detected board: %s" % hw[3:])
     elif found:
@@ -1250,7 +1335,7 @@ def run(src, cfg, args):
     host_default = re.sub(r"[^a-z0-9_]", "", project.lower()) or "device"
 
     if getattr(args, "simple", False):
-        _simple_flow(src, cfg, args, ui_port, hw, project, host_default)
+        _simple_flow(src, cfg, args, ui_port, hw, project, host_default, state)
         return
 
     # Default: our full-screen TUI monitor. It resets the device, splits the screen
@@ -1266,8 +1351,12 @@ def run(src, cfg, args):
             break
         _, rel, name = action
         hr(); print("Flashing %s…" % name); hr()
-        print("Flash complete — reopening the monitor." if flash_image(src, rel, ui_port)
-              else "Flash FAILED — reopening the monitor.")
+        # Out of curses here, so the state-partition warning (if the image reaches
+        # into it) reads and prompts on the plain terminal, like esptool's output.
+        print({"ok": "Flash complete — reopening the monitor.",
+               "cancelled": "Flash cancelled — reopening the monitor.",
+               "failed": "Flash FAILED — reopening the monitor."}
+              [flash_image(src, rel, ui_port, state)])
         time.sleep(0.5)              # let the OS release the port before re-open
 
 
