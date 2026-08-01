@@ -123,7 +123,8 @@ clears it. baryluk's fix, which we mirror: **drain before closing.**
 **Drain on disconnect.** `fnbTeardown` stops the keepalive first, then keeps the
 device **open** for `FNB58_DRAIN_MS` (1 s) with the report handler still attached,
 so the browser keeps reading the endpoint and empties the meter's FIFO; only then
-does it `close()`. No full buffer at close → no freeze. (This is the primary cure;
+does it `close()` and drop the grant. No full buffer at close → no freeze. (This
+is the primary cure;
 everything below is backup, since the drain is only *mostly* reliable — the same
 loggers note the meter still occasionally sticks, and then a replug is the answer,
 which `fnbShowTrouble` tells the user.)
@@ -152,17 +153,27 @@ runs `fnbCloseGranted` first. Disconnect→reconnect is serialized by an
 (`allowInit` + no data yet). A unit that happens to still be streaming is latched
 onto without a re-init; only a genuinely idle meter is kicked.
 
-**Connect = grant → chooser → power-cycle** (`fnbConnect`, only ever from the label
-click; nothing runs on load):
+**A grant is never reused — every connect goes through the chooser.** A remembered
+grant is a handle onto a meter whose state we know nothing about: it may be
+mid-stream from another tab, or wedged from a session that ended badly, and
+opening it silently is how a session starts against a frozen unit. So a grant
+lives exactly as long as the session that asked for it. `fnbForget(device)` closes
+the handle and calls `device.forget()`, so `navigator.hid.getDevices()` stops
+returning it; `fnbForgetGranted()` sweeps every FNB58 grant this tab still holds.
+It runs in three places: on **load** (anything a prior session or a crash left
+behind), before every **connect**, and at **teardown** — including the
+`pagehide`/`beforeunload` cleanup, whose async `forget()` the unload may cut
+short, which is what the boot sweep is there to finish.
 
-1. **Reuse an existing grant silently** — one lean attempt (`fnbTryGranted(1)`).
-   Open the granted meter and wait up to `FNB58_DATA_WAIT_MS` (1.5 s) for a **valid
-   report** — *opened* is not *working* (`fnbAwaitData` is the proof). Kept to a
-   single attempt, it leaves the click's ~5 s transient activation intact for step 2.
-2. **Re-ask for the HID device** (`requestDevice`) — the label click carries the
-   user gesture WebHID's chooser requires. The picked device gets the generous
-   retries (`fnbTryDevice(device, 3)`, no activation clock once chosen).
-3. **Give up with a power-cycle hint.** If neither yields data, a dialog tells the
+**Connect = chooser → power-cycle** (`fnbConnect`, only ever from the label click;
+nothing runs on load):
+
+1. **Revoke any leftover grant** (`fnbForgetGranted`), then **ask for the HID
+   device** (`requestDevice`) — the label click carries the user gesture WebHID's
+   chooser requires. The picked device gets generous retries
+   (`fnbTryDevice(device, 3)`), each waiting up to `FNB58_DATA_WAIT_MS` (1.5 s) for
+   a **valid report**, since *opened* is not *working* (`fnbAwaitData` is the proof).
+2. **Give up with a power-cycle hint.** If it yields no data, a dialog tells the
    user to unplug/replug the FNB58 (`fnbShowTrouble`).
 
 **Losing data mid-stream.** A 1 Hz watchdog (`fnbTick`) notices when no valid report

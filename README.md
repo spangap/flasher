@@ -137,16 +137,17 @@ it:
   the running average and clears the buffer (back to auto) on click. Current is
   kept at the meter's full 0.01 mA resolution; readouts below 20 mA show one
   decimal. It never grabs the meter on its own — only your click opens the panel,
-  which pops the HID chooser to pick the meter. These units are fragile: they have
-  no stop command and **freeze if the connection is closed while their internal FIFO
-  is full** (a documented FNIRSI quirk), which then crashes the next session — so on
+  which pops the HID chooser to pick the meter, every time: a grant is never
+  reused, and one left over from an earlier session is revoked rather than
+  silently opened. These units are fragile: they have no stop command and
+  **freeze if the connection is closed while their internal FIFO is full** (a
+  documented FNIRSI quirk), which then crashes the next session — so on
   disconnect flashmon **drains the FIFO** (keeps reading ~1 s with the keepalive
-  stopped) before closing, backed by a short settle cooldown during which the FNB58
-  button is hidden. One shared LocalSettings timestamp drives that cooldown and also
-  keeps two tabs off the same meter. If a meter does freeze anyway, unplug/replug it.
-  See
-  [`docs/fnb58.md`](docs/fnb58.md) for the HID protocol and rendering. Browser
-  only — `flashmon.py` has no equivalent.
+  stopped) before closing, backed by a short settle cooldown during which the
+  FNB58 button is hidden. One shared LocalSettings timestamp drives that cooldown
+  and also keeps two tabs off the same meter. If a meter does freeze anyway,
+  unplug/replug it. See [`docs/fnb58.md`](docs/fnb58.md) for the HID protocol and
+  rendering. Browser only — `flashmon.py` has no equivalent.
 
 A fresh device (no admin password, or falling back to its own AP) is walked
 through a one-time setup: a password dialog, then a WiFi-connect dialog, sent to

@@ -980,13 +980,22 @@ async function fnbUnbind() {
   }
 }
 
-// Close every granted meter handle this tab still holds — belt-and-suspenders
-// before a connect, so no leftover open() from a prior session is live when we
-// open a fresh one. (close() only reaches this tab's own handles.)
-async function fnbCloseGranted() {
+// Close a handle (if open) and revoke its grant, so navigator.hid.getDevices()
+// stops returning it. The meter is never silently reused across sessions — every
+// connect goes through the chooser — so once a session ends we drop it entirely.
+async function fnbForget(device) {
+  if (!device) return;
+  try { if (device.opened) await device.close(); } catch (_) {}
+  try { await device.forget(); } catch (_) {}
+}
+
+// Revoke every FNB58 grant this tab still holds — belt-and-suspenders before a
+// connect and on load, so no grant a prior session (or a crash) left behind can
+// be silently reused. (getDevices()/forget() only reach this tab's own grants.)
+async function fnbForgetGranted() {
   let devices = [];
   try { devices = (await navigator.hid.getDevices()).filter(isFnb58); } catch (_) { return; }
-  for (const d of devices) if (d.opened) { try { await d.close(); } catch (_) {} }
+  for (const d of devices) await fnbForget(d);
 }
 
 // Wait up to FNB58_DATA_WAIT_MS for the just-bound meter to deliver a valid
@@ -1017,14 +1026,6 @@ async function fnbTryDevice(device, tries, allowInit = true) {
   return false;
 }
 
-// Try each already-granted meter; stream the first that yields data (with retries).
-async function fnbTryGranted(tries) {
-  let devices = [];
-  try { devices = (await navigator.hid.getDevices()).filter(isFnb58); } catch (_) { return false; }
-  for (const d of devices) if (await fnbTryDevice(d, tries)) return true;
-  return false;
-}
-
 function fnbShowTrouble() {
   showInfo('FNB58', '<p>Couldn’t get a reading from the FNB58. These meters can freeze if a ' +
     'session ends abruptly — the surest fix is to <b>unplug the FNB58 and plug it back in</b>, ' +
@@ -1034,8 +1035,9 @@ function fnbShowTrouble() {
 // Connect the meter — only ever from the user clicking the FNB58 label. Opening
 // the panel is always a deliberate act; nothing connects on its own. First honour
 // the cooldown (a recently-active meter isn't idle enough to re-init — that's the
-// crash), then reuse an existing grant silently; if that yields no data it re-asks
-// the HID chooser; if that too yields nothing, it points the user at a power-cycle.
+// crash), then revoke any leftover grant and always re-ask the HID chooser — the
+// grant is never reused silently. If the chosen meter yields nothing, it points
+// the user at a power-cycle.
 async function fnbConnect() {
   if (!('hid' in navigator)) {
     showInfo('FNB58', '<p>This browser has no WebHID support. Use Chrome or Edge, served over HTTPS (or localhost).</p>');
@@ -1050,12 +1052,7 @@ async function fnbConnect() {
   }
   fnb.connecting = true;
   try {
-    await fnbCloseGranted();                        // drop any stale handle this tab still holds
-    // Grant phase is a SINGLE lean attempt: the common reconnect streams within a
-    // few hundred ms, and staying lean here keeps the click's ~5 s transient
-    // activation alive for the requestDevice() fallback below. The chooser device
-    // then gets the generous retries (no activation clock once it's picked).
-    if (await fnbTryGranted(1)) return;
+    await fnbForgetGranted();                       // revoke any leftover grant — never reuse one silently
     let device = null;
     try { device = (await navigator.hid.requestDevice({ filters: FNB58_FILTERS })).filter(isFnb58)[0]; }
     catch (_) { /* chooser dismissed */ }
@@ -1076,12 +1073,13 @@ async function fnbAutoRecover() {
   fnb.recovering = true;
   const device = fnb.device;
   try {
-    if (monitor) { try { monitor.term.writeln('\x1b[33m-- FNB58 stream stalled; reconnecting… --\x1b[0m'); } catch (_) {} }
+    if (monitor) { try { note(monitor, '\x1b[33m-- FNB58 stream stalled; reconnecting… --\x1b[0m'); } catch (_) {} }
     await fnbUnbind();                             // release our handle before touching it again
     await sleep(FNB58_RETRY_MS);
     if (await fnbTryDevice(device, 1, false)) return;   // re-latch a live stream (no re-init)
     await fnbTeardown();                           // gone quiet → disconnect; cooldown gates the reopen
-    if (monitor) { try { monitor.term.writeln('\x1b[31m-- FNB58 disconnected (no data) --\x1b[0m'); } catch (_) {} }
+    await fnbForget(device);                       // revoke the grant (teardown can't — we already unbound)
+    if (monitor) { try { note(monitor, '\x1b[31m-- FNB58 disconnected (no data) --\x1b[0m'); } catch (_) {} }
   } finally {
     fnb.recovering = false;
   }
@@ -1091,8 +1089,9 @@ async function fnbAutoRecover() {
 // and FREEZE if you close while their internal FIFO is full (a documented quirk),
 // which is what crashes the next session — so first stop the keepalive and keep the
 // device open a moment (FNB58_DRAIN_MS) with reports still being consumed, letting
-// the browser empty that FIFO, THEN close. Hides the button at once and stamps the
-// meter active so a brief cooldown backs up the drain.
+// the browser empty that FIFO, THEN close and forget the grant (reconnect always
+// re-prompts). Hides the button at once and stamps the meter active so a brief
+// cooldown backs up the drain.
 async function fnbTeardown() {
   cancelAnimationFrame(fnb.raf); fnb.raf = 0;
   clearInterval(fnb.refreshTimer); fnb.refreshTimer = null;   // stop the keepalive FIRST
@@ -1100,8 +1099,10 @@ async function fnbTeardown() {
   $('monitor').classList.remove('fnb58-open');
   $('monitor-fnb58').classList.remove('on');
   $('monitor-fnb58').hidden = true;            // hide the button immediately (no 5 s poll lag)
-  if (fnb.device) await sleep(FNB58_DRAIN_MS); // drain: browser keeps reading the endpoint until we close
+  const dev = fnb.device;
+  if (dev) await sleep(FNB58_DRAIN_MS);        // drain: browser keeps reading the endpoint until we close
   await fnbUnbind();                           // awaited: the handle is fully released on return
+  await fnbForget(dev);                         // revoke the grant so nothing is remembered past this session
   fnbMarkActive();                             // start the settle cooldown from now
   fnbPollStatus();                             // reconcile the label state right away
 }
@@ -1128,10 +1129,12 @@ function fnbPollStatus() {
   }
 }
 
-// Close the meter when the tab is navigated away or closed: stamp it active (so a
-// reload can't reopen inside the cooldown) and best-effort close the HID session.
+// Drop the meter when the tab is navigated away or closed: stamp it active (so a
+// reload can't reopen inside the cooldown) and best-effort close + forget the HID
+// grant so nothing is remembered. The unload may cut the async forget() short, so
+// the boot sweep (fnbForgetGranted) forgets any survivor on the next load.
 function fnbCleanup() {
-  if (fnb.device) { fnbMarkActive(); try { fnb.device.close(); } catch (_) {} }
+  if (fnb.device) { fnbMarkActive(); fnbForget(fnb.device); fnb.device = null; }
 }
 window.addEventListener('pagehide', fnbCleanup);
 window.addEventListener('beforeunload', fnbCleanup);
@@ -2790,9 +2793,12 @@ async function boot() {
   $('start').addEventListener('click', () => connect());
 
   // The FNB58 graph never opens on its own — only the user clicking the FNB58
-  // label connects it. A 5 s poll keeps the shared active stamp fresh while
-  // streaming and the label in step with the settle cooldown (hidden until the
-  // meter has idled long enough to be safely reopened).
+  // label connects it, and it is never reconnected from a remembered grant: on
+  // load we forget any grant a prior session left behind, so the first click
+  // always goes through the chooser. A 5 s poll then keeps the shared active
+  // stamp fresh while streaming and the label in step with the settle cooldown
+  // (hidden until the meter has idled long enough to be safely reopened).
+  if ('hid' in navigator) fnbForgetGranted();
   fnbPollStatus();
   setInterval(fnbPollStatus, 5000);
 }
