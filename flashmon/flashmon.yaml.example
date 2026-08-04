@@ -12,15 +12,28 @@
 #             flashmon.py so a downloaded copy knows where to fetch config +
 #             images from. Omit for a purely local/bundled setup.
 #   builds:   the catalogue of ready-to-flash images. Each entry is:
-#               name        the image name. Name it after the hw-<straddle> the
-#                           detector reports, so the browser can match a detected
-#                           board to its image. `generic` is the fallback for any
-#                           board without a dedicated image.
+#               name        the image name, and its distribution identity — the
+#                           device reports it back as sys.build.dist, so a
+#                           re-flash offer can mean "same dist, newer stamp".
+#                           Free-format: a board may have several entries that
+#                           differ in what is left out to fit its flash. Name it
+#                           after the hw-<straddle> the detector reports so the
+#                           browser can match a detected board to its image;
+#                           `generic` is the fallback for any board without a
+#                           dedicated image.
 #               invocation  the `spangap build` arguments that produce it.
 #               version     DO NOT hand-edit. `make` in builds/ writes this per
 #                           entry — the build datetime it stamped that image with
 #                           — and names the image builds/<slug>_<name>_<version>.zip.
 #                           A subset build re-stamps only the entries it rebuilt.
+#                           It is the ordering field: a sortable stamp, which is
+#                           why identity lives in `name` and not here.
+#               flash_floor_kb  DO NOT hand-edit. Written by `make`: the minimum
+#                           chip size this image needs. A board smaller than this
+#                           cannot run it, and saying so here is what avoids a
+#                           multi-megabyte download to discover it.
+#               image_bytes DO NOT hand-edit. Written by `make`: the bytes this
+#                           image writes to flash.
 #             The browser (and flashmon.py) fetch that stamped image for the
 #             detected board, falling back to builds/generic.zip.
 #

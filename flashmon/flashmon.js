@@ -368,7 +368,10 @@ async function attachStreams(m, sync = false) {
           if (!$('stuck-overlay').hidden) $('stuck-overlay').hidden = true;  // device came back
           // Activity counts above even while the opening partial line is being
           // dropped; only what reaches the terminal and the parser is trimmed.
-          const out = m.lineSync && m.lineSync.pending ? trimToLineStart(m, value) : value;
+          let out = m.lineSync && m.lineSync.pending ? trimToLineStart(m, value) : value;
+          // Frames come out of the byte stream before anything else sees it, so
+          // the terminal and the log parser get the stream unchanged.
+          if (out && out.length) out = rpcFeed(m, out);
           if (!out || out.length === 0) continue;
           m.term.write(out);         // xterm decodes as UTF-8
           m.rngJustArmed = false;
@@ -435,7 +438,12 @@ function makeSession(port, term, resizeObserver, muted) {
            // versionSettled goes true once the stamp arrives or the grace expires,
            // so an up-to-date device never flashes the button on the way there.
            hw: null, hwDetected: false, deviceVersion: null, versionSettled: false, versionTimer: null,
-           rxSeq: 0, rngArmed: false, rngJustArmed: false, rngTimer: null, rngRecovering: false };
+           rxSeq: 0, rngArmed: false, rngJustArmed: false, rngTimer: null, rngRecovering: false,
+           // The framed side-channel (see the RPC section below). Per session,
+           // because it is a property of the port: a handover to a new port
+           // starts unarmed until that port's device announces the capability.
+           rpc: { buf: new Uint8Array(0), held: 0, replies: new Map(), waiters: new Map(),
+                  available: false, marker: false, probed: false, chain: Promise.resolve() } };
 }
 
 // The port a console handover moved away from. Its streams stay up and keep
@@ -1162,6 +1170,188 @@ if ('hid' in navigator)
 //     host <hostname>`) — the hostname drives the Open Device UI target.
 // Device log lines look like: `<ts> I [net] <message>`.
 
+// ── framed RPC over the console port ─────────────────────────────────────────
+// A framed side-channel multiplexed onto the same console port, over which we
+// run an ordinary CLI command and read exactly its output. Frames are never
+// echoed, never enter the device's line editor and never flip its console into
+// CLI mode — which is what lets provisioning run without colliding with whoever
+// is typing, and gives every command sent a reply to confirm against.
+//
+// The contract (wire format, ids, truncation, the marker) is
+// spangap-core/docs/framed-rpc.md. flashmon.py implements the same thing.
+//
+//     <magic:4> <id:1> <len:2 big-endian> <payload:len>
+const RPC_MAGIC = Uint8Array.of(0xf5, 0x53, 0x47, 0x01);   // 0xF5 can't open UTF-8
+const RPC_HEADER = RPC_MAGIC.length + 3;
+// Printed by the device the moment its sniffer arms, very early in boot. No
+// marker, no frame ever leaves here: firmware without the sniffer would take a
+// frame as keystrokes typed at the console, opening a CLI session on a device
+// that was never going to answer. The capability is advertised, never probed.
+const RPC_MARKER = 'serial: framed rpc v1';
+// A frame whose remainder never arrives — a corrupt length, or a device that
+// reset mid-reply — must not hold the terminal back for as long as it takes
+// 64 KB to turn up. Give up on it and resync on the next magic.
+const RPC_RESYNC_MS = 2000;
+
+function concatBytes(list) {
+  if (list.length === 1) return list[0];
+  let n = 0;
+  for (const p of list) n += p.length;
+  const out = new Uint8Array(n);
+  let at = 0;
+  for (const p of list) { out.set(p, at); at += p.length; }
+  return out;
+}
+
+function matchesAt(b, i, n) {
+  for (let k = 0; k < n; k++) if (b[i + k] !== RPC_MAGIC[k]) return false;
+  return true;
+}
+
+// Swallow frames out of a raw serial chunk; return the bytes that were not
+// frame, for the terminal and the log parser. Everything else in the session
+// sees the stream exactly as the device sent it.
+function rpcFeed(m, chunk) {
+  const r = m.rpc;
+  let b = r.buf.length ? concatBytes([r.buf, chunk]) : chunk;
+  const out = [];
+  if (b.length && r.held && Date.now() - r.held > RPC_RESYNC_MS) {
+    out.push(b.subarray(0, 1));            // abandoned — let its magic through
+    b = b.subarray(1);
+  }
+  let i = 0;
+  for (;;) {
+    let j = -1;
+    for (let k = i; k < b.length; k++) if (b[k] === RPC_MAGIC[0]) { j = k; break; }
+    if (j < 0) { out.push(b.subarray(i)); i = b.length; break; }
+    if (j > i) out.push(b.subarray(i, j));
+    i = j;
+    const avail = b.length - i;
+    if (avail < RPC_MAGIC.length) {
+      if (!matchesAt(b, i, avail)) { out.push(b.subarray(i, i + 1)); i++; continue; }
+      break;                                // partial magic — wait for more
+    }
+    if (!matchesAt(b, i, RPC_MAGIC.length)) {
+      out.push(b.subarray(i, i + 1)); i++; continue;    // false start — it's text
+    }
+    if (avail < RPC_HEADER) break;          // header incomplete
+    const end = i + RPC_HEADER + ((b[i + 5] << 8) | b[i + 6]);
+    if (b.length < end) break;              // payload incomplete
+    rpcDeliver(m, b[i + 4], b.subarray(i + RPC_HEADER, end));
+    i = end;
+  }
+  r.buf = b.subarray(i);
+  r.held = r.buf.length ? (r.held || Date.now()) : 0;
+  return concatBytes(out.length ? out : [new Uint8Array(0)]);
+}
+
+function rpcDeliver(m, id, payload) {
+  const text = new TextDecoder().decode(payload);
+  const waiter = m.rpc.waiters.get(id);
+  if (waiter) { m.rpc.waiters.delete(id); waiter(text); return; }
+  // Nobody waiting: a reply that landed just after its timeout. Keep it — the
+  // retry carries the same id, so this answers it without a second execution.
+  m.rpc.replies.set(id, text);
+}
+
+// The id identifies WHAT was asked, not when, so a retry reuses it and a late
+// reply to the first attempt is a perfectly good answer to the second. That is
+// what stops a timeout from returning a *wrong* answer — the late reply being
+// taken as the answer to whatever went out next. Derived from the command, so
+// neither end keeps state. The device never interprets it; it copies it back.
+// Kept in 0x20..0xBF so a frame typed at firmware that doesn't speak them (the
+// probe in rpcEnsure) can't carry a byte the console acts on: no CR/LF to
+// execute the garbage line, no 0x03 to abort early, no 0xC0 to open a
+// serial-handler session. The device never interprets the id either way — it
+// copies it back — so constraining it costs nothing.
+function rpcId(cmd) {
+  let h = 0;
+  for (let i = 0; i < cmd.length; i++) h = (h * 31 + cmd.charCodeAt(i)) & 0xff;
+  return 0x20 + (h % 0xa0);
+}
+
+// Run `cmd` on the device and resolve with its output. null means it did not
+// answer — distinct from '', which is a real answer meaning the command printed
+// nothing. A command that fails also answers, with whatever it printed.
+async function rpcQuery(m, cmd, timeout = 2500, tries = 2) {
+  if (!m || !m.rpc.available || !m.writer) return null;
+  const bytes = new TextEncoder().encode(cmd);
+  if (bytes.length > 0xffff) return null;
+  const id = rpcId(cmd);
+  const frame = new Uint8Array(RPC_HEADER + bytes.length);
+  frame.set(RPC_MAGIC, 0);
+  frame[4] = id;
+  frame[5] = bytes.length >> 8;
+  frame[6] = bytes.length & 0xff;
+  frame.set(bytes, RPC_HEADER);
+  // Strictly one frame in flight: the device processes them synchronously, and
+  // two overlapping queries could each take the other's reply if their ids
+  // collided. Chained rather than locked — callers just await.
+  const prev = m.rpc.chain;
+  let release;
+  m.rpc.chain = new Promise((r) => { release = r; });
+  await prev.catch(() => {});
+  try {
+    for (let n = 0; n < tries; n++) {
+      m.rpc.replies.delete(id);
+      try { await m.writer.write(frame); } catch (_) { return null; }
+      const got = await new Promise((resolve) => {
+        const t = setTimeout(() => { m.rpc.waiters.delete(id); resolve(null); }, timeout);
+        m.rpc.waiters.set(id, (text) => { clearTimeout(t); resolve(text); });
+      });
+      if (got !== null) return got;
+      const late = m.rpc.replies.get(id);   // landed between the timeout and here
+      if (late !== undefined) { m.rpc.replies.delete(id); return late; }
+    }
+    return null;
+  } finally { release(); }
+}
+
+// Make sure we know whether this device speaks frames, probing once if the
+// marker never arrived.
+//
+// The marker is printed once, very early in boot, so only a session that
+// watched this device boot catches it — and opening the monitor deliberately
+// does NOT reset the device ("Monitoring only"), which is the everyday case.
+// Waiting for a marker that already scrolled past means silently falling back
+// to typing commands at the console forever.
+//
+// Probing is safe because it is recoverable, which is the part that matters. On
+// firmware that speaks frames the probe is swallowed and answered and costs
+// nothing at all. On firmware that does not, the bytes are typed at the
+// console: the first opens a CLI session and the rest land in its line editor —
+// so we follow with Ctrl-C, which that firmware treats as "abort this line and
+// go back to the log". The price of guessing wrong is a CLI banner and a
+// "Press Ctrl-]" notice in the stream, once per session.
+async function rpcEnsure(m) {
+  if (!m || !m.writer) return false;
+  if (m.rpc.available) return true;
+  if (m.rpc.probed) return false;          // one probe per session, ever
+  m.rpc.probed = true;
+  m.rpc.available = true;                  // rpcQuery refuses to send otherwise
+  const answered = await rpcQuery(m, 'auth -O', 1500, 1) !== null;
+  if (answered) return true;
+  // The marker may have landed while the probe was in flight — that is a real
+  // answer and outranks the probe's silence.
+  if (m.rpc.marker) return true;
+  m.rpc.available = false;
+  try { await m.writer.write(Uint8Array.of(0x03)); } catch (_) { /* port gone */ }
+  return false;
+}
+
+// `key=value` lines — the device's `-O` onboarding output — as a Map. Unknown
+// keys are ignored and a missing key is unknown, never a default; that is what
+// lets the device's key set grow without breaking this.
+function parseKv(text) {
+  const out = new Map();
+  for (const raw of (text || '').split('\n')) {
+    const line = raw.replace(/\r$/, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+    const eq = line.indexOf('=');
+    if (eq > 0) out.set(line.slice(0, eq).trim(), line.slice(eq + 1));
+  }
+  return out;
+}
+
 // Feed a raw serial chunk through a line splitter; hand each full line to the
 // net-log matcher. The decoder is streaming, so a chunk split mid-UTF-8 or
 // mid-line is stitched back together across reads.
@@ -1175,6 +1365,11 @@ function feedNetParser(m, chunk) {
     // colored bytes; only this parser copy is cleaned.
     const line = m.lineBuf.slice(0, nl).replace(/\r$/, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
     m.lineBuf = m.lineBuf.slice(nl + 1);
+    // The capability marker: the device's frame sniffer is armed, so a frame
+    // may now be sent. Free and instant when we catch it — but it is printed
+    // once, very early in boot, so only a session that watched this device boot
+    // ever sees it. rpcEnsure() covers the rest.
+    if (line.includes(RPC_MARKER)) { m.rpc.marker = true; m.rpc.available = true; continue; }
     // This bootloader line marks a fresh boot. Two jobs: (1) the device
     // sometimes wedges right here (stuck serial port) — arm a watchdog that
     // recovers on 2 s of silence; (2) a boot invalidates the previous session,
@@ -1313,8 +1508,22 @@ function handleNetLine(m, line) {
       m.hostname = mm[4];            // device reported its actual hostname
       if (m === monitor) setMonTitle(mm[4]);
     } else if (!m.hostnameQueried) {
-      m.hostnameQueried = true;      // firmware didn't log it — query it directly
-      sendToDevice(m, 'show s.net.hostname\n\n');
+      m.hostnameQueried = true;      // firmware didn't log it — ask for it
+      // As a frame where the device speaks them: typing this at the console
+      // opens a CLI session and suppresses the log, which is the stream this
+      // very parser is reading. The reply is handled here either way — framed
+      // it comes back to us, typed it comes back as a log line.
+      if (m.rpc.available) {
+        rpcQuery(m, 'show s.net.hostname').then((out) => {
+          const mm2 = /^s\.net\.hostname = (\S+)/m.exec(out || '');
+          if (!mm2) return;
+          m.hostname = mm2[1];
+          deviceUiHost = mm2[1];
+          if (m === monitor) setMonTitle(mm2[1]);
+        });
+      } else {
+        sendToDevice(m, 'show s.net.hostname\n\n');
+      }
     }
     showOpenUi(m, mm[2], mm[1]);     // device online → show the "Open Device UI" button
     advanceSetup(m);                 // network is up → no wifi dialog needed
@@ -1436,26 +1645,57 @@ function resetSetup(m) {
   closeConnectDialog();
 }
 
-// Send whatever the user chose, once, as one batch. Commands are newline-
-// separated; `save` persists; the trailing blank line drops the CLI back to log
-// mode. The admin password uses `auth passwd admin <pw>` (non-interactive; the
-// bare `passwd` command prompts). The password is the rest of the line, so it
-// isn't quoted; hostname is [A-Za-z0-9_] only; SSID/password may hold spaces so
-// they're quoted.
-function sendSetup(m) {
+// Send whatever the user chose, once. The admin password uses `auth passwd
+// admin <pw>` (non-interactive; the bare `passwd` command prompts). The
+// password is the rest of the line, so it isn't quoted; hostname is
+// [A-Za-z0-9_] only; SSID/password may hold spaces so they're quoted.
+//
+// The commands are the same ones a person would type — only the transport
+// differs. As frames they are never echoed, never enter the line editor and
+// never flip the console into CLI mode, so this cannot collide with someone
+// typing, and each one is answered rather than hoped for. A device that never
+// announced the capability gets the old batch, typed at the console.
+async function sendSetup(m) {
   if (m.setupSent) return;
-  let cmd = '';
-  if (m.newPasswd) cmd += `auth passwd admin ${m.newPasswd}\n`;
+  const cmds = [];
+  if (m.newPasswd) cmds.push(`auth passwd admin ${m.newPasswd}`);
   if (m.wifiCfg) {
-    cmd += `hostname ${m.wifiCfg.hostname}\n`;
-    cmd += `net add ${cliQuote(m.wifiCfg.ssid)}`;
-    if (m.wifiCfg.pass) cmd += ` ${cliQuote(m.wifiCfg.pass)}`;
-    cmd += '\n';
+    cmds.push(`hostname ${m.wifiCfg.hostname}`);
+    cmds.push(`net add ${cliQuote(m.wifiCfg.ssid)}` +
+              (m.wifiCfg.pass ? ` ${cliQuote(m.wifiCfg.pass)}` : ''));
   }
-  if (!cmd) return;   // user skipped everything
-  cmd += 'save\n\n';
-  m.setupSent = true;
-  sendToDevice(m, cmd);
+  if (!cmds.length) return;   // user skipped everything
+  cmds.push('save');
+  m.setupSent = true;         // synchronously, before any await — no double send
+  if (await rpcEnsure(m)) sendSetupFramed(m, cmds);
+  // Newline-separated, `save` persists, the trailing blank line drops the CLI
+  // back to log mode.
+  else sendToDevice(m, cmds.join('\n') + '\n\n');
+}
+
+// One frame per command, each waited for, then a re-query to confirm it took.
+// Nothing is echoed into the terminal, so the only trace is what we note.
+async function sendSetupFramed(m, cmds) {
+  for (const c of cmds) {
+    const verb = c.split(' ')[0];
+    if (await rpcQuery(m, c, 8000) === null) {
+      note(m, `\x1b[31m-- device didn't answer \`${verb}\` --\x1b[0m`);
+      return;
+    }
+  }
+  note(m, '\x1b[90m-- setup sent --\x1b[0m');
+  const net = await rpcQuery(m, 'net -O');
+  if (net === null || monitor !== m) return;
+  const kv = parseKv(net);
+  if (kv.get('hostname')) {
+    m.hostname = kv.get('hostname');
+    deviceUiHost = m.hostname;
+    setMonTitle(m.hostname);
+  }
+  if (kv.get('state') === 'sta' && kv.get('ip')) {
+    m.connectedSeen = true;
+    showOpenUi(m, kv.get('ip'), kv.get('ssid') || '');
+  }
 }
 
 function advanceSetup(m) {
@@ -1920,7 +2160,7 @@ function offerConsoleReturn() {
       // Only if the session actually lost its port — a switch the firmware
       // announced but never carried out leaves the CDC session running, and
       // popping a dialog over a working monitor would be noise.
-      if (monitor && (monitor.gone || !monitor.reader)) $('reconnect-overlay').hidden = false;
+      if (monitor && (monitor.gone || !monitor.reader)) askReconnect(null);
     }
   }, 250);
 }
@@ -2046,19 +2286,38 @@ async function reclaimPort(p, attempts = 8) {
 // browser well before the OS lets it open — the announced-then-quiet flag
 // keeps the narration to one line per outage rather than one per attempt.
 let rescanTimer = null;
+// Raised for this outage already. The ask is ONCE per outage, never once per
+// failed cycle: forgetPortObject() drops our own object cache but deliberately
+// not the browser's grant, so a stale port keeps coming back in every
+// getPorts() snapshot — re-raising on that would put the modal back every
+// couple of seconds, over whatever the user is doing, with no way out.
+// Cleared when the outage ends (below) so the next one asks again.
+let reconnectAsked = false;
+function askReconnect(why) {
+  if (reconnectAsked) return;
+  reconnectAsked = true;
+  if (monitor && why) note(monitor, `\x1b[33m-- ${why} --\x1b[0m`);
+  $('reconnect-overlay').hidden = false;
+}
 function scheduleRescan() {
   if (rescanTimer) return;
   let announced = false;
   let failures = 0;
   let rotate = 0;
+  let ticks = 0;
   rescanTimer = setInterval(async () => {
     if (!monitor || (!monitor.gone && monitor.reader)) {   // recovered or torn down
       clearInterval(rescanTimer);
       rescanTimer = null;
+      reconnectAsked = false;
       $('reconnect-overlay').hidden = true;
       return;
     }
     if (monitor.reattaching) return;          // a reclaim is already running
+    // Once we've concluded the grant is stale and asked for a pick, stop
+    // hammering open() on the dead handles every 800 ms — keep looking, but
+    // slowly, so a device that simply comes back is still picked up free.
+    if (reconnectAsked && (++ticks % 6)) return;
     // A console move owns the ports it is auditioning; stay off them entirely
     // rather than race it for handles.
     if (adopting || awaitingCdc) return;
@@ -2088,18 +2347,22 @@ function scheduleRescan() {
     if (monitor && !monitor.gone && monitor.reader) { failures = 0; return; }
     rotate++;
     // Every candidate has now failed once — the grant is stale, and nothing
-    // reachable through it will ever work. Drop it (a fresh chooser pick mints
-    // a fresh one) and ask for that pick. Dropping also quiets this loop: the
-    // identity vanishes from every snapshot, so the remaining ticks idle until
-    // the pick or a live arrival ends the outage.
+    // reachable through it will ever work. Drop our objects (a fresh chooser
+    // pick mints a fresh one) and ask for that pick, once.
     if (++failures >= Math.max(candidates.length, 1)) {
       for (const x of candidates) forgetPortObject(x);
       failures = 0;
-      note(monitor, '\x1b[33m-- no remembered port for this device opens; pick it again --\x1b[0m');
-      $('reconnect-overlay').hidden = false;
+      askReconnect('no remembered port for this device opens; pick it again');
     }
   }, 800);
 }
+
+// Dismissing costs nothing: the rescan keeps looking, a device that comes back
+// on its own is still adopted, and the stream carries the line saying what to
+// do. What it buys is the ability to use the rest of the page.
+$('reconnect-dismiss').addEventListener('click', () => {
+  $('reconnect-overlay').hidden = true;
+});
 
 $('reconnect-pick').addEventListener('click', async () => {
   $('reconnect-overlay').hidden = true;
@@ -2111,7 +2374,11 @@ $('reconnect-pick').addEventListener('click', async () => {
     const filters = knownIds.map((k) => ({ usbVendorId: k.vid, usbProductId: k.pid }));
     port = await navigator.serial.requestPort(filters.length ? { filters } : {});
   } catch (_) {
-    return;   // dismissed — the rescan keeps trying and re-raises the dialog
+    // Chooser dismissed. Put the dialog back — the user asked for it by
+    // clicking, so this is answering a gesture, not a timer deciding to
+    // interrupt. "Not now" is the way out.
+    $('reconnect-overlay').hidden = false;
+    return;
   }
   noteDeviceId(port);
   holdPort(port);

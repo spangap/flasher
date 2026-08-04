@@ -150,8 +150,21 @@ it:
   rendering. Browser only — `flashmon.py` has no equivalent.
 
 A fresh device (no admin password, or falling back to its own AP) is walked
-through a one-time setup: a password dialog, then a WiFi-connect dialog, sent to
-the device's CLI in one batch.
+through a one-time setup: a password dialog, then a WiFi-connect dialog.
+
+Those commands go out over the **framed console channel** on firmware that
+offers it — announced by the `serial: framed rpc v1` marker at boot, or
+established by a single recoverable probe when this session attached too late to
+see it (see [framed-rpc.md](../spangap-core/docs/framed-rpc.md)). Framed, they
+are never
+echoed, never enter the device's line editor and never flip its console into CLI
+mode, so setup can't collide with whatever you are typing and each command is
+answered rather than hoped for — the terminal shows `-- setup sent --`, not a
+replayed transcript of the commands. Without the marker they are typed at the
+console in one batch, exactly as before.
+
+Which dialogs open is still decided from the boot log here; only the sending is
+framed. `flashmon.py` pulls that state with queries too.
 
 ### Keeping the session across a vanishing port
 
@@ -186,6 +199,34 @@ deployment or from a local flashmon folder:
 ./flashmon.py --url https://<host>/flashmon/   # a served deployment
 ./flashmon.py --dir flashmon                    # a local flashmon/ folder
 ```
+
+### How it learns about the device
+
+`flashmon.py` **asks** the device rather than scraping its boot log. Firmware
+that supports it prints one marker line very early in boot —
+`serial: framed rpc v1` — after which flashmon runs ordinary CLI commands over a
+framed side-channel on the same console port and reads exactly their output:
+`show sys.build` for the running image's identity, `show sys.flash` for the
+board's real flash geometry, `auth -O` for the password state, `net -O` for the
+WiFi state and IP, `net scan -O` for the networks in range. Provisioning goes out the same way, so it can't collide with someone
+typing at the CLI and each command has a reply to confirm against. The frames
+are swallowed out of the byte stream, so the log and the interactive CLI look
+exactly as they always did. The wire format is
+[spangap-core/docs/framed-rpc.md](../spangap-core/docs/framed-rpc.md), the
+`key=value` replies are
+[onboarding-output.md](../spangap-core/docs/onboarding-output.md).
+
+Attaching to an already-running device misses the marker, so before it first
+needs frames flashmon probes once; the probe is answered on firmware that speaks
+them and undone with a Ctrl-C on firmware that doesn't. If neither the marker
+nor the probe lands, flashmon knows nothing about the device beyond what esptool
+read off the chip. It stays a monitor and a
+flasher: it still offers an image (an unknown build has nothing to compare
+against), and there is nothing to set up, because a device old enough not to
+speak frames has long since been through setup. What such a device costs is its
+web-UI address — F8 opens the default `<project>.local` rather than its real
+hostname, until it is flashed and reboots. Nothing is inferred from log text, so
+nothing can be inferred wrongly.
 
 `make` also writes a **branded** copy of it next to it, named for the project —
 `<project>-flashmon` (e.g. `reticulous-flashmon`). It's the identical script with
@@ -223,6 +264,16 @@ it. A `flashmon/flashmon.local.yaml` (also gitignored) is preferred over
 `flashmon.yaml` when present, for a per-machine override without touching your
 own file.
 
+`make` fills in three more fields per entry, which you never hand-edit:
+`version:` (the run stamp), `flash_floor_kb:` (the minimum chip size the image
+needs) and `image_bytes:` (what it writes). The entry's `name:` is also its
+**distribution identity** — the device reports it back as `sys.build.dist`, so a
+re-flash offer means "same dist, newer stamp". That is why identity lives in
+`name` and ordering in `version`: `name` is free-format, so a board can have
+several entries differing in what is left out to fit its flash, while `version`
+is a sortable stamp that answers whether something newer exists. The floor is
+what lets flashmon say an image won't fit a board *before* downloading it.
+
 ## Producing the images — `flashmon/builds/`
 
 From inside the spangap workspace this repo is checked out in:
@@ -237,7 +288,12 @@ cd flashmon/builds && make images BUILD=hw-lilygo-tdeck # rebuild just one image
 in the spangap container via `spangap build` (no local ESP-IDF needed), writes each
 `flasher.zip` to `builds/<slug>_<name>_<datetime>.zip`, and records that datetime as
 the entry's `version:` in `flashmon.yaml` — so the flasher fetches exactly what's on
-disk, and a subset rebuild re-stamps only the images it rebuilt. The offline bundle
+disk, and a subset rebuild re-stamps only the images it rebuilt. It also exports
+the entry's name as `SPANGAP_BUILD_DIST` (which the image reports back as
+`sys.build.dist`) and records the fit numbers `flash_floor_kb:` and
+`image_bytes:`, read out of the `sdkconfig` and `flasher.zip` that build just
+produced — no `spangap build` change, just a read of config the build already
+wrote. The offline bundle
 covers the whole catalogue, so it only comes from a full `make` (a `BUILD=` subset is
 refused). The zips are **gitignored build artifacts** (only `builds/Makefile` is
 tracked) — produce them here before you serve or deploy the page (see the CI
