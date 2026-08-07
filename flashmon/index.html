@@ -59,6 +59,13 @@
        padding:.4rem .85rem;cursor:pointer}
   #monitor-flash[hidden],#monitor-detect[hidden]{display:none}
   #monitor-flash:hover,#monitor-detect:hover{background:#fff;color:#2ea043;border-color:#2ea043}
+  /* Amber, not green: this is a recovery the session is waiting on, not an
+   * action offered on a device that is working. */
+  #monitor-repick{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;
+       letter-spacing:.04em;color:#fff;background:#b8860b;border:2px solid #fff;border-radius:8px;
+       padding:.4rem .85rem;cursor:pointer}
+  #monitor-repick[hidden]{display:none}
+  #monitor-repick:hover{background:#fff;color:#b8860b;border-color:#b8860b}
   @keyframes reset-flicker{
     0%,50%{background:#ff1f1f;color:#fff;border-color:#fff}
     50.01%,100%{background:#fff;color:#ff1f1f;border-color:#ff1f1f}
@@ -178,6 +185,12 @@
       <button id="monitor-detect" type="button" hidden>Detect Hardware</button>
       <button id="monitor-flash" type="button" hidden>Flash</button>
       <button id="open-ui" type="button" hidden>Open Device UI</button>
+      <!-- The way back when a port never returns. Deliberately a button and not
+           a dialog: ports go away constantly (every reset, every reflash) and
+           almost always come back on their own, so a modal on every departure
+           would be wrong far more often than right. This appears only after the
+           session has been detached a long while, and waits to be clicked. -->
+      <button id="monitor-repick" type="button" hidden>Re-select port</button>
       <button id="monitor-reset" type="button">Reset</button>
     </div>
     <button id="monitor-fnb58" type="button">FNB58</button>
@@ -323,15 +336,19 @@
       </div>
     </div>
 
-    <!-- Shown when a returning port keeps refusing to open: the handle the
-         browser remembered for it is stale, and only a fresh pick from the
-         chooser (which needs a user gesture) replaces it. -->
+    <!-- Shown when this tab's port stops opening: either the handle the browser
+         remembered for it is stale, or the board came back as a different one.
+         This tab never picks a replacement on its own — with identical boards on
+         one desk it would have to guess, and a wrong guess moves another tab's
+         console in here — so the pick is asked for. It needs a user gesture, so
+         it has to come from a button. -->
     <div id="reconnect-overlay" class="modal-overlay" hidden>
       <div class="modal">
         <h2>Reconnect to the device</h2>
-        <div>The device is back, but the browser cannot reopen its serial port from
-          the remembered permission. Re-select the port to continue — the session and
-          its scrollback carry on.</div>
+        <div>This tab cannot reopen the serial port it was given. If the device was
+          unplugged and plugged back in, it is a new port now — re-select it to
+          continue, and the session and its scrollback carry on. This tab will not
+          switch to a different port on its own.</div>
         <div class="row">
           <button id="reconnect-dismiss" class="btn-ghost" type="button">Not now</button>
           <button id="reconnect-pick" class="btn-primary" type="button">Re-select port</button>

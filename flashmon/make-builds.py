@@ -19,6 +19,10 @@ SPANGAP_BUILD_DIST, which the image reports back as `sys.build.dist`.
 
 A subset run touches only the entries it rebuilt; the rest keep their datetime
 (and their already-built image). Run from anywhere inside a spangap workspace.
+
+The first failing build ends the run — later entries are not attempted, and the
+entries that did build are still stamped, so the catalogue matches what is on
+disk. The exit status is non-zero, so `make` stops with it.
 """
 import json
 import os
@@ -226,7 +230,7 @@ def main():
     os.environ["SPANGAP_BUILD_DATETIME"] = run_dt
 
     stamped = {}
-    fails = 0
+    failed = None
     for name, inv in entries:
         if sel and name not in sel:
             continue
@@ -265,16 +269,21 @@ def main():
             print("make-builds:   -> %s (floor %s KB, %s bytes)"
                   % (zipname, floor_kb or "?", nbytes or "?"), file=sys.stderr)
         else:
+            # The first failure ends the run: the remaining entries build from
+            # the same tree, so whatever broke this one most likely breaks them
+            # too, and stopping here leaves the error at the end of the output.
             print("make-builds:   !! build failed or no flasher.zip for '%s' "
                   "(looked in %s)" % (name, zip_src), file=sys.stderr)
-            fails += 1
+            failed = name
+            break
 
-    # Record the datetime and fit numbers for every image that built (even if
-    # others failed), so the flasher fetches exactly what's on disk.
+    # Record the datetime and fit numbers for every image that built before the
+    # run stopped, so the flasher fetches exactly what's on disk.
     if stamped:
         stamp_entries(byaml, stamped)
-    if fails:
-        die("%d build(s) failed" % fails)
+    if failed:
+        die("build '%s' failed — stopping (%d image(s) built before it)"
+            % (failed, len(stamped)))
     print("make-builds: wrote %s/*.zip" % outdir, file=sys.stderr)
 
 

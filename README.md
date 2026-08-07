@@ -166,26 +166,52 @@ console in one batch, exactly as before.
 Which dialogs open is still decided from the boot log here; only the sending is
 framed. `flashmon.py` pulls that state with queries too.
 
-### Keeping the session across a vanishing port
+### A tab only ever opens ports you picked
 
-The monitor session outlives the port under it. If the device is powered off,
-unplugged, or resets, the port's permission is retained: the stream notes
-`-- <transport> gone --`, a background rescan keeps looking for a granted port
-belonging to the same device (matched by USB vendor/product id, since it comes
-back as a fresh port object), and reconnecting says `-- <transport> came back --`
-into the same scrollback. When every remembered port refuses to open, a
-**Reconnect to the device** dialog asks you to re-pick it from the chooser — the
-browser only opens that chooser on a click — and the session carries on.
+**A browser tab opens the ports you handed it in the chooser, and no others.**
+It never reaches for one you did not pick. That matters as soon as there is more
+than one board on the desk, because a page cannot tell them apart — Web Serial
+gives it the USB vendor and product ids and nothing else, so three identical
+boards are one identity, and a tab that goes looking for "a port that looks like
+mine" is picking at random among them. Getting that wrong swaps two tabs'
+consoles with nothing on screen to say so.
 
-The device's CLI can also **move its console** between the USB-Serial-JTAG
-controller and a two-port CDC device (`usb cdc` / `usb jtag`), which is a
-different USB device to the host. flashmon follows the move: it reads the
-announcement in the log, adopts the new port (auditioning both CDC ports to find
-which one is the console), and keeps the old one rendering into the same terminal
-until the device drops it. A **Console moving to a new port** dialog asks for a
-pick only when the new device has no grant yet. See
-[`docs/serial.md`](docs/serial.md) for the full mechanism and the notice
+A tab keeps **at most two** of them, which is all a device can present it: the
+USB-Serial-JTAG port it boots on, and the two-port CDC device `usb cdc` moves it
+to. A third pick replaces the oldest.
+
+The session outlives the port under it. A device powered off, reset, or reflashed
+keeps its port: the stream notes `-- <transport> gone --`, a background loop
+retries the tab's own ports, and reconnecting says `-- <transport> came back --`
+into the same scrollback. **A port going away never pops a dialog** — ports go
+away on every reset and almost always come straight back, so interrupting you
+would be wrong far more often than right.
+
+Two things end an outage differently:
+
+- The device **says** it is moving its console (`usb cdc` / `usb jtag`, which
+  swap it between two different USB devices). That is the one departure known
+  not to be a blip. flashmon still gives recovery three seconds first — if the
+  tab already holds the port being moved *to*, the move completes in silence —
+  and only then shows **Console moving to a new port**, whose chooser is
+  filtered to the new device's two ports. Take the **first**; that is the
+  console. So you are asked on the first move only; every one after that is
+  free, in both directions.
+- Half a minute of nothing at all, usually because the board was unplugged and
+  replugged and is now a *different* port to the browser. An amber **Re-select
+  port** button appears in the monitor and waits — no modal, and the loop keeps
+  trying the old port in the background in case it simply comes back.
+
+See [`docs/serial.md`](docs/serial.md) for the full mechanism and the notice
 vocabulary.
+
+Nothing here can name the board for you: the readable string the chooser shows
+(`USB JTAG/serial debug unit`, `FNB-58`) comes from the device's own USB
+descriptors and is never handed to the page. On USB-Serial-JTAG that string is
+fixed in the ESP32-S3's ROM. A device switched to CDC advertises its **hostname**
+there instead — see
+[spangap-core's usb-console](../spangap-core/docs/usb-console.md). Once a session
+is open, the hostname in the monitor's title bar is what identifies the board.
 
 ## The terminal flasher — `flashmon.py`
 

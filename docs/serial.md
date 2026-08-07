@@ -8,12 +8,13 @@ and its dialogs in [`index.html`](../flashmon/index.html). It is a
 **browser-only** concern — `flashmon.py` talks to a device node through
 pyserial and simply re-opens it by name.
 
-The device is not a fixed thing on the bus. It re-enumerates on every reset, and
-its CLI can move the console between two entirely different USB devices
-(`usb cdc` / `usb jtag`). Web Serial, meanwhile, hands out a **new `SerialPort`
-object** each time, keeps permission grants that may or may not still open, and
-delivers `connect`/`disconnect` events in whatever order the operating system
-felt like. Everything below exists to turn that into one continuous terminal.
+The device is not a fixed thing on the bus. Its CLI can move the console between
+two entirely different USB devices (`usb cdc` / `usb jtag`), an unplug mints a
+fresh `SerialPort` object for what a person would call the same board, and Web
+Serial keeps permission grants that may or may not still open and delivers
+`connect`/`disconnect` events in whatever order the operating system felt like.
+Everything below turns that into one continuous terminal — under one rule, which
+is that a tab talks to the one port it was given and asks before that changes.
 
 ## A session per port, one terminal
 
@@ -37,8 +38,9 @@ A port nobody was holding has a **backlog**: the device kept writing into its
 ring buffer, and that buffer begins wherever the ring happened to wrap — mid
 word, or mid escape sequence, which is how a raw `[0;90m` ends up on screen.
 
-Two mechanisms deal with it, and only on a genuinely fresh open
-(`attachStreams(m, sync = true)`, used by `openMonitor`):
+Two mechanisms deal with it, and only on a genuinely fresh open of a device
+left running (`attachStreams(m, 'sync')`, used by `openMonitor` when it is not
+about to reset):
 
 - `syncConsole(m)` writes a carriage return **muted**, waits ~100 ms, and throws
   the whole exchange away. The firmware answers any bare CR, which flushes what
@@ -48,7 +50,18 @@ Two mechanisms deal with it, and only on a genuinely fresh open
   both ways (4 KB, or 2 s) so a device that simply never sends a newline is not
   silenced.
 
-A **reattach** (`attachStreams(m)` with `sync` false) does neither. The bytes
+A session that opens **in order to reset** the device (`attachStreams(m,
+'quiet')`, used by `openMonitor` whenever `doReset`) does neither, and writes
+nothing at all. The reset is its own flush — the boot log that follows starts at
+a line boundary — and a byte written before it cannot be answered: the chip is
+in the ROM loader, or running the RAM-loaded detector, and neither reads the
+console. It is not lost either. The USB-Serial-JTAG controller is not reset with
+the rest of the chip, so the byte is still queued when the real firmware comes
+up and reaches it as a keystroke, which opens a CLI session over the boot log
+the reset was issued to capture. This is what put a stray character at a prompt
+after every hardware detection.
+
+A **reattach** (`attachStreams(m)`, the `poke` default) does neither. The bytes
 arriving just after a port comes back are as often a boot log — from a device
 that reset or was power-cycled — as they are stale, and nothing in the stream
 can tell those apart. A reattach keeps everything and only pokes the console
@@ -66,68 +79,75 @@ each site doubles up whenever notices arrive back to back. `note()` asks the
 terminal where the cursor is, finishes a partial line if needed, and writes
 exactly one blank above and none below.
 
-## Identity, not object
+## Only ports this tab was given
 
-Three separate caches, because three different questions get asked.
+**A tab opens the ports a chooser pick handed it, and no others, ever.**
+`pickedPorts` is that list, `pinnedPort` is whichever of them currently carries
+the session, and `pinPort()` — the only writer of either — is called from
+exactly three places: the opening `connect()`, `repickPort()` behind the
+**Reconnect** dialog and the **Re-select port** button, and a console move. All
+three are a `requestPort()` pick, which is to say a person pointing at an entry
+in the browser's chooser. `isOurs(p)` is `pickedPorts.includes(p)`, plain object
+identity, and it is the whole of the test the `connect` handler applies.
 
-**`knownIds` — which USB identities are this device?** A console handover
-changes the device's vendor/product id pair: the USB-Serial-JTAG controller
-(`0x303A:0x1001`) and the TinyUSB composite (`0x303A:0x4002`) are different
-devices to the host, and a reset changes it back. `noteDeviceId(port)` records
-what it sees and, because the two transports are one physical device, learning
-either one adds the other. `isKnownDevice(port)` is what lets a session opened
-on CDC accept the JTAG identity the device reboots into.
+This is not conservatism, it is the only correct answer available. `getInfo()`
+exposes `usbVendorId` and `usbProductId` and nothing else: no serial number, no
+device path. Three identical boards on a desk are therefore *one* identity to
+this page, and a tab that infers "my port came back" from a matching identity is
+guessing between them. It guesses wrong regularly, and when it does, two tabs
+have quietly traded consoles — the same three boards, the same three tabs, the
+wrong pairing, with nothing on screen to say so.
 
-**`presence` — is this an actual change?** Re-enumeration fires `connect` and
-`disconnect` several times each, with fresh objects every time, so neither the
-event nor the object identifies a state change. `presence` maps USB identity →
-believed-attached, and `presenceChanged(port, here)` returns false for a repeat,
-which is then dropped whole: no message, and no second reattach over a session
-that already holds the port.
+### Two, and why two
 
-**`heldPorts` — which object for this identity is live?** A re-enumeration mints
-a new `SerialPort`; the old one keeps its name, identity, and grant, but not an
-openable backing — `open()` on it fails forever. `getPorts()` can hand back
-either and cannot be trusted to pick, while the object a `connect` event
-delivers is by definition the live one. So every connect event and every
-successful open deposits into `heldPorts` (`holdPort`), and every recovery path
-prefers it over a `getPorts()` snapshot.
+`PICKED_MAX = 2`, because a device presents this tab at most two consoles: the
+USB-Serial-JTAG one it boots on, and the CDC one `usb cdc` moves it to. A third
+pick is a replacement for one of those, so the oldest entry goes.
 
-`heldPorts` keys a **list**, not one object per identity: the composite device
-presents two CDC ports wearing the same vendor/product id, with nothing in
-`getInfo()` to separate them. Collapsing them would hand the console to whichever
-interface enumerated last. Order is the only signal there is — the console is
-interface 0, so it enumerates, and connects, first. The list is bounded
-(`HELD_PER_ID_MAX = 3`, against a hardware maximum of two) so an evening of
-switching does not leave the audition wading through a generation per switch;
-a `disconnect` drops every cached object for that identity outright.
+Owning both is what makes a console move ordinary rather than an event. Once the
+tab has been pointed at the CDC console port a single time, that port is in the
+list — so every later `usb cdc` is just "one of our ports turned up", opened by
+the rescan with no dialog at all, and `usb jtag` is the same in reverse.
+`reclaimPort` re-pins to whichever answered.
 
-`forgetPortObject(port)` drops a dead object from that cache. It is deliberately
-**not** `port.forget()`: that revokes permission for the underlying port, and a
-dead object wears the same identity as the live one, so revoking on its behalf
-takes the working console's grant with it. Objects are ours to discard; grants
-are the user's.
+### Departure is not evidence
+
+Ports go away constantly: every reset, every reflash, every `usb cdc`. Almost
+all of them come straight back. So a `disconnect` raises **nothing** — the
+session is marked `gone`, the rescan starts retrying, and that is all.
+
+Two things can end an outage differently. The device **announcing a transport
+switch** (`offerConsoleHandover` / `offerConsoleReturn`, driven by the log lines
+`USB JTAG serial port going away` and `USB CDC ports going away`) is the one
+signal that a port is gone for good rather than blinking — and even then the ask
+is deferred 3 s and skipped entirely if recovery already landed on one of the
+tab's ports. Failing that, ~30 s of nothing reveals the amber **Re-select port**
+button in the monitor's action row, which waits to be clicked. Neither path ever
+adopts anything; both end in a pick.
+
+An ordinary reset costs none of this. Neither `spangap flash`'s reset nor the
+detection run's re-enumerates the device, because the USB-Serial-JTAG controller
+is not reset with the chip (see
+[spangap-core's usb-console](../../spangap-core/docs/usb-console.md)). The port
+object survives and the session simply reattaches.
 
 ## Losing a port, and getting it back
 
 `disconnect` marks the session `gone`, drops the device's buttons, says which
-transport went (`portLabel`), and tears the dead streams down. The comparison is
-by **USB identity, not object** — a device that re-enumerates arrives as a fresh
-`SerialPort`, so comparing objects misses the session's own departure and leaves
-it marked live forever.
+transport went (`portLabel`), and tears the dead streams down — for **this tab's
+port**, and for the port a handover moved away from (`priorSession`). Every other
+`disconnect` on the machine is another board and is dropped without a word.
 
-`connect` pins the arriving object into `heldPorts` **before** any dedup or
-refusal, then reclaims it if the session is detached. "Detached" is ground truth
-— `gone || !reader` — not the `gone` flag alone, which has repeatedly gone stale
-when a `disconnect` was missed, presenting as a live-looking session that is
-mute and deaf until the page is reloaded.
+`connect` reclaims the port if it is ours and the session is detached. "Detached"
+is ground truth — `gone || !reader` — not the `gone` flag alone, which has
+repeatedly gone stale when a `disconnect` was missed, presenting as a
+live-looking session that is mute and deaf until the page is reloaded.
 
-`reclaimPort(p, attempts)` adopts the (possibly fresh) port object over the dead
-session and retries `open()`, because a port rarely accepts one the instant it
-appears. On success it says `-- <transport> came back --`, restores the green
-slot, and runs `verifyAlive`. On failure it reports the reason once per distinct
-error — the loop below retries every 800 ms and a repeating line is noise — and
-hands over to the rescan.
+`reclaimPort(p, attempts)` retries `open()` over the dead session, because a port
+rarely accepts one the instant it appears. On success it says
+`-- <transport> came back --`, restores the green slot, and runs `verifyAlive`.
+On failure it reports the reason once per distinct error — the loop below retries
+every 800 ms and a repeating line is noise — and hands over to the rescan.
 
 `verifyAlive(m)` proves the port actually carries the console. `attachStreams`
 pokes it with a CR and the firmware always answers one, so a port that stays
@@ -140,24 +160,20 @@ because a device that was merely busy delivers when it gets around to it.
 
 ### The rescan loop
 
-Events cannot drive recovery on their own. The dead port's `disconnect` and its
-replacement's `connect` come from two different USB devices, so the operating
-system orders them freely — an arrival that lands while the session still looks
-live is refused, and that one-shot event is spent.
+Events cannot drive recovery on their own: an arrival that lands while the
+session still looks live is refused, and that one-shot event is spent.
 
-`scheduleRescan()` polls ground truth instead, every 800 ms: session dead plus a
-granted port attached → reclaim it. It prefers held objects over the `getPorts()`
-snapshot, **rotates** through candidates rather than retrying one object forever
-(with two objects wearing one identity, only trying both finds the live one), and
-gives each a single attempt — a stale handle does not fail transiently.
+`scheduleRescan()` polls ground truth instead, every 800 ms: session dead and one
+of `pickedPorts` attached → reopen it, one attempt per tick (a stale handle does
+not fail transiently — it fails, it's dead). It rotates over the tab's ports,
+pinned first, since after a move it is the other one that answers. The candidate
+list is those ports and nothing else; the loop never goes looking.
 
-When every candidate has failed once, the grants reachable from here are spent.
-The loop drops the cached objects and raises the **Reconnect to the device**
-dialog: only a fresh pick from the chooser replaces them, and `requestPort()`
-needs a user gesture, so the ask has to come from a button. The chooser is
-filtered to the identities this device has worn, so the entry the browser shows
-as present is the one on offer. Dismissing it is fine — the loop keeps trying
-and re-raises it.
+It backs off after ~16 s (one try in six thereafter) but never stops, so a board
+that returns on the same object is picked up for free however long it took. At
+~30 s it calls `offerRepick()` once, which reveals the **Re-select port** button
+and says so in the stream. **The loop raises no dialog** — see "departure is not
+evidence" above.
 
 ## Console handover
 
@@ -168,54 +184,55 @@ the parser watches for both directions.
 
 ### Onto CDC — `USB JTAG serial port going away`
 
-`offerConsoleHandover()` sets `awaitingCdc` and polls for up to 3 s for a CDC
-port this origin is already permitted to open (`grantedCdcPorts`, newest object
-first, since a re-enumeration invalidates everything that preceded it). If one
-turns up, the move happens silently — a second switch in the same session needs
-no dialog at all. If none does, the **Console moving to a new port** dialog goes
-up, and its OK does the asking: `requestPort()` filtered to the composite device,
-so the chooser offers its two ports and nothing else.
+This announcement is one of only two things in flashmon that may pop a picker,
+because it is one of only two signals that a port has gone for good rather than
+blinking. Even so it defers to recovery first.
 
-`adoptConsolePort(cands)` then has to work out **which** of those two ports is
-the console. They share a vendor/product id, `getInfo()` exposes nothing to tell
-them apart, and the non-console one is silent in both directions — which is
-indistinguishable from a working monitor on an idle device. So they audition:
-attach muted, un-mute, poke, and wait ~900 ms for any byte. The first that
-answers is kept; the rest are detached and dropped from the cache. Silence is a
-preference, not a veto — if none answers the first is taken anyway, with a
-notice, because a silent monitor beats none.
+`offerConsoleHandover()` sets `awaitingCdc` and waits 3 s. Meanwhile the rescan
+is running — the disconnect that follows the announcement starts it, and it is
+deliberately *not* held off during a move: if this tab already owns the CDC
+console port, the loop opens it the moment it enumerates and the move completes
+in silence. Only if the session is still detached at the 3 s mark does the
+**Console moving to a new port** dialog go up.
 
-Two things guard the audition. A candidate that throws `already open` is one of
-**our own** handles and must be kept, unlike a grant that genuinely cannot be
-opened. And `monitor` is re-checked before committing, because every step above
-awaits and a reclaim can have completed in any of those gaps — overwriting a
-proven-live session with an audition also-ran is exactly how a console that had
-already come back got thrown away.
+So the ask is for the *first* move only, or after a re-pick pushed the CDC port
+out of the pair. Its OK does the asking: `requestPort()` filtered to the
+composite device, so the chooser offers its two ports and nothing else. The
+dialog says to pick the first, which is the console — they share a vendor/product
+id and `getInfo()` exposes nothing to tell them apart, so the person picking is
+the only one who can. A pick that lands on the silent one is caught by
+`verifyAlive`, which says so.
 
-On commit, the new identity is learned, the outgoing session becomes
-`priorSession`, and the flash offer is re-evaluated.
+What must never happen is adopting a CDC port on a *grant* alone. The
+composite's two interfaces are indistinguishable from each other and from
+another board's, so that is a coin toss, and losing it is precisely the
+swapped-console failure this design exists to remove. A grant says this origin
+may open a port; it says nothing about which device it is for.
+
+`adoptConsolePort(port)` opens what was picked, re-checks `monitor` before
+committing (it awaits, and a reclaim of the outgoing port can have completed in
+that gap — overwriting a proven-live session is exactly how a console that had
+already come back got thrown away), then **pins** the new port, makes the
+outgoing session `priorSession`, re-evaluates the flash offer, and runs
+`verifyAlive`.
 
 ### Back onto USB-Serial-JTAG — `USB CDC ports going away`
 
-`offerConsoleReturn()` is the mirror image, and needs a dialog for a different
-reason: the JTAG port that appears may have **no grant in this session** (grants
-are swept at load), and an ungranted port is invisible — no connect event, absent
-from `getPorts()`. Without the dialog the rescan would spin over an empty
-candidate list forever. So it polls for a granted, present JTAG port; if one
-exists the rescan reclaims it with no ceremony, and if none has appeared within
-3 s the **Reconnect to the device** dialog asks for a pick — but only if the
-session actually lost its port, since a switch the firmware announced but never
-carried out leaves the CDC session running and a dialog over a working monitor is
-just noise.
+`offerConsoleReturn()` is the mirror image, and the second of the two places
+allowed to ask. Same shape: wait 3 s, and if the session recovered on its own —
+which it does whenever the tab already owns the JTAG port — say nothing. Only a
+tab that does not own it, one opened straight onto CDC or whose JTAG port aged
+out of the pair, reaches the **Reconnect to the device** dialog. The same check
+covers a switch the firmware announced but never carried out: the CDC session is
+still running, so nothing interrupts it.
 
 ### One driver at a time
 
-`awaitingCdc` (a move is expected) and `adopting` (a move is auditioning ports)
-both hold the rescan and the connect handler off the ports involved. Otherwise
-both would be opening the same handles, and the loser reads `The port is already
-open` — which the audition scores as "did not answer" and the rescan as a dead
-grant. During a move, the move has the wheel; the departure that starts it is
-that move's expected first half, not an outage to recover from.
+`adopting` (a console move is opening its port) holds the rescan and the connect
+handler off, so both are not opening the same handle with the loser reading
+`The port is already open`. `awaitingCdc` no longer holds anything off — under
+the pinning rule the rescan can only reach the tab's own ports, and reaching them
+during a move is the point.
 
 ## The notice vocabulary
 
@@ -225,15 +242,14 @@ them. `<transport>` is `JTAG serial port`, `CDC serial port`, or a plain
 
 | Notice | Means |
 |---|---|
-| `-- <transport> gone --` | The session's port left the bus. Grey rather than red when it was not the session's own port — during a move the device presents and withdraws transports on its own schedule. |
+| `-- <transport> gone --` | This tab's port left the bus. |
 | `-- previous <transport> gone --` | The port a handover moved away from, finally going. Expected, not a loss. |
 | `-- <transport> came back --` | Reattached and streaming again. |
-| `-- following the <transport> already present --` | The rescan found a granted port and is trying it. Once per outage. |
-| `-- <transport> reopen failed (…); retrying in background --` | The grant is listed but will not open yet. Once per distinct reason. |
-| `-- no remembered port for this device opens; pick it again --` | Every grant is spent; the reconnect dialog follows. |
+| `-- following the <transport> already present --` | The rescan is retrying one of the tab's ports. Once per outage. |
+| `-- <transport> reopen failed (…); retrying in background --` | The port is listed but will not open yet. Once per distinct reason. |
+| `-- still no port; use "Re-select port" if it came back as a new one --` | ~30 s of nothing; the amber button is now showing. No dialog, and the loop keeps trying. |
 | `-- <transport> is silent, reopening… --` | `verifyAlive` got no answer to its poke and is cycling the port. |
 | `-- no response; leaving the port open --` | It never answered, and the session stays attached anyway. |
-| `-- a <transport> is already open here --` | An audition candidate is one of our own handles. |
-| `-- no port answered; taking the first --` | Neither CDC port spoke; the first was adopted regardless. |
-| `-- console already recovered; audition abandoned --` | A reclaim won the race while the audition was running. |
+| `-- could not open the new port: … --` | A console move's picked port would not open. |
+| `-- console already recovered; move abandoned --` | A reclaim won the race while a console move was opening its port. |
 | `-- Serial stuck after RNG init; …  --` | The separate RNG-init watchdog, not the port machinery. |

@@ -342,16 +342,27 @@ async function detachStreams(m) {
 
 // Open the port at m.cfg and pump it both ways: bytes → xterm, keystrokes → port.
 //
-// `sync` runs the opening handshake muted, discarding the first ~100 ms. That is
-// right exactly once — on a port nobody was holding, whose backlog starts
-// wherever the device's ring happened to wrap. It is wrong everywhere else, and
-// not by a margin: the bytes arriving just after a port comes back are as often
-// a boot log, from a device that reset or was power-cycled, as they are stale.
-// Nothing here can tell those apart — same bytes, same position — so a reattach
-// keeps everything and leaves it to the device not to replay its own history.
-async function attachStreams(m, sync = false) {
+// `mode` picks the opening handshake:
+//
+// - `sync` runs it muted, discarding the first ~100 ms. That is right exactly
+//   once — on a port nobody was holding, whose backlog starts wherever the
+//   device's ring happened to wrap. It is wrong everywhere else, and not by a
+//   margin: the bytes arriving just after a port comes back are as often a boot
+//   log, from a device that reset or was power-cycled, as they are stale.
+//   Nothing here can tell those apart — same bytes, same position — so a
+//   reattach keeps everything and leaves it to the device not to replay its own
+//   history.
+// - `poke` (the reattach default) writes one bare CR and keeps what comes back.
+// - `quiet` writes nothing at all, for a caller that is about to reset the
+//   device. A byte written into a chip that is not running its firmware — the
+//   ROM loader, or the RAM-loaded detector, neither of which reads the console
+//   — is not consumed and not lost either: the USB-Serial-JTAG controller is
+//   not reset with the rest of the chip, so it is still queued when the real
+//   firmware comes up and is delivered to it as a keystroke, which opens a CLI
+//   session over the boot log the reset was issued to capture.
+async function attachStreams(m, mode = 'poke') {
+  const sync = mode === 'sync';
   await m.port.open(m.cfg);
-  holdPort(m.port);              // it opened — the live object for its identity
   m.lineSync = sync ? { pending: true, bytes: 0, since: Date.now() } : null;
   m.reader = m.port.readable.getReader();
   m.writer = m.port.writable.getWriter();
@@ -388,10 +399,10 @@ async function attachStreams(m, sync = false) {
     }
   })();
 
-  // Either way the console is asked to identify itself; `sync` only decides
-  // whether the exchange runs muted, discarding what the port was holding.
+  // The console is asked to identify itself, unless a reset is about to make
+  // the question moot and the byte that asked it a stray keystroke.
   if (sync) await syncConsole(m);
-  else      await pokeConsole(m);
+  else if (mode !== 'quiet') await pokeConsole(m);
 }
 
 async function closeMonitor() {
@@ -470,39 +481,39 @@ function portLabel(port) {
   return 'Serial port';
 }
 
-// Every USB identity this one physical device has enumerated under. A console
-// handover changes it — the USB-Serial-JTAG controller and the TinyUSB
-// composite are different devices to the host — and a reset changes it back, so
-// matching a returning port against the current session alone loses it.
-let knownIds = [];
+// ── the tab's ports ─────────────────────────────────────────────────────────
+// A tab opens the ports it was handed by a chooser pick, and no others, ever.
+// Not a preference — the only correct rule available. getInfo() exposes the USB
+// vendor and product ids and nothing more: no serial number, no device path. So
+// three identical boards on a desk are ONE identity to this page, and a tab that
+// infers "my port is back" from a matching identity is choosing among them at
+// random. When it chooses wrong, two tabs have quietly traded consoles, with
+// nothing on screen to say so. Object identity is the only handle that tells
+// this board from its neighbours, and a pick is the only way to establish it.
+//
+// Two, because a device presents this tab at most two consoles: the
+// USB-Serial-JTAG one it boots on, and the CDC one `usb cdc` moves it to. A
+// third pick is a replacement, so the oldest goes.
+const PICKED_MAX = 2;
+let pickedPorts = [];
+// The one currently carrying the session. Always a member of pickedPorts.
+let pinnedPort = null;
 
-function noteDeviceId(port) {
-  try {
-    const { usbVendorId: vid, usbProductId: pid } = port.getInfo();
-    if (vid == null || pid == null) return;
-    const add = (v, p2) => {
-      if (!knownIds.some((k) => k.vid === v && k.pid === p2)) knownIds.push({ vid: v, pid: p2 });
-    };
-    add(vid, pid);
-    // The two transports are one device: a console switch swaps between them,
-    // and a reset out of CDC mode comes back as the JTAG controller. Learning
-    // one means the other must be followed too — a session opened straight on
-    // CDC would otherwise refuse the JTAG identity the device reboots into.
-    if (vid === JTAG_ID.usbVendorId && pid === JTAG_ID.usbProductId)
-      add(CDC_FILTER.usbVendorId, CDC_FILTER.usbProductId);
-    if (vid === CDC_FILTER.usbVendorId && pid === CDC_FILTER.usbProductId)
-      add(JTAG_ID.usbVendorId, JTAG_ID.usbProductId);
-  } catch (_) { /* info unavailable */ }
+// Take ownership of a picked port and make it the active one. Callers must have
+// obtained it from requestPort() — a user gesture is the only unambiguous
+// statement of which physical device on the desk this tab is for.
+function pinPort(port) {
+  if (!port) return null;
+  pickedPorts = pickedPorts.filter((p) => p !== port);
+  pickedPorts.push(port);
+  while (pickedPorts.length > PICKED_MAX) pickedPorts.shift();
+  pinnedPort = port;
+  return port;
 }
 
-function isKnownDevice(port) {
-  if (!knownIds.length) return true;      // nothing learned yet — accept
-  try {
-    const { usbVendorId: vid, usbProductId: pid } = port.getInfo();
-    if (vid == null || pid == null) return true;
-    return knownIds.some((k) => k.vid === vid && k.pid === pid);
-  } catch (_) { return true; }
-}
+// True for a port this tab was given — the pinned one, or the other transport
+// it has already been pointed at. The recovery paths open these and nothing else.
+const isOurs = (p) => !!p && pickedPorts.includes(p);
 
 async function openMonitor(port, doReset, banner) {
   $('monitor').hidden = false;
@@ -530,11 +541,8 @@ async function openMonitor(port, doReset, banner) {
   // Drop incoming bytes until the first reset (below); a plain terminal with no
   // reset shows everything from the start.
   monitor = makeSession(port, term, resizeObserver, doReset);
-  knownIds = [];              // a fresh session: forget the previous device
-  presence.clear();
-  noteDeviceId(port);
-  presence.set(idKey(port), true);
   $('monitor-baud').textContent = fmtCfg(monitor.cfg);
+  $('monitor-repick').hidden = true;   // a fresh session has a working port
   setMonTitle(null);   // new session: no hostname until the device logs one
 
   // Forward keystrokes to the current writer. The device's serial line stays in
@@ -545,7 +553,11 @@ async function openMonitor(port, doReset, banner) {
     if (w) w.write(encoder.encode(data)).catch(() => { /* port gone */ });
   });
 
-  await attachStreams(monitor, true);   // fresh port: discard the wrapped backlog
+  // A reset is its own flush — the boot log that follows starts at a line
+  // boundary — so the handshake that discards a wrapped backlog is only for the
+  // sessions that open on a device left running, and a reset session opens
+  // without writing a byte.
+  await attachStreams(monitor, doReset ? 'quiet' : 'sync');
 
   if (banner && banner.length) {
     for (const line of banner) term.writeln(`\x1b[36m${line}\x1b[0m`);
@@ -1930,239 +1942,92 @@ let awaitingCdc = false;
 // during a move it is the move.
 let adopting = false;
 
-// A grant already held for the CDC transport, if the device is presenting it.
-// Chrome only reports ports the origin may use, so anything listed here is
-// openable without asking again.
-// What we believe is currently attached, keyed by USB identity. Re-enumeration
-// fires connect and disconnect several times each and hands out fresh SerialPort
-// objects, so neither the event nor the object identifies a state change. The
-// device presents one instance of each transport; tracking that is what makes a
-// repeat a repeat rather than something to act on again.
-const presence = new Map();
-
-function idKey(port) {
-  try {
-    const i = port.getInfo();
-    return `${i.usbVendorId}:${i.usbProductId}`;
-  } catch (_) { return 'unknown'; }
-}
-
-// True when this is a real change. Repeats return false and are dropped whole:
-// no message, and no second reattach over a session that already has the port.
-function presenceChanged(port, here) {
-  const k = idKey(port);
-  if (presence.get(k) === here) return false;
-  presence.set(k, here);
-  return true;
-}
-
-// The freshest SerialPort object per USB identity. A re-enumeration mints a
-// NEW object; the old one keeps its name, identity, and grant, but not an
-// openable backing — open() on it fails "Failed to open serial port" forever.
-// getPorts() can hand back either, so it cannot be trusted to pick; the object
-// a connect event delivers is by definition the live one. Every connect event
-// deposits here, every successful open refreshes, and every recovery path
-// checks here before settling for a getPorts() snapshot.
-// A LIST per identity, in first-seen order, not one object per identity: the
-// composite device presents two CDC ports wearing the same VID/PID, and
-// getInfo() exposes nothing to tell them apart. Keeping one slot per identity
-// would collapse them — and, since these objects are preferred over a
-// getPorts() snapshot, would hand the console over to whichever interface
-// enumerated last. Order is the only signal there is: the console is
-// interface 0, so it enumerates, and connects, first.
-const heldPorts = new Map();
-// Bounded, newest last. Every connect event delivers a freshly minted object,
-// so an unbounded list grows by one per interface per re-enumeration — a dozen
-// entries after an evening of switching, all but the last pair belonging to
-// incarnations of the device that no longer exist. Two is the hardware maximum
-// (two CDC interfaces); keep a little slack and discard the oldest beyond it.
-const HELD_PER_ID_MAX = 3;
-function holdPort(port) {
-  if (!port) return;
-  const k = idKey(port);
-  const list = (heldPorts.get(k) || []).filter((x) => x !== port);
-  list.push(port);
-  while (list.length > HELD_PER_ID_MAX) list.shift();
-  heldPorts.set(k, list);
-}
-function heldList() { return [...heldPorts.values()].flat(); }
-
-// Drop a dead port OBJECT from our cache. Deliberately not forget(): that
-// revokes permission for the underlying port, and a dead object wears the same
-// identity as the live one, so revoking on its behalf takes the working
-// console's grant with it — turning one failed open into a permanent loss of
-// access, and a re-pick that mints yet another entry. Objects are ours to
-// discard; grants are the user's, cleared in the browser's own settings.
-function forgetPortObject(port) {
-  const k = idKey(port);
-  const rest = (heldPorts.get(k) || []).filter((x) => x !== port);
-  if (rest.length) heldPorts.set(k, rest); else heldPorts.delete(k);
-}
-
-function isCdcPort(port) {
-  try {
-    const i = port.getInfo();
-    return i.usbVendorId === CDC_FILTER.usbVendorId && i.usbProductId === CDC_FILTER.usbProductId;
-  } catch (_) { return false; }
-}
-
-function isJtagPort(port) {
-  try {
-    const i = port.getInfo();
-    return i.usbVendorId === JTAG_ID.usbVendorId && i.usbProductId === JTAG_ID.usbProductId;
-  } catch (_) { return false; }
-}
-
-// Held objects first: after a re-enumeration the getPorts() snapshot may still
-// carry the previous incarnation's dead object under the same identity.
-async function grantedCdcPorts() {
-  let ports = [];
-  try { ports = await navigator.serial.getPorts(); } catch (_) { /* held only */ }
-  const seen = new Set();
-  // Newest first. A re-enumeration invalidates every object that preceded it,
-  // so recency is the best available guess at which one is live — and the
-  // audition pays ~900 ms for each dud it tries before the console, so guessing
-  // well is the difference between an instant move and a visible stall.
-  return [...ports.reverse(), ...heldList().reverse()].filter((p) => {
-    if (!p || seen.has(p)) return false;
-    seen.add(p);
-    return p.connected !== false && isCdcPort(p);
-  });
-}
-
-function offerConsoleHandover() {
-  if (!monitor || awaitingCdc) return;
-  awaitingCdc = true;
-  // The device has only announced the move; its new ports appear a moment
-  // later. Wait for one we are already permitted to open before troubling the
-  // user — a second switch in the same session needs no dialog at all.
-  let waited = 0;
-  const poll = setInterval(async () => {
-    if (!awaitingCdc) { clearInterval(poll); return; }
-    const found = await grantedCdcPorts();
-    if (found.length) {
-      clearInterval(poll);
-      adoptConsolePort(found);
-      return;
-    }
-    if ((waited += 250) >= 3000) {
-      clearInterval(poll);
-      // Stop suppressing reattach either way: if no CDC device turned up, the
-      // move failed and following the device back is the only way its error
-      // message reaches anyone.
-      if (awaitingCdc) { awaitingCdc = false; $('cdcmove-overlay').hidden = false; }
-    }
-  }, 250);
-}
-
-// Move the console onto the device's new port, keeping the outgoing session
-// rendering into the same terminal until the device drops it.
+// The device says it is moving its console to the CDC composite. This is the
+// one departure that is known not to be a blip — the port is not coming back on
+// this transport — so it is one of the only two places allowed to pop a picker.
 //
-// `cands` may hold both of the composite device's CDC ports — same VID/PID,
-// nothing in getInfo() to separate them, and only one is the console; the other
-// is silent in both directions, which is indistinguishable from a working
-// monitor on an idle device. So let them answer for themselves: attach, poke
-// (attachStreams sends a CR, which the firmware always answers), and keep the
-// first that produces a byte. Silence is a preference, not a veto — if none
-// answers we still take the first, because a silent monitor beats none.
-async function adoptConsolePort(cands) {
-  if (!monitor) { awaitingCdc = false; return; }
-  // Dedup by object: the same port can reach us from both heldPorts and the
-  // getPorts() snapshot, and auditioning it twice means opening one we already
-  // hold open — "The port is already open", read as a failure to answer.
-  const list = [...new Set(Array.isArray(cands) ? cands.filter(Boolean) : [cands])];
-  if (!list.length) { awaitingCdc = false; return; }
+// It still gives recovery first refusal. If this tab has already been pointed
+// at the CDC console port once, that port is in pickedPorts, the rescan opens it
+// the moment it enumerates, and the move completes with no dialog at all. The
+// ask is for the first move only, or after a re-pick pushed the CDC port out of
+// the pair.
+//
+// What it must never do is adopt a CDC port on a grant alone. The composite's
+// two interfaces are indistinguishable from each other and from another board's,
+// so that is a coin toss, and losing it swaps two consoles on a desk.
+function offerConsoleHandover() {
+  if (!monitor || awaitingCdc || !$('cdcmove-overlay').hidden) return;
+  awaitingCdc = true;
+  setTimeout(() => {
+    awaitingCdc = false;
+    if (!monitor) return;
+    if (!monitor.gone && monitor.reader) return;   // followed it on our own
+    $('cdcmove-overlay').hidden = false;
+  }, 3000);
+}
+
+// Move the console onto the port the user just picked, keeping the outgoing
+// session rendering into the same terminal until the device drops it. The pick
+// re-pins the tab: from here on this is the port, and the one it moved away
+// from is only watched out.
+//
+// The composite device presents two CDC ports with nothing in getInfo() to tell
+// them apart, and only the first is the console. The dialog says so and the
+// user picks; a port that turns out to be the silent one is caught by
+// verifyAlive, which narrates it. Auditioning them here instead would mean
+// opening a port nobody chose.
+async function adoptConsolePort(port) {
+  if (!monitor || !port) { awaitingCdc = false; return; }
   const outgoing = monitor;
-  adopting = true;                 // holds the rescan off these ports (see below)
+  adopting = true;                 // holds the rescan off while this runs
+  let committed = null;
   try {
-
-  let chosen = null;
-  for (const port of list) {
-    // Someone else got there first — a reclaim, or a connect event that landed
-    // on a live handle — and that session is real and working. Yield to it: the
-    // whole point of this audition is to find a console, and one has been found.
-    if (monitor !== outgoing) break;
-    let probe = null;
+    let chosen;
     try {
-      probe = makeSession(port, outgoing.term, outgoing.resizeObserver, true);  // muted while auditioning
-      await attachStreams(probe);
-      probe.muted = false;
-      const base = probe.rxSeq;
-      for (let waited = 0; waited < 900 && probe.rxSeq === base; waited += 100) await sleep(100);
-      if (probe.rxSeq !== base || list.length === 1) { chosen = probe; break; }
-      await detachStreams(probe);
-      forgetPortObject(port);        // opened but mute: not the console we want
-    } catch (e) {
-      if (probe) { try { await detachStreams(probe); } catch (_) { /* */ } }
-      const msg = e && e.message ? e.message : String(e);
-      // A grant that cannot be opened is spent — revoke it, so it is gone from
-      // the next audition instead of being waded through again. "Already open"
-      // is not that: it is one of our own handles, and must be kept.
-      if (!/already open/i.test(msg)) forgetPortObject(port);
-      else note(outgoing, `\x1b[90m-- a ${portLabel(port)} is already open here --\x1b[0m`);
-    }
-  }
-  // Re-check before committing: the loop above awaits, and a reclaim can have
-  // completed in any of those gaps. Overwriting `monitor` now would replace a
-  // proven-live session with an audition also-ran — which is exactly how a
-  // console that had come back got thrown away.
-  if (monitor !== outgoing) {
-    if (chosen) { try { await detachStreams(chosen); } catch (_) { /* */ } }
-    note(outgoing, '\x1b[90m-- console already recovered; audition abandoned --\x1b[0m');
-    return;
-  }
-
-  if (!chosen) {
-    // Every candidate opened but stayed mute. Take the first anyway and say so:
-    // the session stays usable, and a device that was merely busy delivers when
-    // it gets around to it.
-    try {
-      chosen = makeSession(list[0], outgoing.term, outgoing.resizeObserver, false);
+      chosen = makeSession(port, outgoing.term, outgoing.resizeObserver, false);
       await attachStreams(chosen);
-      note(outgoing, '\x1b[33m-- no port answered; taking the first --\x1b[0m');
     } catch (e) {
       note(outgoing, `\x1b[31m-- could not open the new port: ${e && e.message ? e.message : e} --\x1b[0m`);
       scheduleRescan();
       return;
     }
-  }
-
-  const port = chosen.port;
-  noteDeviceId(port);                  // the identity to follow from here on
-  presence.set(idKey(port), true);     // we hold it; later connects are repeats
-  priorSession = outgoing.gone ? null : outgoing;
-  monitor = chosen;
-  outgoing.term.focus();
-  refreshFlashOffer();
+    // Re-check before committing: attachStreams awaits, and a reclaim of the
+    // outgoing port can have completed in that gap. Overwriting `monitor` now
+    // would throw away a session that is proven live.
+    if (monitor !== outgoing) {
+      try { await detachStreams(chosen); } catch (_) { /* */ }
+      note(outgoing, '\x1b[90m-- console already recovered; move abandoned --\x1b[0m');
+      return;
+    }
+    pinPort(port);                       // the tab's port from here on
+    priorSession = outgoing.gone ? null : outgoing;
+    monitor = chosen;
+    committed = chosen;
+    outgoing.term.focus();
+    refreshFlashOffer();
   } finally {
     adopting = false;
     awaitingCdc = false;
+    // After the flags clear, so its own close/reopen cycle isn't held off by
+    // them. This is what tells a user who picked the composite device's other
+    // interface — the silent one — that they picked the wrong of the two.
+    if (committed) verifyAlive(committed);
   }
 }
 
-// The cdc→jtag counterpart of offerConsoleHandover. If this session holds a
-// grant for the JTAG side, the rescan reclaims it with no ceremony; if not,
-// the port is invisible to us and only a chooser pick (a gesture) reaches it —
-// raise the reconnect dialog to ask for one.
+// The cdc→jtag counterpart, and the other of the two places allowed to pop a
+// picker. Same shape: the device is walking off this transport for good, so if
+// the tab already owns the JTAG port the rescan is opening it right now and
+// there is nothing to ask. Only a tab that does not own it — one that was
+// opened straight onto CDC, or whose JTAG port aged out of the pair — needs the
+// dialog. A switch the firmware announced but never carried out leaves the CDC
+// session running, and the same check covers that: a working monitor is never
+// interrupted.
 function offerConsoleReturn() {
   if (!monitor) return;
-  let waited = 0;
-  const poll = setInterval(async () => {
-    if (!monitor) { clearInterval(poll); return; }
-    let ports = [];
-    try { ports = await navigator.serial.getPorts(); } catch (_) { /* held only */ }
-    if ([...heldList(), ...ports].some((x) => x && x.connected !== false && isJtagPort(x))) {
-      clearInterval(poll);              // granted and present — the rescan takes it
-      return;
-    }
-    if ((waited += 250) >= 3000) {
-      clearInterval(poll);
-      // Only if the session actually lost its port — a switch the firmware
-      // announced but never carried out leaves the CDC session running, and
-      // popping a dialog over a working monitor would be noise.
-      if (monitor && (monitor.gone || !monitor.reader)) askReconnect(null);
-    }
-  }, 250);
+  setTimeout(() => {
+    if (monitor && (monitor.gone || !monitor.reader)) askReconnect(null);
+  }, 3000);
 }
 
 $('cdcmove-ok').addEventListener('click', async () => {
@@ -2223,17 +2088,16 @@ async function verifyAlive(m) {
   }
 }
 
-// Re-open a returning port over the dead session. Shared by the connect event
-// and the rescan below, so a port that arrives before its predecessor's death
-// is reported gets the same treatment as one that arrives after.
-// `attempts` bounds the open retries: alone-in-the-list ports get the full
-// patient run (an OS still building the node needs time), but when several
-// objects wear one identity the dead twin fails instantly, so short passes
-// that rotate quickly find the live one sooner.
+// Re-open the tab's port over the dead session. Shared by the connect event and
+// the rescan below, so a port that arrives before its predecessor's death is
+// reported gets the same treatment as one that arrives after. `attempts` bounds
+// the open retries: a connect event has just proved the device is there and gets
+// the patient run (an OS still building the device node needs time), while the
+// rescan's blind polling takes one attempt per tick.
 let reclaimLastReport = null;   // last failure line printed; cleared on success
 async function reclaimPort(p, attempts = 8) {
   monitor.reattaching = true;                 // set synchronously, before any await
-  monitor.port = p;                           // adopt the (possibly fresh) port object
+  monitor.port = p;
   let attached = false;
   let lastErr = null;
   try {
@@ -2247,6 +2111,11 @@ async function reclaimPort(p, attempts = 8) {
         if (attempt === 0) { try { await p.close(); } catch (_) { /* wasn't open */ } }
         await attachStreams(monitor);
         monitor.gone = false;
+        // Whichever of the tab's ports answered is now the active one. That is
+        // how a console move completes without a dialog once both transports
+        // have been picked: the CDC port this tab already owns turns up, and
+        // the session simply follows it.
+        pinnedPort = p;
         note(monitor, `\x1b[32m-- ${portLabel(p)} came back --\x1b[0m`);
         monitor.term.focus();
         refreshFlashOffer();   // restore the green slot (detect, or the flash offer)
@@ -2276,22 +2145,30 @@ async function reclaimPort(p, attempts = 8) {
   }
 }
 
-// Keep looking for a replacement port while the session is dead. Events cannot
-// be trusted to drive this: the dead port's disconnect and its replacement's
-// connect come from two different USB devices, so the OS orders them freely —
-// a connect that lands while the session still looks live (or while a reclaim
-// holds the lock) is refused, and that one-shot event is spent. Ground truth
-// is polled instead: session dead + granted port attached → reclaim it. The
-// loop also outlasts a failed reclaim, because a port can be listed by the
-// browser well before the OS lets it open — the announced-then-quiet flag
-// keeps the narration to one line per outage rather than one per attempt.
+// Keep trying the tab's ports while the session is dead. Events cannot be
+// trusted to drive this on their own: a connect that lands while the session
+// still looks live (or while a reclaim holds the lock) is refused, and that
+// one-shot event is spent. Ground truth is polled instead — session dead, one
+// of our ports attached → reopen it — and the loop also outlasts a failed
+// reclaim, because a port can be listed by the browser well before the OS lets
+// it open.
+//
+// The candidate list is `pickedPorts` and nothing else. It rotates over them,
+// pinned first, because after a console move the port that answers is the other
+// one — which is what makes the second and every later `usb cdc` free of any
+// dialog. A board that was unplugged and plugged back in may return as a fresh
+// SerialPort object; this loop deliberately does not go looking for it.
+//
+// **This loop never raises a dialog.** Ports go away constantly — every reset,
+// every reflash — and come straight back, so a departure is not evidence of
+// anything and a modal on one would be wrong far more often than right. The
+// only thing that says a port is gone *for good* is the device announcing a
+// transport switch, and those two paths (offerConsoleHandover /
+// offerConsoleReturn) own the ask. What this loop does after a long silence is
+// reveal the Re-select port button and go quiet.
 let rescanTimer = null;
-// Raised for this outage already. The ask is ONCE per outage, never once per
-// failed cycle: forgetPortObject() drops our own object cache but deliberately
-// not the browser's grant, so a stale port keeps coming back in every
-// getPorts() snapshot — re-raising on that would put the modal back every
-// couple of seconds, over whatever the user is doing, with no way out.
-// Cleared when the outage ends (below) so the next one asks again.
+// Raised for this outage already, so the ask is ONCE per outage. Cleared when
+// the outage ends (below).
 let reconnectAsked = false;
 function askReconnect(why) {
   if (reconnectAsked) return;
@@ -2299,128 +2176,108 @@ function askReconnect(why) {
   if (monitor && why) note(monitor, `\x1b[33m-- ${why} --\x1b[0m`);
   $('reconnect-overlay').hidden = false;
 }
+// Offer the re-pick without interrupting: the session may yet recover on its
+// own, and this waits to be clicked either way.
+function offerRepick() {
+  if (!$('monitor-repick').hidden) return;
+  $('monitor-repick').hidden = false;
+  if (monitor) note(monitor, '\x1b[33m-- still no port; use “Re-select port” if it came back as a new one --\x1b[0m');
+}
 function scheduleRescan() {
   if (rescanTimer) return;
   let announced = false;
-  let failures = 0;
-  let rotate = 0;
   let ticks = 0;
+  let rotate = 0;
   rescanTimer = setInterval(async () => {
     if (!monitor || (!monitor.gone && monitor.reader)) {   // recovered or torn down
       clearInterval(rescanTimer);
       rescanTimer = null;
       reconnectAsked = false;
       $('reconnect-overlay').hidden = true;
+      $('monitor-repick').hidden = true;
       return;
     }
     if (monitor.reattaching) return;          // a reclaim is already running
-    // Once we've concluded the grant is stale and asked for a pick, stop
-    // hammering open() on the dead handles every 800 ms — keep looking, but
-    // slowly, so a device that simply comes back is still picked up free.
-    if (reconnectAsked && (++ticks % 6)) return;
-    // A console move owns the ports it is auditioning; stay off them entirely
-    // rather than race it for handles.
-    if (adopting || awaitingCdc) return;
-    let ports = [];
-    try { ports = await navigator.serial.getPorts(); } catch (_) { /* held only */ }
-    // Held objects first — a connect event's object outranks the snapshot's,
-    // which after a re-enumeration can be the dead previous incarnation. A
-    // failed cycle rotates to the next candidate rather than retrying the same
-    // object forever: with two objects wearing one identity, only trying both
-    // finds the live one.
-    const seen = new Set();
-    const candidates = [...heldList(), ...ports].filter((x) => {
-      if (!x || seen.has(x)) return false;
-      seen.add(x);
-      return x.connected !== false && isKnownDevice(x) && !(awaitingCdc && isCdcPort(x));
-    });
-    if (!candidates.length) return;
-    const p = candidates[rotate % candidates.length];
+    // A console move is opening one of these ports itself; stay off it rather
+    // than race for the handle.
+    if (adopting) return;
+    ticks++;
+    if (ticks === 40) offerRepick();          // ~30 s of nothing; before the
+                                              // backoff below, which skips ticks
+    // Present and openable is the common case and resolves in the first second
+    // or two. Past that the device is off the bus, and polling it hard buys
+    // nothing — back off, but never stop: a board that comes back on the same
+    // object is still picked up for free, however long it took.
+    if (ticks > 20 && (ticks % 6)) return;
+    const live = pickedPorts.filter((x) => x.connected !== false);
+    if (!live.length) return;
+    // Pinned first, then the other transport — after a move it is the other one
+    // that turns up, and following it is the whole point of owning both.
+    const order = [pinnedPort, ...live.filter((x) => x !== pinnedPort)].filter(
+      (x) => x && live.includes(x));
+    const p = order[rotate++ % order.length];
     if (!announced) {
       note(monitor, `\x1b[90m-- following the ${portLabel(p)} already present --\x1b[0m`);
       announced = true;
     }
-    // One attempt: a stale handle does not fail transiently — it fails, it's
-    // dead. (A live port arriving by connect event gets the patient retries in
-    // that handler; this loop only ever reaches for remembered handles.)
+    // One attempt per tick: a stale handle does not fail transiently — it
+    // fails, it's dead. (A port whose arrival raised a connect event gets the
+    // patient retries in that handler.)
     await reclaimPort(p, 1);
-    if (monitor && !monitor.gone && monitor.reader) { failures = 0; return; }
-    rotate++;
-    // Every candidate has now failed once — the grant is stale, and nothing
-    // reachable through it will ever work. Drop our objects (a fresh chooser
-    // pick mints a fresh one) and ask for that pick, once.
-    if (++failures >= Math.max(candidates.length, 1)) {
-      for (const x of candidates) forgetPortObject(x);
-      failures = 0;
-      askReconnect('no remembered port for this device opens; pick it again');
-    }
   }, 800);
 }
 
-// Dismissing costs nothing: the rescan keeps looking, a device that comes back
-// on its own is still adopted, and the stream carries the line saying what to
-// do. What it buys is the ability to use the rest of the page.
+// Dismissing costs nothing: the rescan keeps trying the tab's ports, the
+// Re-select port button is there when it is wanted, and the stream carries the
+// line saying what to do. What it buys is the ability to use the rest of the page.
 $('reconnect-dismiss').addEventListener('click', () => {
   $('reconnect-overlay').hidden = true;
 });
 
-$('reconnect-pick').addEventListener('click', async () => {
-  $('reconnect-overlay').hidden = true;
+// Pop the chooser and adopt what comes back. It takes a gesture by design: with
+// several identical boards listed, only the person at the desk knows which entry
+// is this tab's. `putBack` restores whatever asked, if the chooser is dismissed.
+async function repickPort(putBack) {
   if (!monitor) return;
   let port;
   try {
-    // Offer only identities this device has worn — with a stale twin possibly
-    // still listed, the fresh entry is the one the chooser shows as present.
-    const filters = knownIds.map((k) => ({ usbVendorId: k.vid, usbProductId: k.pid }));
-    port = await navigator.serial.requestPort(filters.length ? { filters } : {});
+    port = await navigator.serial.requestPort();
   } catch (_) {
-    // Chooser dismissed. Put the dialog back — the user asked for it by
-    // clicking, so this is answering a gesture, not a timer deciding to
-    // interrupt. "Not now" is the way out.
-    $('reconnect-overlay').hidden = false;
+    if (putBack) putBack();     // dismissed — this was answering a gesture
     return;
   }
-  noteDeviceId(port);
-  holdPort(port);
-  presence.set(idKey(port), true);
+  pinPort(port);
+  $('monitor-repick').hidden = true;
   await reclaimPort(port);
+}
+
+$('reconnect-pick').addEventListener('click', () => {
+  $('reconnect-overlay').hidden = true;
+  repickPort(() => { $('reconnect-overlay').hidden = false; });
 });
 
-// Hold on to the port's permission across physical disconnects: when the device
-// is powered off / unplugged, note it in the stream and tear the dead streams
-// down; when the device reappears (matched by USB VID/PID, since it may come back
-// as a fresh SerialPort object), re-open it and resume.
+// The non-modal way back, revealed by the rescan after a long silence.
+$('monitor-repick').addEventListener('click', () => repickPort(null));
+
+// The tab's port leaving the bus: note it in the stream and tear the dead
+// streams down. Nothing else on the desk is any of this tab's business — three
+// boards mean three sets of these events, and only the one for our own port
+// says anything about our session.
 navigator.serial.addEventListener('disconnect', (e) => {
   const p = e.port || e.target;
   if (!p) return;
-  // Every cached object for this identity is now a dead incarnation: the device
-  // left the bus, and whatever it presents next comes as freshly minted objects
-  // via connect. Dropping them here is what keeps the cache at the two ports
-  // that actually exist, instead of accumulating a generation per switch for
-  // the audition to wade through.
-  heldPorts.delete(idKey(p));
-  if (!presenceChanged(p, false)) return;
   // The port a handover moved away from, finally going. Expected, not a loss:
-  // say so plainly and let it go rather than holding the grant for a port the
-  // device has stopped presenting.
-  if (priorSession && idKey(p) === idKey(priorSession.port)) {
+  // say so plainly and let it go.
+  if (priorSession && p === priorSession.port) {
     const old = priorSession;
     priorSession = null;
     note(old, `\x1b[36m-- previous ${portLabel(old.port)} gone --\x1b[0m`);
     detachStreams(old);
     return;
   }
-  // By USB identity, not object: a device that re-enumerates is handed to us as
-  // a fresh SerialPort, so comparing objects misses its own session's departure
-  // — leaving the session marked live, never reattached, and its port closed
-  // under everything that later tries to use it.
-  if (!monitor || idKey(p) !== idKey(monitor.port)) {
-    // Not a session's port, or one already accounted for. Still worth saying:
-    // during a console move the device presents and withdraws transports on its
-    // own schedule, and a silent gap reads as the app having lost track.
-    if (monitor) note(monitor, `\x1b[90m-- ${portLabel(p)} gone --\x1b[0m`);
-    return;
-  }
+  // Only the port actually carrying the session. The tab's other transport
+  // coming and going is the device's business, not an outage.
+  if (!monitor || p !== pinnedPort || monitor.gone) return;
   monitor.gone = true;
   hideOpenUi();            // the device is gone — drop its buttons
   pendingFlash = null;     // can't flash (or detect on) a gone device
@@ -2429,50 +2286,30 @@ navigator.serial.addEventListener('disconnect', (e) => {
   $('monitor-detect').hidden = true;
   note(monitor, `\x1b[31m-- ${portLabel(p)} gone --\x1b[0m`);
   detachStreams(monitor);
-  // The replacement may have connected BEFORE this death was reported — its
+  // The port may have re-connected BEFORE this death was reported — its
   // one-shot connect event refused while the session still looked live. Now
-  // that the session is known dead, keep looking for it. Not during a console
-  // move: this departure is that move's expected first half, and the arriving
-  // transport belongs to the audition, not to a recovery.
-  if (!adopting && !awaitingCdc) scheduleRescan();
+  // that the session is known dead, keep trying. This runs during a console
+  // move too: the port the device is moving TO may be one this tab already
+  // owns, and the loop opening it is exactly how a move completes without
+  // troubling anyone.
+  if (!adopting) scheduleRescan();
 });
 
+// Only ever the tab's own port. An arrival that is not it is another board on
+// the desk coming back — possibly into another tab that owns it — and following
+// it would be how two consoles trade places.
 navigator.serial.addEventListener('connect', async (e) => {
   const p = e.port || e.target;
-  if (!p) return;
-  // Before any dedup or refusal: whatever else happens to this event, its port
-  // object is the live one for its identity — pin it, so the rescan reaches
-  // for this and not for a dead twin out of getPorts(). This is also how an
-  // arrival refused below (session still looks live, reclaim lock held) still
-  // ends up adopted: the rescan finds it here once the session's death lands.
-  holdPort(p);
-  // Re-enumeration fires `connect` several times; the lock keeps a single
-  // reattach running so concurrent handlers don't fight over the port.
-  // Match against every identity this device has worn, not just the one the
-  // dead session held: a reset out of CDC mode brings the device back as the
-  // USB-Serial-JTAG controller, which is a different VID/PID entirely.
-  if (!presenceChanged(p, true)) return;
-
-  // A CDC arrival during a move belongs to adoptConsolePort; taking it here
-  // would grab the wrong port and claim a return that did not happen. Every
-  // other arrival is ours to follow — including the device coming back on its
-  // old transport after a move failed, whose console carries the reason.
+  if (!isOurs(p) || !monitor) return;
   // Ground truth, not bookkeeping: a session with no reader has no working
   // port, whatever `gone` was left saying. That flag has repeatedly gone stale
   // — a missed disconnect leaves it false — and every time it does, an arriving
   // port is announced and then not taken, which presents as a live-looking
   // session that is mute and deaf until the page is reloaded.
-  const detached = monitor && (monitor.gone || !monitor.reader);
-  const mine = detached && !monitor.reattaching && isKnownDevice(p)
-               && !(awaitingCdc && isCdcPort(p));
-  if (!mine) {
-    // Announce it anyway. Ports appearing and disappearing is the whole shape
-    // of a console move, and hiding the ones we do not act on makes the
-    // sequence impossible to follow.
-    if (monitor) note(monitor, `\x1b[32m-- ${portLabel(p)} came back --\x1b[0m`);
-    return;
-  }
-  if (awaitingCdc) { awaitingCdc = false; $('cdcmove-overlay').hidden = true; }
+  if (!(monitor.gone || !monitor.reader)) return;
+  // Re-enumeration fires `connect` several times; the lock keeps a single
+  // reattach running so concurrent handlers don't fight over the port.
+  if (monitor.reattaching) return;
   await reclaimPort(p);
 });
 
@@ -2576,14 +2413,42 @@ async function flash(port, plan) {
   }
 }
 
+// Names for the USB identities that turn up here. The readable string the
+// browser's own chooser shows ("USB JTAG/serial debug unit", "FNB-58") comes
+// from the device's USB descriptors, read by the operating system; Web Serial
+// hands a page `usbVendorId` and `usbProductId` and nothing else, so a name in
+// flashmon's own UI has to be a table of ours. It names the kind of port, never
+// the individual board — three identical boards share one identity, and what
+// tells them apart is the hostname in the title once the device logs one.
+const USB_NAMES = [
+  { vid: 0x303A, pid: 0x1001, name: 'ESP32-S3 USB-Serial-JTAG' },
+  { vid: 0x303A, pid: 0x4002, name: 'ESP32-S3 CDC console' },
+  { vid: 0x10C4, pid: 0xEA60, name: 'CP210x USB-UART bridge' },
+  { vid: 0x1A86, pid: 0x55D4, name: 'CH9102 USB-UART bridge' },
+  { vid: 0x1A86, pid: 0x7523, name: 'CH340 USB-UART bridge' },
+];
+
+function usbDeviceName(port) {
+  if (isFnb58Port(port)) return 'FNB58 power meter';
+  try {
+    const i = port.getInfo ? port.getInfo() : {};
+    const hit = USB_NAMES.find((n) => n.vid === i.usbVendorId && n.pid === i.usbProductId);
+    return hit ? hit.name : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // The selected port's USB identity (native-USB S3 = 303A:1001, or a bridge's
-// CP2102/CH9102 VID:PID). Shown at the top of the banner. null for non-USB ports.
+// CP2102/CH9102 VID:PID), with its name where we have one. Shown at the top of
+// the banner. null for non-USB ports.
 function usbInfoLine(port) {
   try {
     const i = port.getInfo ? port.getInfo() : {};
     if (i.usbVendorId == null) return null;
     const h = (n) => (n != null ? n.toString(16).toUpperCase().padStart(4, '0') : '????');
-    return `USB ${h(i.usbVendorId)}:${h(i.usbProductId)}`;
+    const name = usbDeviceName(port);
+    return `USB ${h(i.usbVendorId)}:${h(i.usbProductId)}${name ? ` — ${name}` : ''}`;
   } catch (_) {
     return null;
   }
@@ -2944,6 +2809,9 @@ let connecting = false;
 // the Detect Hardware button, or for the firmware's own `build: invocation` line.
 // requestPort() is called first, while the user gesture is fresh, before any long
 // await.
+//
+// This pick is what the tab is for. It becomes the tab's one port, and only
+// another pick — the reconnect dialog, or a console move — ever replaces it.
 async function connect() {
   if (connecting || monitor) return;
   connecting = true;
@@ -2965,6 +2833,7 @@ async function connect() {
       $('start').hidden = false;      // let them re-pick; finally{} clears `connecting`
       return;
     }
+    pinPort(port);
     const banner = ['Monitoring only — the device has not been reset.',
                     'Press “Detect Hardware” to identify the board (that resets it).'];
     const usb = usbInfoLine(port);
