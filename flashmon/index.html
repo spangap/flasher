@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- The module below is fetched with a cache-bust query, this page is not: without
+     this, a browser holding an old copy pairs stale markup with a fresh script. -->
+<meta http-equiv="Cache-Control" content="no-cache">
 <title>flashmon</title>
 <style>
   :root{--bg:#000;--fg:#e6edf3;--accent:#2ea043;--err:#f85149;--muted:#8b949e;--panel:#161b22;--line:#30363d}
@@ -160,6 +163,20 @@
        text-transform:none;margin:1rem 0 0;cursor:pointer}
   .modal label.check input{width:auto;margin:0}
   #uichoice-overlay .row button{flex:1}
+  /* Firmware download: a bar with no buttons — it closes when the image is in. */
+  #dl-bar{display:block}
+  #dl-detail{color:var(--muted);font-size:.8rem;margin:.5rem 0 0;min-height:1.1em}
+  /* What a detection run read off the device. Wider than a plain dialog: it
+   * carries a board photo and the full fact list. */
+  #device-overlay .modal{max-width:560px}
+  #device-photo{display:block;width:100%;max-height:230px;object-fit:contain;
+       background:#0d1117;border:1px solid var(--line);border-radius:8px;margin:0 0 1rem}
+  #device-photo[hidden]{display:none}
+  #device-facts{display:grid;grid-template-columns:auto 1fr;gap:.35rem .8rem;font-size:.85rem;
+       align-items:baseline}
+  #device-facts dt{color:var(--muted)}
+  #device-facts dd{margin:0}
+  #device-facts .lines{white-space:pre-wrap;font:12px/1.5 ui-monospace,SFMono-Regular,monospace}
   /* Suggest sits INSIDE the password field, small, flush right. */
   .pw-row{position:relative}
   .pw-row input{padding-right:4.6rem}
@@ -291,6 +308,32 @@
         <div class="row">
           <button id="statewarn-cancel" class="btn-ghost" type="button">Cancel</button>
           <button id="statewarn-go" class="btn-danger" type="button">Erase and flash</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Firmware download: the image is fetched and unpacked with the monitor
+         still up and the device still running, so the progress belongs over the
+         terminal rather than on the intro screen the write uses. -->
+    <div id="dl-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Fetching firmware</h2>
+        <p class="sub" id="dl-sub"></p>
+        <div class="bar" id="dl-bar"><i id="dl-barfill"></i></div>
+        <p id="dl-detail"></p>
+      </div>
+    </div>
+
+    <!-- What a detection run found: the board, its photo, and every fact read
+         off the chip. Purely informational — the flash offer is made behind it. -->
+    <div id="device-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2 id="device-title"></h2>
+        <p class="sub" id="device-sub"></p>
+        <img id="device-photo" alt="" hidden>
+        <dl id="device-facts"></dl>
+        <div class="row">
+          <button id="device-ok" class="btn-primary" type="button">OK</button>
         </div>
       </div>
     </div>

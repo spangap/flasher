@@ -25,6 +25,17 @@ import { Terminal } from './vendor/xterm.js';
 import { FitAddon } from './vendor/xterm-addon-fit.js';
 
 const $ = (id) => document.getElementById(id);
+
+// Bind a listener to an element that may not be in this page. index.html is
+// served without the cache-bust the module gets, so a browser can pair a stale
+// page with a fresh script: an element added in the same change as its handler
+// is then missing, and a throw here — at module scope — would abort the whole
+// script and leave nothing but a black screen. boot() says so out loud instead.
+function on(id, ev, fn) {
+  const el = $(id);
+  if (el) el.addEventListener(ev, fn);
+  return !!el;
+}
 const logEl = $('log');
 const bar = $('bar');
 const barfill = $('barfill');
@@ -67,7 +78,111 @@ const DEFAULT_CFG = {
   parity: 'none',
 };
 
+// Picking a port resets the device and identifies the board straight away. A
+// `?noreset` in the query string keeps the old hands-off behaviour: the monitor
+// opens on a device that is left running, and identifying it waits for the
+// Detect Hardware button.
+const AUTO_DETECT = !params.has('noreset');
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── timers that keep running in a background tab ────────────────────────────
+// Chrome throttles window timers in a hidden tab: a chain of setTimeout calls is
+// clamped to one per second, and after five minutes hidden to roughly one per
+// minute. esptool-js waits for every serial response by polling its receive
+// buffer with `await sleep(1)`, and the reset/upload paths (ours included) are
+// built from short sleeps, so a run in a hidden tab crawls and then fails on its
+// own command timeouts.
+//
+// Timers inside a dedicated worker are not throttled, so for the length of a
+// port-owning run (flash, detect, and the monitor re-open that follows) the
+// global setTimeout is routed through one: the worker holds the timer and posts
+// its id back when it fires. Every user of setTimeout is covered, vendored
+// esptool-js included, because it resolves the global at call time. Where a
+// worker cannot be created the natives simply stay in place.
+const nativeSetTimeout = window.setTimeout.bind(window);
+const nativeClearTimeout = window.clearTimeout.bind(window);
+// Our ids live far above the browser's sequential ones so a clearTimeout can
+// tell whose timer it holds, whichever implementation issued it.
+const WT_ID_BASE = 1e9;
+let wtWorker = null;            // the worker holding the timers, once spawned
+let wtSpawned = false;          // spawn is attempted once per page
+const wtCallbacks = new Map();  // our timer id → callback
+let wtNextId = WT_ID_BASE;
+let wtDepth = 0;                // port-owning runs currently asking for them
+
+function wtSpawn() {
+  if (wtSpawned) return wtWorker;
+  wtSpawned = true;
+  const src =
+    'const t=new Map();onmessage=(e)=>{const d=e.data;' +
+    'if(d.op==="set"){t.set(d.id,setTimeout(()=>{t.delete(d.id);postMessage(d.id);},d.ms));}' +
+    'else{const h=t.get(d.id);if(h!==undefined){clearTimeout(h);t.delete(d.id);}}};';
+  const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+  try {
+    wtWorker = new Worker(url);
+    wtWorker.onmessage = (e) => {
+      const cb = wtCallbacks.get(e.data);
+      if (cb) { wtCallbacks.delete(e.data); cb(); }
+    };
+    wtWorker.onerror = wtFallBack;
+  } catch (_) {
+    wtWorker = null;            // no worker (CSP, say): keep the window timers
+  } finally {
+    URL.revokeObjectURL(url);   // the worker keeps its script alive past this
+  }
+  return wtWorker;
+}
+
+// A worker that dies mid-run would take every pending timer with it and hang the
+// flash, so give up on it: window timers go back (throttled in a hidden tab, but
+// running) and whatever it still owed fires now.
+function wtFallBack() {
+  wtWorker = null;
+  window.setTimeout = nativeSetTimeout;
+  const pending = [...wtCallbacks.values()];
+  wtCallbacks.clear();
+  for (const cb of pending) nativeSetTimeout(cb, 0);
+}
+
+function wtSetTimeout(fn, ms, ...args) {
+  if (typeof fn !== 'function' || !wtWorker) return nativeSetTimeout(fn, ms, ...args);
+  const id = wtNextId++;
+  wtCallbacks.set(id, () => fn(...args));
+  wtWorker.postMessage({ op: 'set', id, ms: Math.max(0, Number(ms) || 0) });
+  return id;
+}
+
+function wtClearTimeout(id) {
+  if (typeof id === 'number' && id >= WT_ID_BASE) {
+    wtCallbacks.delete(id);
+    if (wtWorker) wtWorker.postMessage({ op: 'clear', id });
+    return;
+  }
+  nativeClearTimeout(id);
+}
+
+// Route window timers through the worker until the returned release is called.
+// Nested runs share one installation; the natives go back when the last one
+// releases. Call it in a try/finally — leaving the shim installed is harmless
+// but pointless.
+// A timer armed during a run can be cancelled after it ends (an rpc waiter that
+// gets its answer, say), so clearTimeout stays ours for the rest of the page:
+// it is a plain passthrough for ids the browser issued, and only it can cancel
+// the ones the worker holds.
+function useWorkerTimers() {
+  if (!wtSpawn()) return () => {};
+  let released = false;
+  if (wtDepth++ === 0) {
+    window.setTimeout = wtSetTimeout;
+    window.clearTimeout = wtClearTimeout;
+  }
+  return () => {
+    if (released) return;
+    released = true;
+    if (--wtDepth === 0) window.setTimeout = nativeSetTimeout;
+  };
+}
 
 function fmtCfg(c) {
   const p = c.parity === 'even' ? 'E' : c.parity === 'odd' ? 'O' : 'N';
@@ -1880,6 +1995,7 @@ function hideOpenUi() {
 function closeDialogs(m) {
   $('info-overlay').hidden = true;
   $('stuck-overlay').hidden = true;
+  closeDeviceBox();
   closeUiChoice();
   cancelStateWarn();       // an unanswered warning means: don't flash
   if (m && m.passwdOpen) { m.passwdOpen = false; m.passwdResolved = true; closePasswdDialog(); }
@@ -2329,6 +2445,46 @@ function initCfgControls() {
 }
 
 // ── flashing ────────────────────────────────────────────────────────────────
+// The download's own dialog. The image is fetched with the monitor still up and
+// the device still running, so its progress has no intro screen to live on —
+// this box sits over the terminal for the length of the fetch and unpack, and
+// takes no answer: it closes when the image is in hand, or when the fetch fails
+// and the error goes to the monitor.
+function dlOpen(what) {
+  if (!$('dl-overlay')) return;               // page older than this script
+  $('dl-sub').textContent = what;
+  $('dl-detail').textContent = '';
+  $('dl-barfill').style.width = '0';
+  $('dl-overlay').hidden = false;
+}
+function dlProgress(frac, detail) {
+  if (!$('dl-overlay')) return;
+  if (frac != null) $('dl-barfill').style.width = `${Math.round(frac * 100)}%`;
+  if (detail != null) $('dl-detail').textContent = detail;
+}
+function dlClose() { if ($('dl-overlay')) $('dl-overlay').hidden = true; }
+
+// Fetch `url` into memory, reporting progress as the body streams in. A response
+// that declares no Content-Length (chunked, or compressed on the fly) has no
+// fraction to report: `frac` comes through null and only the byte count moves.
+async function fetchProgress(url, onProgress) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`could not fetch ${url} (HTTP ${res.status}) — is the build published?`);
+  const total = Number(res.headers.get('content-length')) || 0;
+  if (!res.body) return new Uint8Array(await res.arrayBuffer());   // no streaming here
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    onProgress(total ? got / total : null, got, total);
+  }
+  return concatBytes(chunks);
+}
+
 // Download the image zip at `zipURL` (a flasher.zip produced by `spangap
 // build`) and unzip it in the browser: the images to write, each at its offset,
 // plus the flash settings. Separate from the write, and touching neither the
@@ -2336,9 +2492,20 @@ function initCfgControls() {
 // on the chip (see stateOverlaps) while there is still nothing to undo.
 async function loadFlashPlan(zipURL) {
   log(`Downloading ${zipURL}`);
-  const res = await fetch(zipURL, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`could not fetch ${zipURL} (HTTP ${res.status}) — is the build published?`);
-  const zip = await window.JSZip.loadAsync(await res.arrayBuffer());
+  dlOpen(zipURL.replace(/^.*\//, ''));
+  try {
+    return await unpackFlashPlan(zipURL);
+  } finally {
+    dlClose();
+  }
+}
+
+async function unpackFlashPlan(zipURL) {
+  const bytes = await fetchProgress(zipURL, (frac, got, total) => {
+    dlProgress(frac, total ? `${fmtBytes(got)} of ${fmtBytes(total)}` : `${fmtBytes(got)} downloaded`);
+  });
+  dlProgress(1, `${fmtBytes(bytes.length)} downloaded — unpacking…`);
+  const zip = await window.JSZip.loadAsync(bytes);
 
   const argsFile = zip.file('flasher_args.json');
   if (!argsFile) throw new Error('flasher.zip has no flasher_args.json');
@@ -2355,6 +2522,7 @@ async function loadFlashPlan(zipURL) {
   for (const [offset, fname] of entries) {
     const f = zip.file(fname);
     if (!f) throw new Error(`image "${fname}" missing from flasher.zip`);
+    dlProgress(null, `unpacking ${fname} (${fileArray.length + 1} of ${entries.length})…`);
     fileArray.push({ data: await f.async('uint8array'), address: parseInt(offset, 16) });
   }
   fileArray.sort((a, b) => a.address - b.address);
@@ -2493,6 +2661,99 @@ function detectedStatePart(lines) {
   }
   return null;
 }
+
+// ── the device box ──────────────────────────────────────────────────────────
+// Everything a detection run read off the attached device, shown over the
+// terminal the moment the run ends: the board and its photo, the chip facts, the
+// peripherals, where the device keeps its own data, and what firmware it runs.
+// It takes no decision — the flash offer is resolved behind it, so OK just
+// uncovers a monitor that is already in its normal state, green Flash button and
+// all.
+//
+// The facts are kept because some land late: the running firmware's build stamp
+// only arrives with the boot log a few seconds after the reset, and the flash
+// offer waits on it, so an open box re-renders as they come in.
+let deviceFacts = null;
+
+// The catalogue's photo for `hw` — `image:` on its build entry, a path in the
+// web root (`devices/<board>.jpg` by convention). Nothing ships one by default,
+// and a board without one simply shows no picture.
+function deviceImage(hw) {
+  const entry = BUILDS.find((b) => b.name === hw);
+  return (entry && entry.image) || null;
+}
+
+// A build stamp (YYYYMMDDhhmmss) as a readable date.
+function fmtStamp(v) {
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(v || '');
+  return m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}` : (v || '');
+}
+
+// One <dt>/<dd> pair. Written as text, never markup: every value here is a line
+// the device itself printed.
+function factRow(dl, key, value) {
+  if (!value) return;
+  const dt = document.createElement('dt');
+  dt.textContent = key;
+  const dd = document.createElement('dd');
+  dd.textContent = value;
+  if (value.includes('\n')) dd.className = 'lines';
+  dl.append(dt, dd);
+}
+
+function renderDeviceBox() {
+  const f = deviceFacts;
+  if (!f || !$('device-overlay')) return;     // no facts, or a page older than this script
+  const board = f.hw ? f.hw.replace(/^hw-/, '') : null;
+  $('device-title').textContent = board || 'Device found';
+  $('device-sub').textContent = f.hw
+    ? `Identified as ${f.hw}. Everything read off the chip:`
+    : 'The chip answered the probe, but no supported board matched it.';
+
+  const photo = $('device-photo');
+  const src = f.hw ? deviceImage(f.hw) : null;
+  photo.hidden = !src;
+  if (src) {
+    photo.onerror = () => { photo.hidden = true; };   // catalogue names a file that isn't there
+    photo.alt = board;
+    photo.src = src;
+  }
+
+  const dl = $('device-facts');
+  dl.textContent = '';
+  factRow(dl, 'Port', f.usb);
+  factRow(dl, 'Chip', f.chip.join('\n'));
+  factRow(dl, 'Peripherals', f.periph.length ? f.periph.join('\n') : 'none reported');
+  factRow(dl, 'Stored data', f.state
+    ? `state partition at 0x${f.state.addr.toString(16)}, ${fmtBytes(f.state.size)}`
+    : 'no state partition on this chip yet');
+  const m = monitor;
+  factRow(dl, 'Firmware', m && m.deviceVersion
+    ? `${PROJECT} build ${fmtStamp(m.deviceVersion)}`
+    : 'no build stamp reported (older firmware, or still booting)');
+  const offered = pendingFlash && (BUILDS.find((b) => b.name === pendingFlash.name) || {}).version;
+  let catalogue;
+  if (!f.hw) catalogue = 'no board identified, so nothing to match against';
+  else if (pendingFlash) catalogue = `build ${fmtStamp(offered)} is newer — the green button behind this box flashes it`;
+  else if (m && m.versionSettled) catalogue = 'nothing newer published for this board';
+  else catalogue = 'checking for a newer build…';
+  factRow(dl, 'Catalogue', catalogue);
+}
+
+function showDeviceBox(facts) {
+  deviceFacts = facts;
+  renderDeviceBox();
+  if ($('device-overlay')) $('device-overlay').hidden = false;
+}
+
+function closeDeviceBox() { if ($('device-overlay')) $('device-overlay').hidden = true; }
+
+on('device-ok', 'click', closeDeviceBox);
+// Clicking the dimmed backdrop dismisses it too — but not a click inside the
+// box, where the fact list is there to be selected and copied.
+on('device-overlay', 'click', (e) => {
+  if (e.target === $('device-overlay')) closeDeviceBox();
+});
 
 // ── state-partition warning ─────────────────────────────────────────────────
 // Flash erases whole sectors, so a write erases from the start of the sector its
@@ -2644,6 +2905,13 @@ function armFlashGrace(hw, fromDetector) {
   refreshFlashOffer();
 }
 
+// Re-evaluate the flash offer, and with it anything that quotes the offer.
+async function refreshFlashOffer() {
+  await resolveFlashOffer();
+  const box = $('device-overlay');
+  if (box && !box.hidden) renderDeviceBox();
+}
+
 // Resolve the identified board to the best available image and show the flash
 // button — but only when that image is newer than the running firmware. Reactive:
 // re-run whenever the board, the device's build stamp, or the catalogue changes. A
@@ -2651,7 +2919,7 @@ function armFlashGrace(hw, fromDetector) {
 //
 // The green slot falls back to "Detect Hardware" while the board is unknown —
 // nothing can be resolved until either the boot log or a detection run names it.
-async function refreshFlashOffer() {
+async function resolveFlashOffer() {
   const m = monitor;
   pendingFlash = null;
   $('monitor-flash').hidden = true;
@@ -2696,42 +2964,50 @@ async function runPendingFlash() {
   logEl.hidden = true;
   $('intro-hint').textContent = '';
 
-  // Fetch and unpack with the monitor still up and the device still running: the
-  // image's own offsets are the only way to tell whether the write reaches into
-  // the device's state store, and if it does the answer may be "don't" — which
-  // has to leave the session exactly as it was.
-  let plan;
-  note(m, '\x1b[36m-- fetching firmware image --\x1b[0m');
+  // The download, the write and the re-open that follows all run on short timers,
+  // which a hidden tab would throttle to a standstill — so they are held for the
+  // whole run, from the first byte fetched to the monitor coming back.
+  const releaseTimers = useWorkerTimers();
   try {
-    plan = await loadFlashPlan(url);
-  } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    log(`Error: ${msg}`, 'err');
-    note(m, `\x1b[31m-- flash aborted: ${msg} --\x1b[0m`);
-    return;
-  }
-  if (monitor !== m) return;                  // session replaced while downloading
-  const hits = stateOverlaps(plan.fileArray, statePart);
-  if (hits.length && !(await confirmStateOverlap(statePart, hits))) {
-    if (monitor === m) note(m, '\x1b[33m-- flash cancelled; the device was not touched --\x1b[0m');
-    return;
-  }
-  if (monitor !== m) return;                  // …or while the warning was up
+    // Fetch and unpack with the monitor still up and the device still running: the
+    // image's own offsets are the only way to tell whether the write reaches into
+    // the device's state store, and if it does the answer may be "don't" — which
+    // has to leave the session exactly as it was.
+    let plan;
+    note(m, '\x1b[36m-- fetching firmware image --\x1b[0m');
+    try {
+      plan = await loadFlashPlan(url);
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      log(`Error: ${msg}`, 'err');
+      note(m, `\x1b[31m-- flash aborted: ${msg} --\x1b[0m`);
+      return;
+    }
+    if (monitor !== m) return;                  // session replaced while downloading
+    const hits = stateOverlaps(plan.fileArray, statePart);
+    if (hits.length && !(await confirmStateOverlap(statePart, hits))) {
+      if (monitor === m) note(m, '\x1b[33m-- flash cancelled; the device was not touched --\x1b[0m');
+      return;
+    }
+    if (monitor !== m) return;                  // …or while the warning was up
 
-  await closeMonitor();
-  $('monitor').hidden = true;                 // reveal the intro screen behind it
-  try {
-    let banner = await flash(port, plan);
-    const usb = usbInfoLine(port);
-    if (usb) banner = [usb, ...(banner || [])];
-    await openMonitor(port, true, banner);   // reset into the freshly-flashed firmware
-    armFlashGrace(hw, hwDetected);            // re-arm: the new build should read as current
-  } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    log(`Error: ${msg}`, 'err');
-    // Flashing may have left the port closed; drop back to a plain monitor so
-    // the user can retry or reset manually.
-    try { await openMonitor(port, false, [`Flash failed: ${msg}`]); } catch (_) { /* */ }
+    await closeMonitor();
+    $('monitor').hidden = true;                 // reveal the intro screen behind it
+    try {
+      let banner = await flash(port, plan);
+      const usb = usbInfoLine(port);
+      if (usb) banner = [usb, ...(banner || [])];
+      await openMonitor(port, true, banner);   // reset into the freshly-flashed firmware
+      armFlashGrace(hw, hwDetected);            // re-arm: the new build should read as current
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      log(`Error: ${msg}`, 'err');
+      // Flashing may have left the port closed; drop back to a plain monitor so
+      // the user can retry or reset manually.
+      try { await openMonitor(port, false, [`Flash failed: ${msg}`]); } catch (_) { /* */ }
+    }
+  } finally {
+    releaseTimers();
   }
 }
 
@@ -2763,6 +3039,10 @@ async function runDetect() {
   let info = null;
   let hw = null;
   let banner;
+  let facts = null;
+  // ROM-loader traffic and the reset back into the firmware run on short timers,
+  // which a hidden tab would throttle to a standstill.
+  const releaseTimers = useWorkerTimers();
   try {
     info = await probeChip(port);
     if (info) {
@@ -2773,6 +3053,16 @@ async function runDetect() {
       // A run that captured nothing at all is no answer, so it changes nothing.
       if (detected.length) statePart = detectedStatePart(detected);
       banner = detected.length ? [...info, '', ...detected] : info;
+      // Same findings, for the box: the detector's own conclusions (`DETECTED:`
+      // — the board, the state store) are stated as fields of their own, so what
+      // is left under "peripherals" is the parts it actually found on the buses.
+      facts = {
+        usb: usbInfoLine(port),
+        chip: info,
+        periph: detected.filter((l) => !l.startsWith('DETECTED:')),
+        hw,
+        state: statePart,
+      };
     } else {
       banner = ['No ESP32 detected.'];
     }
@@ -2793,22 +3083,27 @@ async function runDetect() {
     try { await openMonitor(port, false, [`Detection failed: ${msg}`]); } catch (_) { /* */ }
   } finally {
     detecting = false;   // before the offer refresh, so an empty result re-offers detection
+    releaseTimers();
   }
   // Record what we learned (nothing, on a failed run — which puts the Detect
   // Hardware button back) and offer a flash only if a newer build is published.
   armFlashGrace(hw, true);
+  // Only a run that reached the chip has anything to show.
+  if (facts && monitor) showDeviceBox(facts);
 }
 
 $('monitor-detect').addEventListener('click', runDetect);
 
 let connecting = false;
 
-// Pop the serial chooser and open the monitor on the port — nothing more. The
-// device is not probed and not reset: it keeps doing whatever it was doing, and
-// the monitor just watches. Identifying the board (which costs a reset) waits for
-// the Detect Hardware button, or for the firmware's own `build: invocation` line.
-// requestPort() is called first, while the user gesture is fresh, before any long
-// await.
+// Pop the serial chooser, open the monitor on the port, and identify the board:
+// the pick is followed straight away by a detection run, which resets the device,
+// reads the chip and its peripherals, and ends in the device box. Under
+// `?noreset` the pick opens the monitor and stops there — the device is not
+// probed and not reset, it keeps doing whatever it was doing, and identifying it
+// waits for the Detect Hardware button or the firmware's own `build: invocation`
+// line. requestPort() is called first, while the user gesture is fresh, before
+// any long await.
 //
 // This pick is what the tab is for. It becomes the tab's one port, and only
 // another pick — the reconnect dialog, or a console move — ever replaces it.
@@ -2834,8 +3129,10 @@ async function connect() {
       return;
     }
     pinPort(port);
-    const banner = ['Monitoring only — the device has not been reset.',
-                    'Press “Detect Hardware” to identify the board (that resets it).'];
+    const banner = AUTO_DETECT
+      ? ['Identifying the board — the device is about to be reset.']
+      : ['Monitoring only — the device has not been reset.',
+         'Press “Detect Hardware” to identify the board (that resets it).'];
     const usb = usbInfoLine(port);
     await openMonitor(port, false, usb ? [usb, ...banner] : banner);
     refreshFlashOffer();   // board unknown → the green slot offers detection
@@ -2846,12 +3143,17 @@ async function connect() {
   } finally {
     connecting = false;
   }
+  // Identify the board the moment the monitor is up — outside the try above, so
+  // a detection failure reports itself in the monitor rather than putting the
+  // "pick a port" call to action back over a live session.
+  if (AUTO_DETECT && monitor) await runDetect();
 }
 
 // ── config ────────────────────────────────────────────────────────────────
 // Minimal YAML for our shape: `project: <name>` and a `builds:` list whose
-// entries each carry a `name:`. We only need the project brand and the image
-// names; the invocations are for `make` in builds/, not the browser.
+// entries each carry a `name:`. The browser needs the project brand, the image
+// names and stamps, and the optional `image:` photo the device box shows; the
+// invocations are for `make` in builds/, not the browser.
 function parseConfig(text) {
   const cfg = { project: 'flashmon', builds: [] };
   let inBuilds = false;
@@ -2861,7 +3163,7 @@ function parseConfig(text) {
     if (i < 0) return;
     const k = kv.slice(0, i).trim();
     const v = kv.slice(i + 1).trim().replace(/^["']|["']$/g, '');
-    if (k === 'name' || k === 'version') obj[k] = v;
+    if (k === 'name' || k === 'version' || k === 'image') obj[k] = v;
   };
   const top = (st, key) => st.slice(st.indexOf(':') + 1).trim().replace(/^["']|["']$/g, '');
   for (const raw of text.split('\n')) {
@@ -2906,6 +3208,16 @@ async function boot() {
     BUILD_NAMES = c.builds.map((b) => b.name).filter(Boolean);
     if (monitor) refreshFlashOffer();
   }, 60000);
+
+  // Markup this script drives that the page it loaded into doesn't have: the
+  // page was served from cache, older than the script beside it. Flashing and
+  // the monitor still work; the dialogs those elements belong to don't, and a
+  // reload that bypasses the cache is the fix.
+  const stale = ['dl-overlay', 'device-overlay'].filter((id) => !$(id));
+  if (stale.length) {
+    log(`This page is cached from an older deployment (missing: ${stale.join(', ')}). `
+      + 'Reload with Shift held to fetch the current one.', 'err');
+  }
 
   setMonTitle(null);
   $('monitor-baud').textContent = fmtCfg(DEFAULT_CFG);

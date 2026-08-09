@@ -22,6 +22,7 @@ flashmon/                     ← this repo
     flashmon.yaml.example     ← template config (checked in); copy → flashmon.yaml
     flashmon.yaml             ← your config: project brand + catalogue (gitignored)
     detect/spangap_detect.bin ← the peripheral detector (checked in)
+    devices/                  ← board photos for the device box (optional)
     vendor/                   ← esptool-js, JSZip, xterm.js (no runtime CDN)
     builds/
       Makefile                ← `make` builds every image in flashmon.yaml
@@ -52,9 +53,20 @@ along and get served even though they aren't tracked: the branded
 The page shows its title (**`<project> Flasher`**) and goes straight to the
 serial port picker on your first click/keypress (the browser only lets the
 chooser open in response to a user gesture; it never silently reuses a
-remembered device). Once you pick a device it **only opens the port** and shows
-the **serial monitor**: the device is not probed and not reset, so whatever it is
-doing keeps running and its output just starts streaming.
+remembered device). Once you pick a device it opens the port, shows the **serial
+monitor**, and immediately **resets the device and identifies it** — the same
+detection run the *Detect Hardware* button performs, described below. What it
+found is then shown in the **device box** over the terminal: the board and its
+photo, the chip facts, the peripherals, where the device keeps its own data, and
+which firmware it is running. **OK** dismisses it and leaves the monitor in its
+normal state — including the green *Flash* button, if the catalogue has something
+newer than what the device already runs.
+
+Add **`?noreset`** to the URL to keep the device untouched: the port is opened
+and the monitor watches, the device is not probed and not reset, whatever it is
+doing keeps running, and identifying the board waits for the button (or for the
+boot log to say it). Reach for it when the device is doing something you don't
+want interrupted.
 
 Everything past that is board-specific, so it waits until the board is known. The
 board is identified either way round:
@@ -64,9 +76,11 @@ board is identified either way round:
   image was compiled with. The `hw-<board>` in it names the board, so a device
   that boots (or is reset) while the monitor is open identifies itself with no
   probe at all.
-- **From the hardware, on demand.** A green **Detect Hardware** button sits where
-  the flash button goes (left of *Open Device UI* and *Reset*). Pressing it
-  **probes** the chip over the ROM loader (esptool-js — chip, revision, features,
+- **From the hardware.** This is the run that fires on connect, and a green
+  **Detect Hardware** button repeats it on demand — it sits where the flash
+  button goes (left of *Open Device UI* and *Reset*), and appears whenever the
+  board is still unknown (after a `?noreset` connect, or a run that found
+  nothing). It **probes** the chip over the ROM loader (esptool-js — chip, revision, features,
   flash size), **RAM-loads the peripheral detector**
   (`detect/spangap_detect.bin`) into SRAM and jumps to it (**no flash write**),
   captures its one-shot findings into the cyan banner (which board, which
@@ -76,9 +90,11 @@ board is identified either way round:
 
 Once the board is known, that same green slot turns into **Flash `<project>` to
 `<board>`** if the catalogue holds a newer image for it. Pressing it downloads
-that image, unzips it in the browser (JSZip), flashes every image at its offset
-over Web Serial, then reopens the monitor and resets into the freshly-flashed
-firmware.
+that image behind a progress box over the terminal (bytes fetched of the
+`Content-Length`, then the unpack), unzips it in the browser (JSZip), flashes
+every image at its offset over Web Serial, then reopens the monitor and resets
+into the freshly-flashed firmware. The download happens with the monitor still up
+and the device still running, so a fetch that fails costs the session nothing.
 
 ### How an image is matched
 
@@ -107,6 +123,20 @@ still running, so cancelling costs the session nothing — nothing has been writ
 and the monitor carries on. Without a detection run there is nothing to compare
 against and no warning is raised, since the boot log never states where the store
 is. `flashmon.py` makes the same check and asks the same question on the terminal.
+
+### Flashing survives a background tab
+
+A flash — download, write and the monitor re-open that follows — and a detect run
+keep going at full speed while their tab is hidden: switch tabs, minimise the
+window, walk away. That takes work, because Chrome
+throttles `setTimeout` in a hidden tab to one call per second, and to about one
+per minute once it has been hidden five minutes; esptool-js waits for every
+serial response by polling its receive buffer on a 1 ms timer, so an unaided
+flash would crawl and then die on its own command timeouts. For the length of a
+run, flashmon routes the global `setTimeout` through a dedicated worker — worker
+timers are exempt from the throttling — and puts the native one back afterwards.
+It is the browser's own throttling that is sidestepped, not the machine's: a
+laptop that suspends still suspends the flash.
 
 ## The monitor
 
@@ -280,6 +310,7 @@ project: Reticulous              # shown in the title, the flash button, the
                                  # default device hostname
 builds:
   - name: hw-lilygo-tdeck        # matched against the detected hw-<straddle>
+    image: devices/hw-lilygo-tdeck.jpg   # optional: photo for the device box
     invocation: reticulous/reticulous --with spangap/hw-lilygo-tdeck
   - name: generic                # fallback for any board without its own image
     invocation: reticulous/reticulous
@@ -289,6 +320,13 @@ Each entry names an image and gives the `spangap build` invocation that produces
 it. A `flashmon/flashmon.local.yaml` (also gitignored) is preferred over
 `flashmon.yaml` when present, for a per-machine override without touching your
 own file.
+
+`image:` is the board's **photo**, shown in the device box when a detection run
+identifies that board — a path in the web root (`devices/<board>.jpg` by
+convention; see [`flashmon/devices/`](flashmon/devices)), never a remote URL,
+since nothing here loads from a CDN. It is optional both ways: an entry without
+one, a board with no catalogue entry at all, or a file that 404s just leaves the
+box text-only.
 
 `make` fills in three more fields per entry, which you never hand-edit:
 `version:` (the run stamp), `flash_floor_kb:` (the minimum chip size the image

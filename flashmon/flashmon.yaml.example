@@ -22,6 +22,12 @@
 #                           `generic` is the fallback for any board without a
 #                           dedicated image.
 #               invocation  the `spangap build` arguments that produce it.
+#               image       optional. A photo of the board, shown in the device
+#                           box when a detection run identifies it: a path in the
+#                           web root (devices/<board>.jpg by convention — see
+#                           devices/README.md), never a remote URL. Left out, or
+#                           pointing at a file that isn't there, the box is
+#                           simply text-only.
 #               version     DO NOT hand-edit. `make` in builds/ writes this per
 #                           entry — the build datetime it stamped that image with
 #                           — and names the image builds/<slug>_<name>_<version>.zip.
@@ -47,6 +53,7 @@ project: MyProject
 url: https://myproject.example/flashmon/
 builds:
   - name: hw-lilygo-tdeck
+    image: devices/hw-lilygo-tdeck.jpg
     invocation: myorg/myproject --with spangap/hw-lilygo-tdeck
   - name: generic
     invocation: myorg/myproject
