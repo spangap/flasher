@@ -100,6 +100,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // its id back when it fires. Every user of setTimeout is covered, vendored
 // esptool-js included, because it resolves the global at call time. Where a
 // worker cannot be created the natives simply stay in place.
+//
+// The same worker also serves callers that need one un-throttled timer without
+// taking over the global (wtSetInterval, used by the FNB58 keep-alive).
 const nativeSetTimeout = window.setTimeout.bind(window);
 const nativeClearTimeout = window.clearTimeout.bind(window);
 // Our ids live far above the browser's sequential ones so a clearTimeout can
@@ -182,6 +185,27 @@ function useWorkerTimers() {
     released = true;
     if (--wtDepth === 0) window.setTimeout = nativeSetTimeout;
   };
+}
+
+// A repeating timer the worker holds, for a cadence that has to survive a hidden
+// tab outside any port-owning run — the FNB58 keep-alive, which the device drops
+// the stream over if it stops arriving. It is a self-re-arming chain rather than
+// a worker-side interval so a slow callback can never stack up behind itself.
+// Returns a stop function; where no worker exists it is a plain window interval
+// (throttled, like everything else in that fallback).
+function wtSetInterval(fn, ms) {
+  if (!wtSpawn()) {
+    const h = setInterval(fn, ms);
+    return () => clearInterval(h);
+  }
+  let id = 0;
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    try { fn(); } finally { if (!stopped) id = wtSetTimeout(tick, ms); }
+  };
+  id = wtSetTimeout(tick, ms);
+  return () => { stopped = true; wtClearTimeout(id); };
 }
 
 function fmtCfg(c) {
@@ -745,6 +769,15 @@ $('cfg-apply').addEventListener('click', applyCfg);
 // /100000 → volts/amps). At ~100 samples/s we ring-buffer each reading with its
 // arrival timestamp (up to 5 minutes) and paint a scrolling bar graph across the
 // top of the monitor.
+//
+// The session outlives a hidden tab. Input reports keep arriving unthrottled, but
+// the 1 Hz keep-alive is what holds the stream open and the same 1 Hz tick is the
+// stall watchdog — on window timers a background tab would clamp both to a minute,
+// the meter would stop streaming and the watchdog would then tear the session down.
+// So every FNB58 timer runs on the flasher's worker timers (wtSetInterval, and
+// useWorkerTimers around the sleeping open/recover/drain paths). Only the graph is
+// left to the tab: requestAnimationFrame pauses while hidden, the ring keeps
+// filling from the reports, and the first visible frame draws the history.
 const FNB58_MAX_SEC = 300;                     // keep at most 5 minutes of samples
 const FNB58_CAP = 100 * FNB58_MAX_SEC;         // ring size at the nominal ~100 Hz
 const FNB58_WINDOWS = [10, 30, 60, 180, 300];  // selectable display spans (seconds)
@@ -780,8 +813,8 @@ const FNB_BG_COL  = '#0d1117';   // max → top (matches #fnb58-panel background
 // wpos/len: ring write head + fill. winSel: index into FNB58_WINDOWS when the
 // user has pinned a span, else null (auto: smallest window that holds every
 // sample). shownWin: the span the pills currently reflect, so we only touch the
-// DOM when it changes.
-const fnb = { device: null, refreshTimer: null, raf: 0,
+// DOM when it changes. stopTick: cancels the worker-held keep-alive/watchdog.
+const fnb = { device: null, stopTick: null, raf: 0,
   ma: new Float32Array(FNB58_CAP), ts: new Float64Array(FNB58_CAP),
   wpos: 0, len: 0, winSel: null, shownWin: -1, shownAuto: false,
   // lastData: performance.now() of the newest valid report (0 = none yet). Drives
@@ -1063,8 +1096,8 @@ async function fnbBind(device, allowInit) {
   fnbClear();
   fnbBuildPills();
   device.addEventListener('inputreport', onFnb58Report);
-  clearInterval(fnb.refreshTimer);
-  fnb.refreshTimer = setInterval(fnbTick, 1000);
+  fnb.stopTick?.();
+  fnb.stopTick = wtSetInterval(fnbTick, 1000);   // worker-held: a hidden tab must not throttle the keep-alive
   // Closing our USB handle doesn't stop the meter — it keeps streaming on its own —
   // so a reopened unit is usually already sending data. Re-sending the start
   // sequence to a live meter is exactly what crashes its firmware. Listen briefly
@@ -1105,7 +1138,7 @@ function fnbShowPanel() {
 // close so the OS handle is truly released before anything opens it again — an
 // un-awaited close is exactly what lets the next open() land as a second connect.
 async function fnbUnbind() {
-  clearInterval(fnb.refreshTimer); fnb.refreshTimer = null;
+  fnb.stopTick?.(); fnb.stopTick = null;
   const d = fnb.device;
   fnb.device = null;                            // clear first so fnbTick stops acting on it
   fnb.lastData = 0;
@@ -1151,14 +1184,22 @@ async function fnbAwaitData(ms) {
 // stall recovery passes false to only re-latch an already-running stream. On success
 // reveal the panel; on failure nothing is left open. Returns whether it's now live.
 async function fnbTryDevice(device, tries, allowInit = true) {
-  for (let a = 0; a < tries; a++) {
-    try { await fnbBind(device, allowInit); }
-    catch (_) { await fnbUnbind(); if (a + 1 < tries) await sleep(FNB58_RETRY_MS); continue; }
-    if (await fnbAwaitData(FNB58_DATA_WAIT_MS)) { fnbShowPanel(); return true; }
-    await fnbUnbind();
-    if (a + 1 < tries) await sleep(FNB58_RETRY_MS);
+  // The probe listen, the data wait and the retry pause are all short sleeps; a
+  // recovery that lands while the tab is hidden would have them throttled into
+  // uselessness, so hold the worker timers for the whole attempt.
+  const releaseTimers = useWorkerTimers();
+  try {
+    for (let a = 0; a < tries; a++) {
+      try { await fnbBind(device, allowInit); }
+      catch (_) { await fnbUnbind(); if (a + 1 < tries) await sleep(FNB58_RETRY_MS); continue; }
+      if (await fnbAwaitData(FNB58_DATA_WAIT_MS)) { fnbShowPanel(); return true; }
+      await fnbUnbind();
+      if (a + 1 < tries) await sleep(FNB58_RETRY_MS);
+    }
+    return false;
+  } finally {
+    releaseTimers();
   }
-  return false;
 }
 
 function fnbShowTrouble() {
@@ -1207,6 +1248,7 @@ async function fnbAutoRecover() {
   if (fnb.recovering || fnb.connecting || !fnb.device) return;
   fnb.recovering = true;
   const device = fnb.device;
+  const releaseTimers = useWorkerTimers();         // recovery is all short sleeps; a hidden tab must not stretch them
   try {
     if (monitor) { try { note(monitor, '\x1b[33m-- FNB58 stream stalled; reconnecting… --\x1b[0m'); } catch (_) {} }
     await fnbUnbind();                             // release our handle before touching it again
@@ -1216,6 +1258,7 @@ async function fnbAutoRecover() {
     await fnbForget(device);                       // revoke the grant (teardown can't — we already unbound)
     if (monitor) { try { note(monitor, '\x1b[31m-- FNB58 disconnected (no data) --\x1b[0m'); } catch (_) {} }
   } finally {
+    releaseTimers();
     fnb.recovering = false;
   }
 }
@@ -1229,13 +1272,21 @@ async function fnbAutoRecover() {
 // cooldown backs up the drain.
 async function fnbTeardown() {
   cancelAnimationFrame(fnb.raf); fnb.raf = 0;
-  clearInterval(fnb.refreshTimer); fnb.refreshTimer = null;   // stop the keepalive FIRST
+  fnb.stopTick?.(); fnb.stopTick = null;       // stop the keepalive FIRST
   $('fnb58-panel').hidden = true;
   $('monitor').classList.remove('fnb58-open');
   $('monitor-fnb58').classList.remove('on');
   $('monitor-fnb58').hidden = true;            // hide the button immediately (no 5 s poll lag)
   const dev = fnb.device;
-  if (dev) await sleep(FNB58_DRAIN_MS);        // drain: browser keeps reading the endpoint until we close
+  // The drain is a fixed 1 s of the browser reading the endpoint; a throttled
+  // hidden tab would turn it into a minute of the panel already gone but the
+  // handle still held, so it runs on the worker timers too.
+  const releaseTimers = useWorkerTimers();
+  try {
+    if (dev) await sleep(FNB58_DRAIN_MS);      // drain: browser keeps reading the endpoint until we close
+  } finally {
+    releaseTimers();
+  }
   await fnbUnbind();                           // awaited: the handle is fully released on return
   await fnbForget(dev);                         // revoke the grant so nothing is remembered past this session
   fnbMarkActive();                             // start the settle cooldown from now
@@ -3246,9 +3297,12 @@ async function boot() {
   // always goes through the chooser. A 5 s poll then keeps the shared active
   // stamp fresh while streaming and the label in step with the settle cooldown
   // (hidden until the meter has idled long enough to be safely reopened).
+  // Worker-held like the keep-alive: a throttled poll would let the shared active
+  // stamp go stale while this tab is still streaming, and another tab would read
+  // that as an idle meter and take it.
   if ('hid' in navigator) fnbForgetGranted();
   fnbPollStatus();
-  setInterval(fnbPollStatus, 5000);
+  wtSetInterval(fnbPollStatus, 5000);
 }
 
 boot();

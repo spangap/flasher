@@ -32,6 +32,33 @@ round to a whole number. The meter streams at roughly **100 Hz** (four samples
 per ~40 ms report), but nothing downstream trusts that rate — see timestamps
 below.
 
+## Background tabs: every FNB58 timer lives in the flasher's worker
+
+A hidden tab clamps window timers to one per second, and after five minutes
+hidden to roughly one per minute. Input reports are unaffected — they keep
+arriving — but everything that *drives* the session is a timer: the 1 Hz
+keep-alive that holds the stream open, the stall watchdog riding the same tick,
+and the short sleeps in the open/recover/drain paths. Left on window timers, a
+backgrounded tab stops feeding the meter, the meter stops streaming, and the
+watchdog then tears the session down: switching tabs would drop the graph.
+
+So the FNB58 shares the worker the flasher already uses for un-throttled timers
+(`wtSpawn`, the same one that keeps a flash from crawling in a hidden tab):
+
+- The keep-alive/watchdog tick is `wtSetInterval(fnbTick, 1000)` — a
+  self-re-arming chain of worker timeouts, so a slow tick can't stack behind
+  itself. `fnb.stopTick` cancels it; `fnbUnbind`/`fnbTeardown` call that instead
+  of `clearInterval`.
+- The 5 s `fnbPollStatus` runs on the same helper, so the shared active stamp
+  stays fresh while this tab streams — a throttled poll would let the stamp go
+  stale and another tab would read that as an idle meter and take it.
+- `fnbTryDevice`, `fnbAutoRecover` and the `FNB58_DRAIN_MS` drain hold
+  `useWorkerTimers()` for their duration, so their `sleep()`s keep real time.
+
+Only the graph is left to the tab: `requestAnimationFrame` pauses while hidden,
+the ring keeps filling from the reports, and the first visible frame draws the
+history that accumulated meanwhile.
+
 ## Storage: a timestamped ring, 5 minutes
 
 Readings land in two parallel rings, `fnb.ma` (mA, `Float32`) and `fnb.ts`
