@@ -3,6 +3,24 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Served as .../flashmon rather than .../flashmon/, this document's base is the
+     PARENT directory: the stylesheet, jszip and the module import below would all
+     be fetched one level too high, and a page whose only styling is inline comes
+     up as an empty black screen. Most servers redirect a directory URL onto its
+     trailing slash and spare us this; not all do, so the page pins its own base
+     before anything relative is parsed. A last segment carrying a dot is a
+     filename (…/index.html), whose base is already this directory. -->
+<script>
+  (function () {
+    var p = location.pathname;
+    var last = p.slice(p.lastIndexOf('/') + 1);
+    if (last && last.indexOf('.') < 0) {
+      var b = document.createElement('base');
+      b.href = p + '/';
+      document.head.appendChild(b);
+    }
+  })();
+</script>
 <!-- The module below is fetched with a cache-bust query, this page is not: without
      this, a browser holding an old copy pairs stale markup with a fresh script. -->
 <meta http-equiv="Cache-Control" content="no-cache">
@@ -43,10 +61,13 @@
    * the very edge of the window. */
   #monitor-term{position:absolute;top:.5rem;left:.6rem;right:.6rem;bottom:.8rem}
 
-  /* Top-right action row: [Open Device UI] [Reset]. */
+  /* Top-right action row: [Open Device UI] [Reset]. Identifying the board and
+   * offering a flash are not here — the first is a settings-panel action, the
+   * second is the device window. */
   /* Above the modal overlays (z-index 30): the action buttons stay clickable
    * while a dialog is up, and clicking one also dismisses the dialog. */
-  #monitor-actions{position:absolute;top:.7rem;right:1.6rem;z-index:40;display:flex;gap:.6rem;align-items:center}
+  /* Right edge leaves the gear (fixed, top right) its own space. */
+  #monitor-actions{position:absolute;top:.7rem;right:4.75rem;z-index:40;display:flex;gap:.6rem;align-items:center}
   #monitor-reset{font:inherit;font-weight:700;
        font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;
        color:#fff;background:#ff1f1f;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
@@ -55,13 +76,6 @@
        color:#fff;background:#1f6feb;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
   #open-ui[hidden]{display:none}
   #open-ui:hover{background:#fff;color:#1f6feb;border-color:#1f6feb}
-  /* The green slot: "Detect Hardware" until the board is known, the flash offer
-   * once it is. Same look either way — one action in one place. */
-  #monitor-flash,#monitor-detect{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;
-       letter-spacing:.04em;color:#fff;background:#2ea043;border:2px solid #fff;border-radius:8px;
-       padding:.4rem .85rem;cursor:pointer}
-  #monitor-flash[hidden],#monitor-detect[hidden]{display:none}
-  #monitor-flash:hover,#monitor-detect:hover{background:#fff;color:#2ea043;border-color:#2ea043}
   /* Amber, not green: this is a recovery the session is waiting on, not an
    * action offered on a device that is working. */
   #monitor-repick{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;
@@ -74,14 +88,7 @@
     50.01%,100%{background:#fff;color:#ff1f1f;border-color:#ff1f1f}
   }
 
-  /* Sits clear of the terminal's right-hand scrollbar (~.9rem was under it). */
-  #monitor-baud{position:absolute;bottom:.5rem;right:1.6rem;z-index:21;font:inherit;font-size:.72rem;
-       color:var(--muted);background:transparent;border:0;padding:.1rem .2rem;cursor:pointer}
-  #monitor-baud:hover{color:var(--fg)}
-  /* One line above the baud button, same right edge. Green while streaming. */
-  #monitor-fnb58{position:absolute;bottom:2.5rem;right:1.6rem;z-index:21;font:inherit;font-size:.72rem;
-       color:var(--muted);background:transparent;border:0;padding:.1rem .2rem;cursor:pointer}
-  #monitor-fnb58:hover{color:var(--fg)}
+  /* Green while the meter is streaming. Lives in the settings panel. */
   #monitor-fnb58.on{color:var(--accent);font-weight:700}
 
   /* Live current graph, pinned across the top; the monitor's terminal and action
@@ -121,17 +128,57 @@
   #fnb58-times span{font:.6rem ui-monospace,SFMono-Regular,monospace;color:var(--muted)}
   #monitor.fnb58-open #monitor-term{top:158px}
   #monitor.fnb58-open #monitor-actions{top:calc(150px + .7rem)}
+  body.fnb58-open #gear{top:calc(150px + .7rem)}
+  body.fnb58-open #settings-box{top:calc(150px + 3.3rem)}
 
-  /* Invisible catch-all: a click anywhere off the settings box dismisses it. */
-  #cfg-overlay{position:fixed;inset:0;z-index:22;background:transparent}
-  #cfg-overlay[hidden]{display:none}
-  #serial-cfg{position:absolute;bottom:2.1rem;right:.9rem;z-index:23;background:var(--panel);
-       border:1px solid var(--line);border-radius:8px;padding:.7rem .8rem;
-       display:grid;grid-template-columns:auto auto;gap:.5rem .6rem;align-items:center;font-size:.8rem}
-  #serial-cfg[hidden]{display:none}
-  #serial-cfg label{color:var(--muted)}
-  #serial-cfg select{font:inherit;color:var(--fg);background:#0d1117;border:1px solid var(--line);
+  /* The gear, and the panel it opens. Fixed to the window, not the monitor: the
+   * settings apply before a port is picked as much as during a session, so both
+   * are on screen from the first paint. Above the monitor's own action row so it
+   * stays reachable while a session runs. A button like the ones beside it —
+   * same white-on-black frame, sized so the glyph reads as an equal action
+   * rather than a decoration in the corner.
+   *
+   * The height is the action buttons' own box written out: .8rem text at the
+   * inherited 1.5 line-height (19.2px) + .4rem padding top and bottom (12.8px)
+   * + the 2px border twice = 36px = 2.25rem. The glyph is far bigger than their
+   * text, so it is centred in that box rather than padded into it. */
+  #gear{position:fixed;top:.7rem;right:.6rem;z-index:41;height:2.25rem;
+       display:flex;align-items:center;justify-content:center;
+       font-size:2rem;line-height:1;color:#fff;background:#000;
+       border:2px solid #fff;border-radius:8px;padding:0 .65rem;cursor:pointer}
+  #gear:hover{background:#fff;color:#000}
+  /* Invisible catch-all: a click anywhere off the panel dismisses it. */
+  #settings-overlay{position:fixed;inset:0;z-index:42;background:transparent}
+  #settings-overlay[hidden]{display:none}
+  #settings-box{position:fixed;top:3.3rem;right:.6rem;z-index:43;background:var(--panel);
+       border:1px solid var(--line);border-radius:8px;padding:.7rem .8rem;width:16.5rem;
+       display:flex;flex-direction:column;gap:.55rem;font-size:.8rem}
+  #settings-box[hidden]{display:none}
+  #settings-box hr{border:0;border-top:1px solid var(--line);margin:.1rem 0}
+  #settings-box .row{display:flex;align-items:center;gap:.45rem}
+  #settings-box .row label{color:var(--fg)}
+  #settings-box .hint{color:var(--muted);font-size:.72rem;line-height:1.35}
+  #settings-box button{font:inherit;color:var(--fg);background:#0d1117;border:1px solid var(--line);
+       border-radius:6px;padding:.3rem .5rem;cursor:pointer}
+  #settings-box button:hover{border-color:var(--muted)}
+  #settings-box button:disabled{color:var(--muted);border-color:var(--line);cursor:default}
+  #settings-box button:disabled:hover{border-color:var(--line)}
+  #set-defaults{font-weight:600;color:#fff;background:var(--accent);border-color:var(--accent)}
+  #settings-saved{color:var(--muted);font-size:.72rem;min-height:1.1em}
+  #cfg-serial{display:grid;grid-template-columns:auto auto;gap:.4rem .6rem;align-items:center}
+  #cfg-serial[hidden]{display:none}
+  #cfg-serial label{color:var(--muted)}
+  #cfg-serial select{font:inherit;color:var(--fg);background:#0d1117;border:1px solid var(--line);
        border-radius:5px;padding:.2rem .3rem}
+  #cfg-current{grid-column:1 / -1;color:var(--muted);font-size:.72rem}
+  /* Which catalogue the page offers images from. A select over the same row
+   * shape as the line settings, plus the field "- other -" reveals. */
+  #set-build-row{display:grid;grid-template-columns:auto 1fr;gap:.4rem .6rem;align-items:center}
+  #set-build-row label{color:var(--muted)}
+  #settings-box select,#set-build-other{font:inherit;color:var(--fg);background:#0d1117;
+       border:1px solid var(--line);border-radius:5px;padding:.2rem .3rem;min-width:0}
+  #set-build-other{grid-column:1 / -1}
+  #set-build-other[hidden]{display:none}
   #cfg-apply{grid-column:1 / -1;font:inherit;font-weight:600;color:#fff;background:var(--accent);
        border:0;border-radius:6px;padding:.35rem;cursor:pointer;margin-top:.2rem}
 
@@ -177,6 +224,14 @@
   #device-facts dt{color:var(--muted)}
   #device-facts dd{margin:0}
   #device-facts .lines{white-space:pre-wrap;font:12px/1.5 ui-monospace,SFMono-Regular,monospace}
+  /* Why an offer in the device window is not an upgrade — shown only when it
+   * isn't one, right above the button that would go ahead anyway. */
+  #flash-warn{margin:1rem 0 0;padding:.55rem .7rem;font-size:.85rem;line-height:1.5;
+       color:var(--fg);background:rgba(184,134,11,.15);border:1px solid #b8860b;border-radius:6px}
+  #flash-warn[hidden]{display:none}
+  /* Amber "Flash anyway", green "Flash": the button says which of the two this
+   * offer is before it is read. */
+  .modal .btn-warn{color:#fff;background:#b8860b}
   /* Suggest sits INSIDE the password field, small, flush right. */
   .pw-row{position:relative}
   .pw-row input{padding-right:4.6rem}
@@ -196,24 +251,30 @@
     <div id="log" hidden></div>
   </div>
 
-  <div id="monitor" hidden>
-    <div id="monitor-term"></div>
-    <div id="monitor-actions">
-      <button id="monitor-detect" type="button" hidden>Detect Hardware</button>
-      <button id="monitor-flash" type="button" hidden>Flash</button>
-      <button id="open-ui" type="button" hidden>Open Device UI</button>
-      <!-- The way back when a port never returns. Deliberately a button and not
-           a dialog: ports go away constantly (every reset, every reflash) and
-           almost always come back on their own, so a modal on every departure
-           would be wrong far more often than right. This appears only after the
-           session has been detached a long while, and waits to be clicked. -->
-      <button id="monitor-repick" type="button" hidden>Re-select port</button>
-      <button id="monitor-reset" type="button">Reset</button>
-    </div>
-    <button id="monitor-fnb58" type="button">FNB58</button>
-    <button id="monitor-baud" type="button">115200 N 8 1</button>
-    <div id="cfg-overlay" hidden></div>
-    <div id="serial-cfg" hidden>
+  <!-- Settings, on screen from the first paint: what they change (the console's
+       rate, which catalogue images come from, whether picking a port resets the
+       board, whether a new build flashes itself) matters before a port is
+       picked as much as during a session. -->
+  <button id="gear" type="button" title="Settings">⚙</button>
+  <div id="settings-overlay" hidden></div>
+  <div id="settings-box" hidden>
+    <!-- The way back when a port comes back as a DIFFERENT port object — the one
+         case the rescan cannot solve on its own. Always here, never announced:
+         ports go away constantly (every reset, every reflash) and almost always
+         return by themselves, so a prompt would be wrong far more often than
+         right. -->
+    <button id="monitor-repick" type="button">Re-select port</button>
+    <!-- The full reset / probe / RAM-detector run. It lives here rather than
+         over the monitor because a running device answers the same question for
+         free — the firmware confirms its board at every boot — so the run is for
+         the cases that have no answer: a device that won't boot, one carrying an
+         image too old to be asked, or a chip with no firmware at all. -->
+    <button id="monitor-detect" type="button">Detect hardware</button>
+    <div class="hint">Reset the device and read the board off the chip. Only
+      needed when it can’t say for itself.</div>
+    <button id="monitor-fnb58" type="button">FNB58 power meter</button>
+    <hr>
+    <div id="cfg-serial">
       <label for="cfg-baud">Baud</label>
       <select id="cfg-baud">
         <option>300</option><option>1200</option><option>2400</option><option>4800</option>
@@ -229,7 +290,44 @@
       </select>
       <label for="cfg-stop">Stop</label>
       <select id="cfg-stop"><option selected>1</option><option>2</option></select>
+      <div id="cfg-current"></div>
       <button id="cfg-apply" type="button">Apply</button>
+    </div>
+    <hr>
+    <!-- Which catalogue the images come from. Options are the directories
+         builds/index.html lists, plus whatever the attached device says it was
+         flashed from, plus "- other -" for a catalogue that is served but
+         unlisted. -->
+    <div id="set-build-row">
+      <label for="set-build">Build</label>
+      <select id="set-build"></select>
+      <input id="set-build-other" type="text" placeholder="catalogue name" hidden>
+    </div>
+    <div class="hint">Which catalogue images are offered from. Follows the
+      attached device’s own build until you pick one here.</div>
+    <hr>
+    <div class="row">
+      <input id="set-noreset" type="checkbox">
+      <label for="set-noreset">No reset</label>
+    </div>
+    <div class="hint">Never reset the device. It is still asked which board it
+      is, which costs it nothing; only the fallback probe is skipped.</div>
+    <div class="row">
+      <input id="set-autoflash" type="checkbox">
+      <label for="set-autoflash">Auto-flash</label>
+    </div>
+    <div class="hint">Flash a newer build for the attached board as soon as one is
+      published, without waiting to be asked.</div>
+    <hr>
+    <button id="set-defaults" type="button">Set as defaults</button>
+    <div id="settings-saved"></div>
+  </div>
+
+  <div id="monitor" hidden>
+    <div id="monitor-term"></div>
+    <div id="monitor-actions">
+      <button id="open-ui" type="button" hidden>Open Device UI</button>
+      <button id="monitor-reset" type="button">Reset</button>
     </div>
 
     <!-- Live current graph (WebHID); hidden until an FNB58 is connected. -->
@@ -324,16 +422,23 @@
       </div>
     </div>
 
-    <!-- What a detection run found: the board, its photo, and every fact read
-         off the chip. Purely informational — the flash offer is made behind it. -->
+    <!-- The device window: what was read off the board, and what the catalogue
+         has for it — one question asked twice, so one window. It opens when a
+         detection run ends, and by itself when an image is on offer with
+         nothing on screen (a build published while the page is open, or a board
+         the boot log named without a run). The flash is started from here and
+         nowhere else. An image that is not newer is still offered; the warning
+         and the button then say so. -->
     <div id="device-overlay" class="modal-overlay" hidden>
       <div class="modal">
         <h2 id="device-title"></h2>
         <p class="sub" id="device-sub"></p>
         <img id="device-photo" alt="" hidden>
         <dl id="device-facts"></dl>
+        <p id="flash-warn" hidden></p>
         <div class="row">
           <button id="device-ok" class="btn-primary" type="button">OK</button>
+          <button id="flash-go" class="btn-primary" type="button" hidden>Flash</button>
         </div>
       </div>
     </div>

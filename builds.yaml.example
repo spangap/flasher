@@ -1,0 +1,51 @@
+# Copy this to <workspace>/builds/<catalogue>/builds.yaml and make it yours.
+# `spangap make-builds`, run in that directory, builds every entry here and
+# writes index.html + timestamp beside them; the flasher page serves the
+# directory as `../builds/<catalogue>/` and reads both.
+#
+# `stable` is the catalogue the page starts on; an attached device's own
+# `build: catalogue` line, `?build=<catalogue>` and the settings panel's Build
+# selector each move it. A catalogue directory holding a file named `.unlisted`
+# still builds and is still reachable by name — it is only left out of the tree's
+# own index.html, and so out of the selector's list.
+#
+# flashmon is a generic installer; this file is the ONLY thing that brands it and
+# lists its images, so each deployment ships its own.
+#
+#   project:  the brand shown throughout the UI. Every place the tool would say
+#             its own name ("<project> Flasher", the flash button, the default
+#             device hostname) uses this, so your deployment reads as its own
+#             product rather than "flashmon". It also slugs the image names.
+#   url:      where THIS deployment is served.
+#   builds:   the catalogue of ready-to-flash images. Each entry is:
+#               name        the image name, and its distribution identity — the
+#                           device reports it back as sys.build.dist, so a
+#                           re-flash offer can mean "same dist, newer stamp".
+#                           Free-format: a board may have several entries that
+#                           differ in what is left out to fit its flash. Name it
+#                           after the hw-<straddle> the detector reports so the
+#                           browser can match a detected board to its image;
+#                           `generic` is the fallback for any board without a
+#                           dedicated image.
+#               invocation  the `spangap build` arguments that produce it.
+#               image       optional. A photo of the board, shown in the device
+#                           box when a detection run identifies it: a path in the
+#                           web root (devices/<board>.jpg by convention — see
+#                           devices/README.md), never a remote URL. Left out, or
+#                           pointing at a file that isn't there, the box is
+#                           simply text-only.
+#
+# Nothing writes this file. What was built, and when, lives in the index.html
+# `spangap make-builds` leaves next to the images.
+#
+# Order matters: each build rewrites the workspace's remembered target
+# (.spangap-build), so the LAST entry is what a later bare `spangap build`
+# resolves to.
+project: MyProject
+url: https://myproject.example/flashmon/
+builds:
+  - name: hw-lilygo-tdeck
+    image: devices/hw-lilygo-tdeck.jpg
+    invocation: myorg/myproject --with spangap/hw-lilygo-tdeck
+  - name: generic
+    invocation: myorg/myproject

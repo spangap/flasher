@@ -4,7 +4,7 @@ The pictures the **device box** shows when a detection run identifies a board.
 Nothing here is required: a board with no photo just gets a text-only box.
 
 Drop an image in beside this file and point the board's catalogue entry at it in
-`flashmon.yaml`:
+the catalogue's `builds.yaml`:
 
 ```yaml
 builds:

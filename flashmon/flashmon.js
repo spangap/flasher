@@ -1,22 +1,40 @@
 // flashmon — browser firmware flasher / serial monitor.
 //
 // Connecting only opens the port: the device is not touched, not reset, and the
-// monitor shows whatever it is already doing. Identifying the board is a
-// separate, deliberate act — the green "Detect Hardware" button, which probes
-// the chip and RAM-loads the peripheral detector (no flash write) and folds its
-// findings into the monitor banner. A board also identifies itself for free when
-// the running firmware logs its `build: invocation` line, which names the
-// hw-<straddle> it was compiled for.
+// monitor shows whatever it is already doing. It is then ASKED which board it
+// is — `show sys.hw`, one frame on the already-open port. spangap confirms the
+// board its image was built for against the hardware at every boot and halts on
+// a mismatch, so a device that answers has already settled the question and
+// nothing needs resetting.
 //
-// Once the board is known and the catalogue (flashmon.yaml → builds/<name>.zip,
-// or the generic fallback) holds a newer image for it, that same green slot
-// becomes "Flash <project> to <device>"; pressing it unzips that image in the
-// browser and flashes every segment at its offset over Web Serial (vendored
-// esptool-js), then drops back into the monitor and resets the device so its
-// boot log streams live.
+// Only a device with no answer — no firmware, an image too old to carry the key,
+// a generic image, or one that does not speak frames — is worth a probe: reset
+// the chip, RAM-load the peripheral detector (no flash write), and read the
+// board off the buses. That run is "Detect hardware" in the settings panel, and
+// it is also what a connect falls back to unless "No reset" says to leave the
+// device alone.
 //
-// The catalogue and the UI brand come from flashmon.yaml (or a gitignored
-// flashmon.local.yaml, preferred when present), fetched at boot.
+// Once the board is known and the catalogue holds an image for it, the offer
+// appears in that same device window, under the facts it follows from: "Flash"
+// for an image newer than what runs, "Flash anyway" — behind a warning — for one
+// that is the same build or older, which is a re-flash you may still want. Going
+// ahead unzips that image in the browser and flashes every segment at its offset
+// over Web Serial (vendored esptool-js), then drops back into the monitor and
+// resets the device so its boot log streams live. With auto-flash on, a newer
+// image doesn't wait to be asked about.
+//
+// The catalogues are directories beside this page — ../builds/<catalogue>/ —
+// and ../builds/index.html lists them. Which one is in force starts at `stable`,
+// is overridden by `?build=`, follows the attached device's own
+// `build: catalogue` line, and is finally the user's to pick in the settings
+// panel. Three files in a catalogue drive everything:
+//
+//   builds.yaml   the brand and the entries (each `name` matched against the
+//                 detected hw-<board>)
+//   index.html    the images that exist, as <slug>_<name>_<stamp>.zip links;
+//                 the newest stamp for a board is the offer
+//   timestamp     the newest stamp in the directory, polled so a build
+//                 published while the page is open is noticed
 //
 // No CDN, no build step — these files can be served from anywhere static.
 
@@ -42,22 +60,54 @@ const barfill = $('barfill');
 
 const params = new URLSearchParams(location.search);
 
-// Filled from flashmon.yaml at boot. `project` brands the UI; `builds` is the
-// catalogue of entries (each a `name` matched against the detected hw-<board>,
-// plus the `version` — a build datetime — `make` stamped its image with). `slug`
-// is the project name reduced for filenames.
+// The tree of catalogues, beside the page in the deployment and under `spangap
+// dev` alike, so one relative path reaches it in both. Its own index.html lists
+// the catalogues that are meant to be found; one that is served but unlisted is
+// still reachable by naming it.
+const BUILDS_BASE = '../builds/';
+const cleanCatalogue = (s) => (s || '').replace(/[^A-Za-z0-9._-]/g, '');
+
+// The catalogue images are offered from — `stable` unless something says
+// otherwise. `?build=<name>` names one for this load, the settings panel's
+// Build selector changes it live, and an attached device that reports which
+// catalogue it was flashed from moves it there on its own (see setCatalogue).
+let CATALOGUE = cleanCatalogue(params.get('build')) || 'stable';
+let CAT_BASE = `${BUILDS_BASE}${CATALOGUE}/`;
+// True once something other than the default has claimed the choice — a
+// `?build=`, or the user picking one. A device's own catalogue is adopted only
+// while nothing has.
+let cataloguePinned = !!cleanCatalogue(params.get('build'));
+
+// Filled from builds.yaml at boot. `project` brands the UI; `builds` is the
+// catalogue of entries (each a `name` matched against the detected hw-<board>).
+// `slug` is the project name reduced for filenames.
 let PROJECT = 'flashmon';
 let BUILDS = [];
 let BUILD_NAMES = [];
 let SLUG = 'flashmon';
+// Build name -> the newest stamp published for it, read out of the catalogue's
+// index.html. The listing is the record of what exists: the config says what the
+// catalogue is meant to hold, this says what it actually holds right now.
+let VERSIONS = {};
+// The stamp file's last value. A change is the signal to re-read the listing;
+// nothing else about it matters.
+let LAST_STAMP = null;
 // Default device hostname (a DNS/mDNS label): the project name, lowercased and
 // reduced to the legal charset. Set once the config loads.
 let HOSTNAME_DEFAULT = 'flashmon';
-// The image resolved for the connected board, if any: { url, label, name }.
-// Set when the flash button is shown; read by its click handler.
+// The image resolved for the connected board, if any:
+// { url, label, name, stamp, newer }. `newer` is false when the catalogue's
+// image is the one already running, or older than it — still offered, behind a
+// warning. Set whenever the offer resolves; read by the offer dialog.
 let pendingFlash = null;
+// The image URL the offer dialog has already been opened for. The URL carries
+// the stamp, so a build that lands while the page is open opens it again while
+// a re-render of the same offer doesn't. Set when the dialog opens and when a
+// flash starts, so flashing an image is not followed by an offer to flash it.
+let offerShownFor = null;
 // True while a detection run owns the port (monitor torn down, ROM loader busy):
-// keeps the Detect Hardware button off the screen and the run non-reentrant.
+// disables the settings panel's Detect hardware button and keeps the run
+// non-reentrant.
 let detecting = false;
 // The user-state partition a detection run read off the attached chip —
 // { addr, size } — or null while the chip has not been probed (or has no store
@@ -69,20 +119,58 @@ let statePart = null;
 // none is up.
 let stateWarnClose = null;
 
-// Default line settings. The device console runs at 115200/N/8/1 (ESP-IDF
-// default); ?monitor_baud= overrides the baud for firmware that logs elsewhere.
+// ── settings ────────────────────────────────────────────────────────────────
+// What the gear panel holds. Live for this tab as soon as they're changed; the
+// panel's "Set as defaults" is what writes them here, so a session can try
+// something without committing to it.
+const SETTINGS_KEY = 'flashmon.settings';
+const SETTINGS_DEFAULTS = {
+  baudRate: 115200,     // the device console's rate (ESP-IDF default)
+  noReset: false,       // open the monitor without resetting or identifying
+  autoFlash: false,     // flash a newer image as soon as one is on offer
+};
+
+function loadSettings() {
+  let stored = {};
+  try {
+    stored = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+  } catch (_) { /* nothing stored, or not ours */ }
+  const s = { ...SETTINGS_DEFAULTS };
+  for (const k of Object.keys(SETTINGS_DEFAULTS)) {
+    if (typeof stored[k] === typeof SETTINGS_DEFAULTS[k]) s[k] = stored[k];
+  }
+  // A baud in the URL is for firmware that logs somewhere other than the
+  // console default, and outranks the stored one for this load only.
+  const urlBaud = parseInt(params.get('monitor_baud'), 10);
+  if (urlBaud) s.baudRate = urlBaud;
+  return s;
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(SETTINGS));
+    return true;
+  } catch (_) {
+    return false;    // private mode, or storage full — the session keeps them
+  }
+}
+
+const SETTINGS = loadSettings();
+
+// Default line settings. Only the rate is configurable from the panel; the rest
+// of the frame is the console's and is changed from the same panel's selects.
 const DEFAULT_CFG = {
-  baudRate: parseInt(params.get('monitor_baud'), 10) || 115200,
+  baudRate: SETTINGS.baudRate,
   dataBits: 8,
   stopBits: 1,
   parity: 'none',
 };
 
-// Picking a port resets the device and identifies the board straight away. A
-// `?noreset` in the query string keeps the old hands-off behaviour: the monitor
+// Picking a port resets the device and identifies the board straight away.
+// "No reset" in the settings panel is the hands-off alternative: the monitor
 // opens on a device that is left running, and identifying it waits for the
-// Detect Hardware button.
-const AUTO_DETECT = !params.has('noreset');
+// panel's Detect hardware button.
+const autoDetect = () => !SETTINGS.noReset;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -381,12 +469,30 @@ async function captureDetection(port) {
     try { reader.releaseLock(); } catch (_) { /* */ }
     try { await port.close(); } catch (_) { /* */ }
   }
-  // Whitelist: the detector prefixes every intentional line with "DETECT: ".
-  // Keep only those, strip the prefix, and drop the end sentinel.
-  return buf.split(/\r?\n/).map((l) => l.trim())
-    .filter((l) => l.startsWith('DETECT:'))
-    .map((l) => l.slice('DETECT:'.length).replace(/^ /, ''))
-    .filter((l) => l !== 'SPANGAP-DETECT-END');
+  // Two whitelists, because the detector says two different kinds of thing.
+  //
+  //   "DETECT: …"          its results — the board it settled on and the state
+  //                        store — printed deliberately for this parser.
+  //   "I (123) detect: …"  the probe trace, which is ordinary ESP-IDF logging
+  //                        under the `detect` tag: every board's detect_hw()
+  //                        saying what it read and why it did or didn't match.
+  //                        The same lines the firmware logs on a real boot.
+  //
+  // Everything else on the wire (IDF's own boot chatter) is dropped. ANSI is
+  // stripped first: the log lines are coloured by level.
+  const TRACE = /^[VDIWE] \(\d+\) detect: (.*)$/;
+  const out = [];
+  for (let l of buf.split(/\r?\n/)) {
+    l = l.replace(/\x1b\[[0-9;]*m/g, '').trim();
+    if (l.startsWith('DETECT:')) {
+      const rest = l.slice('DETECT:'.length).replace(/^ /, '');
+      if (rest !== 'SPANGAP-DETECT-END') out.push(rest);
+      continue;
+    }
+    const t = TRACE.exec(l);
+    if (t) out.push(t[1]);
+  }
+  return out;
 }
 
 // ── serial monitor ────────────────────────────────────────────────────────
@@ -581,13 +687,14 @@ function makeSession(port, term, resizeObserver, muted) {
            needPasswd: false, passwdResolved: false, newPasswd: null, passwdOpen: false,
            wifiNeeded: false, wifiResolved: false, wifiCfg: null, wifiOpen: false,
            connectedSeen: false, setupSent: false, hostnameQueried: false,
-           // Flash offer: the identified board and the running firmware's build
-           // stamp (from its boot log), which gate whether a newer image is offered.
+           // Flash offer: the identified board, the catalogue the running image
+           // was published from, and its build stamp — all three off the boot log.
            // hwDetected records that the board came from a detection run (which
            // reads the hardware), so the boot log's weaker claim can't overwrite it.
            // versionSettled goes true once the stamp arrives or the grace expires,
-           // so an up-to-date device never flashes the button on the way there.
-           hw: null, hwDetected: false, deviceVersion: null, versionSettled: false, versionTimer: null,
+           // so an up-to-date device is never offered a flash on the way there.
+           hw: null, hwDetected: false, deviceCatalogue: null,
+           deviceVersion: null, versionSettled: false, versionTimer: null,
            rxSeq: 0, rngArmed: false, rngJustArmed: false, rngTimer: null, rngRecovering: false,
            // The framed side-channel (see the RPC section below). Per session,
            // because it is a property of the port: a handover to a new port
@@ -601,13 +708,17 @@ function makeSession(port, term, resizeObserver, muted) {
 // words of the outgoing port are not lost. Never the target of typed input.
 let priorSession = null;
 
+// Espressif's USB vendor ID. A port carrying it is the chip's own USB, not a
+// bridge chip on the board, which is what makes the line rate irrelevant there.
+const ESPRESSIF_VID = 0x303A;
+
 // The composite device the firmware presents while running two CDC ports.
-// Espressif's shared VID; the PID is TinyUSB's class-derived one, 0x4000 with
-// the CDC count in the low bits.
-const CDC_FILTER = { usbVendorId: 0x303A, usbProductId: 0x4002 };
+// The PID is TinyUSB's class-derived one, 0x4000 with the CDC count in the low
+// bits.
+const CDC_FILTER = { usbVendorId: ESPRESSIF_VID, usbProductId: 0x4002 };
 
 // The USB-Serial-JTAG controller, the device's other console transport.
-const JTAG_ID = { usbVendorId: 0x303A, usbProductId: 0x1001 };
+const JTAG_ID = { usbVendorId: ESPRESSIF_VID, usbProductId: 0x1001 };
 
 // Name the transport a port belongs to. During a console move two devices are
 // in play and "Serial port gone" leaves the reader guessing which one it means.
@@ -680,8 +791,9 @@ async function openMonitor(port, doReset, banner) {
   // Drop incoming bytes until the first reset (below); a plain terminal with no
   // reset shows everything from the start.
   monitor = makeSession(port, term, resizeObserver, doReset);
-  $('monitor-baud').textContent = fmtCfg(monitor.cfg);
-  $('monitor-repick').hidden = true;   // a fresh session has a working port
+  syncDetectButton();      // there is a port to run one on now
+  showCfg(monitor.cfg);
+  updateBaudVisibility(port);
   setMonTitle(null);   // new session: no hostname until the device logs one
 
   // Forward keystrokes to the current writer. The device's serial line stays in
@@ -708,21 +820,36 @@ async function openMonitor(port, doReset, banner) {
   }
 }
 
-// Re-open the port with new line settings, keeping the same terminal + buffer.
-async function applyCfg() {
-  if (!monitor) return;
-  const cfg = {
+// Show the live line settings on the panel's own readout.
+function showCfg(cfg) {
+  const el = $('cfg-current');
+  if (el) el.textContent = fmtCfg(cfg);
+}
+
+// The line settings the panel's selects currently describe.
+function cfgFromControls() {
+  return {
     baudRate: parseInt($('cfg-baud').value, 10) || 115200,
     dataBits: parseInt($('cfg-data').value, 10) || 8,
     stopBits: parseInt($('cfg-stop').value, 10) || 1,
     parity: $('cfg-parity').value || 'none',
   };
-  closeCfg();
+}
+
+// Re-open the port with new line settings, keeping the same terminal + buffer.
+async function applyCfg() {
+  const cfg = cfgFromControls();
+  // Both, because they answer different questions: SETTINGS is what "Set as
+  // defaults" would write, DEFAULT_CFG is what the next session (or a detection
+  // run, which opens the port itself) starts at.
+  SETTINGS.baudRate = cfg.baudRate;
+  DEFAULT_CFG.baudRate = cfg.baudRate;
+  showCfg(cfg);
+  if (!monitor) return;             // no session yet: it will open at this rate
   monitor.cfg = cfg;
   try {
     await detachStreams(monitor);
     await attachStreams(monitor);
-    $('monitor-baud').textContent = fmtCfg(cfg);
     monitor.term.writeln(`\r\n\x1b[36m── serial ${fmtCfg(cfg)} ──\x1b[0m`);
   } catch (e) {
     monitor.term.writeln(`\r\n\x1b[31m── reconfigure failed: ${e && e.message ? e.message : e} ──\x1b[0m`);
@@ -752,14 +879,48 @@ $('monitor-reset').addEventListener('click', async () => {
   term.focus();            // so the next Enter goes to the device, not this button
 });
 
-function openCfg() { $('serial-cfg').hidden = false; $('cfg-overlay').hidden = false; }
-function closeCfg() { $('serial-cfg').hidden = true; $('cfg-overlay').hidden = true; }
+// ── settings panel ──────────────────────────────────────────────────────────
+// The gear, top right, on screen from the first paint: everything here is worth
+// changing before a port is picked (a device that logs at a different rate, a
+// session that must not reset the board) as well as during a session.
+function openSettings() { $('settings-box').hidden = false; $('settings-overlay').hidden = false; }
+function closeSettings() { $('settings-box').hidden = true; $('settings-overlay').hidden = true; }
 
-$('monitor-baud').addEventListener('click', () => {
-  if ($('serial-cfg').hidden) openCfg(); else closeCfg();
+on('gear', 'click', () => {
+  if ($('settings-box').hidden) openSettings(); else closeSettings();
 });
-$('cfg-overlay').addEventListener('click', closeCfg);
-$('cfg-apply').addEventListener('click', applyCfg);
+on('settings-overlay', 'click', closeSettings);
+on('cfg-apply', 'click', applyCfg);
+on('set-noreset', 'change', (e) => { SETTINGS.noReset = e.target.checked; });
+on('set-autoflash', 'change', (e) => {
+  SETTINGS.autoFlash = e.target.checked;
+  // Turning it on with an offer already up should act on that offer, not wait
+  // for the next one to resolve.
+  if (SETTINGS.autoFlash) maybeAutoFlash();
+});
+on('set-defaults', 'click', () => {
+  SETTINGS.baudRate = cfgFromControls().baudRate;
+  const msg = $('settings-saved');
+  if (msg) {
+    msg.textContent = saveSettings()
+      ? 'Saved — these are the settings this page will load with.'
+      : 'Could not save: this browser is not storing anything for this page.';
+  }
+});
+
+// The baud selector is meaningless on a native USB device: the ESP32-S3's own
+// USB (both the Serial/JTAG peripheral and a CDC console) carries the console
+// over USB packets, where the line rate is a number nobody reads. Hide it rather
+// than offer a control that does nothing.
+function isNativeUsb(port) {
+  const i = port && port.getInfo ? port.getInfo() : {};
+  return i.usbVendorId === ESPRESSIF_VID;
+}
+
+function updateBaudVisibility(port) {
+  const row = $('cfg-serial');
+  if (row) row.hidden = isNativeUsb(port);
+}
 
 // ── FNB58 USB power meter (WebHID) ──────────────────────────────────────────
 // A FNIRSI FNB58/FNB48 is a USB-HID device (not a serial port), so it rides
@@ -1128,7 +1289,10 @@ function fnbTick() {
 function fnbShowPanel() {
   fnbMarkActive();
   $('fnb58-panel').hidden = false;
-  $('monitor').classList.add('fnb58-open');     // slide the terminal + actions clear
+  // Slide the terminal + actions clear of the graph; the gear is fixed to the
+  // window rather than the monitor, so it takes the class from the body.
+  $('monitor').classList.add('fnb58-open');
+  document.body.classList.add('fnb58-open');
   $('monitor-fnb58').classList.add('on');
   cancelAnimationFrame(fnb.raf);
   fnbLoop();
@@ -1275,6 +1439,7 @@ async function fnbTeardown() {
   fnb.stopTick?.(); fnb.stopTick = null;       // stop the keepalive FIRST
   $('fnb58-panel').hidden = true;
   $('monitor').classList.remove('fnb58-open');
+  document.body.classList.remove('fnb58-open');
   $('monitor-fnb58').classList.remove('on');
   $('monitor-fnb58').hidden = true;            // hide the button immediately (no 5 s poll lag)
   const dev = fnb.device;
@@ -1620,20 +1785,43 @@ async function onRngStuck(m) {
 }
 
 function handleNetLine(m, line) {
+  // `build: hw <hw-board>` — the device saying which board it is. Not a claim
+  // about the image: it is what the board straddle's own detect_hw() read off
+  // the hardware at the top of this boot, checked against the board the image
+  // was built for (spangap halts when those disagree). So it is exactly what a
+  // detection run would find, arriving for free, and it is marked as such.
+  //
+  // Printed at boot AND whenever a console attaches, which is what makes this
+  // the whole of identification: opening the port sends a CR, the device answers
+  // with this, and there is nothing to ask.
+  let mm = line.match(/\bbuild: hw (hw-[a-z0-9-]+)/);
+  if (mm) {
+    if (m === monitor && m.hw !== mm[1]) armFlashGrace(mm[1], true);
+    return;
+  }
   // `build: invocation spangap build <buildable> --with spangap/hw-<board> …` —
-  // the `spangap build` command that produced the running image, logged on boot.
-  // The hw-<straddle> in it names the board the firmware was compiled for, which
-  // identifies the device just as a detection run does — for free, without
-  // resetting anything. It is a claim about the image, not a reading of the
-  // hardware, so a real detection run (hwDetected) outranks it.
-  let mm = line.match(/build: invocation\b.*?\b(hw-[a-z0-9-]+)/);
+  // the `spangap build` command that produced the running image. Firmware too
+  // old to print `build: hw` still names its board here, so this is the fallback
+  // — and a weaker one: it says what the image was COMPILED for, not what the
+  // hardware is, so a real detection run (hwDetected) outranks it.
+  mm = line.match(/build: invocation\b.*?\b(hw-[a-z0-9-]+)/);
   if (mm) {
     if (m === monitor && !m.hwDetected) armFlashGrace(mm[1], false);
     return;
   }
+  // `build: catalogue <name>` — which catalogue the running image was published
+  // from (spangap-core logs it on boot; absent on an image that didn't come from
+  // a catalogue run). The device's own answer to "which build is this", so the
+  // page follows it: a board flashed from `dev` is compared against `dev`.
+  mm = line.match(/build: catalogue (\S+)/);
+  if (mm) {
+    m.deviceCatalogue = mm[1];
+    if (m === monitor) adoptDeviceCatalogue(mm[1]);
+    return;
+  }
   // `build: datetime <YYYYMMDDhhmmss>` — the running firmware's catalogue build
   // stamp (spangap-core logs it on boot). Remember it and re-evaluate the flash
-  // offer: we only offer an image the catalogue stamps NEWER than what's running.
+  // offer: it decides whether the offer reads as an upgrade or as a re-flash.
   mm = line.match(/build: datetime (\d{14})/);
   if (mm) {
     m.deviceVersion = mm[1];
@@ -2038,11 +2226,12 @@ function hideOpenUi() {
   closeUiChoice();
 }
 
-// Force-dismiss every modal dialog. The floating action buttons (Flash / Open
-// Device UI / Reset) sit above the overlay and call this, so one click both
-// fires the action AND clears whatever dialog was up — no separate dismiss
-// click. Setup-input dialogs (password / wifi), if open, are marked settled so
-// the setup coordinator neither re-opens them nor stalls waiting on them.
+// Force-dismiss every modal dialog. The floating action buttons (Detect
+// Hardware / Open Device UI / Reset) sit above the overlay and call this, so one
+// click both fires the action AND clears whatever dialog was up — no separate
+// dismiss click. Setup-input dialogs (password / wifi), if open, are marked
+// settled so the setup coordinator neither re-opens them nor stalls waiting on
+// them.
 function closeDialogs(m) {
   $('info-overlay').hidden = true;
   $('stuck-overlay').hidden = true;
@@ -2285,7 +2474,7 @@ async function reclaimPort(p, attempts = 8) {
         pinnedPort = p;
         note(monitor, `\x1b[32m-- ${portLabel(p)} came back --\x1b[0m`);
         monitor.term.focus();
-        refreshFlashOffer();   // restore the green slot (detect, or the flash offer)
+        refreshFlashOffer();   // the board is reachable again — re-evaluate the offer
         attached = true;
         reclaimLastReport = null;   // next outage reports afresh
         return;
@@ -2326,13 +2515,16 @@ async function reclaimPort(p, attempts = 8) {
 // dialog. A board that was unplugged and plugged back in may return as a fresh
 // SerialPort object; this loop deliberately does not go looking for it.
 //
-// **This loop never raises a dialog.** Ports go away constantly — every reset,
-// every reflash — and come straight back, so a departure is not evidence of
-// anything and a modal on one would be wrong far more often than right. The
-// only thing that says a port is gone *for good* is the device announcing a
-// transport switch, and those two paths (offerConsoleHandover /
-// offerConsoleReturn) own the ask. What this loop does after a long silence is
-// reveal the Re-select port button and go quiet.
+// **This loop never raises a dialog, and never gives up.** Ports go away
+// constantly — every reset, every reflash — and come straight back, so a
+// departure is not evidence of anything and a modal on one would be wrong far
+// more often than right. Nor is a long silence: a board can sit unpowered for an
+// afternoon and be the same board when it returns. So the loop simply keeps the
+// port and its grant and waits, however long that takes, saying nothing. A board
+// that comes back as a fresh object is Re-select port in the settings panel,
+// which is on screen the whole time and needs no prompting. The only thing that
+// says a port is gone *for good* is the device announcing a transport switch,
+// and those two paths (offerConsoleHandover / offerConsoleReturn) own the ask.
 let rescanTimer = null;
 // Raised for this outage already, so the ask is ONCE per outage. Cleared when
 // the outage ends (below).
@@ -2342,13 +2534,6 @@ function askReconnect(why) {
   reconnectAsked = true;
   if (monitor && why) note(monitor, `\x1b[33m-- ${why} --\x1b[0m`);
   $('reconnect-overlay').hidden = false;
-}
-// Offer the re-pick without interrupting: the session may yet recover on its
-// own, and this waits to be clicked either way.
-function offerRepick() {
-  if (!$('monitor-repick').hidden) return;
-  $('monitor-repick').hidden = false;
-  if (monitor) note(monitor, '\x1b[33m-- still no port; use “Re-select port” if it came back as a new one --\x1b[0m');
 }
 function scheduleRescan() {
   if (rescanTimer) return;
@@ -2361,7 +2546,6 @@ function scheduleRescan() {
       rescanTimer = null;
       reconnectAsked = false;
       $('reconnect-overlay').hidden = true;
-      $('monitor-repick').hidden = true;
       return;
     }
     if (monitor.reattaching) return;          // a reclaim is already running
@@ -2369,8 +2553,6 @@ function scheduleRescan() {
     // than race for the handle.
     if (adopting) return;
     ticks++;
-    if (ticks === 40) offerRepick();          // ~30 s of nothing; before the
-                                              // backoff below, which skips ticks
     // Present and openable is the common case and resolves in the first second
     // or two. Past that the device is off the bus, and polling it hard buys
     // nothing — back off, but never stop: a board that comes back on the same
@@ -2414,7 +2596,6 @@ async function repickPort(putBack) {
     return;
   }
   pinPort(port);
-  $('monitor-repick').hidden = true;
   await reclaimPort(port);
 }
 
@@ -2423,8 +2604,9 @@ $('reconnect-pick').addEventListener('click', () => {
   repickPort(() => { $('reconnect-overlay').hidden = false; });
 });
 
-// The non-modal way back, revealed by the rescan after a long silence.
-$('monitor-repick').addEventListener('click', () => repickPort(null));
+// The non-modal way back: always on screen in the settings panel, for the one
+// case the rescan can't solve — a board that returned as a different port object.
+on('monitor-repick', 'click', () => { closeSettings(); repickPort(null); });
 
 // The tab's port leaving the bus: note it in the stream and tear the dead
 // streams down. Nothing else on the desk is any of this tab's business — three
@@ -2449,8 +2631,8 @@ navigator.serial.addEventListener('disconnect', (e) => {
   hideOpenUi();            // the device is gone — drop its buttons
   pendingFlash = null;     // can't flash (or detect on) a gone device
   cancelStateWarn();       // …so a warning waiting on an answer is moot
-  $('monitor-flash').hidden = true;
-  $('monitor-detect').hidden = true;
+  closeDeviceBox();        // …and an offer for a device that isn't there
+  syncDetectButton();      // …and nothing to run a detection on
   note(monitor, `\x1b[31m-- ${portLabel(p)} gone --\x1b[0m`);
   detachStreams(monitor);
   // The port may have re-connected BEFORE this death was reported — its
@@ -2480,20 +2662,88 @@ navigator.serial.addEventListener('connect', async (e) => {
   await reclaimPort(p);
 });
 
-// Populate the settings box from the defaults (adds the baud as an option if the
-// ?monitor_baud= override isn't one of the presets).
-function initCfgControls() {
+// Populate the settings panel from what's in force (adding the baud as an option
+// if a ?monitor_baud= or a stored rate isn't one of the presets).
+function initSettingsControls() {
   const b = $('cfg-baud');
-  if (![...b.options].some((o) => Number(o.value) === DEFAULT_CFG.baudRate)) {
-    const o = document.createElement('option');
-    o.textContent = String(DEFAULT_CFG.baudRate);
-    b.appendChild(o);
+  if (b) {
+    if (![...b.options].some((o) => Number(o.value) === DEFAULT_CFG.baudRate)) {
+      const o = document.createElement('option');
+      o.textContent = String(DEFAULT_CFG.baudRate);
+      b.appendChild(o);
+    }
+    b.value = String(DEFAULT_CFG.baudRate);
+    $('cfg-data').value = String(DEFAULT_CFG.dataBits);
+    $('cfg-parity').value = DEFAULT_CFG.parity;
+    $('cfg-stop').value = String(DEFAULT_CFG.stopBits);
   }
-  b.value = String(DEFAULT_CFG.baudRate);
-  $('cfg-data').value = String(DEFAULT_CFG.dataBits);
-  $('cfg-parity').value = DEFAULT_CFG.parity;
-  $('cfg-stop').value = String(DEFAULT_CFG.stopBits);
+  if ($('set-noreset')) $('set-noreset').checked = SETTINGS.noReset;
+  if ($('set-autoflash')) $('set-autoflash').checked = SETTINGS.autoFlash;
+  syncDetectButton();
+  syncBuildSelector();
+  showCfg(DEFAULT_CFG);
 }
+
+// ── the build selector ──────────────────────────────────────────────────────
+// Which catalogue the page offers images from, as a select in the settings
+// panel. Its options are what `builds/index.html` lists, plus the catalogue in
+// force and the one the attached device says it was flashed from — either can be
+// a catalogue the tree deliberately doesn't list, and a selector that couldn't
+// show where you already are would be lying about the state of the page.
+const BUILD_OTHER = ' other';       // no catalogue name can collide with it
+let CATALOGUES = [];
+
+function buildOptions() {
+  const out = [...CATALOGUES];
+  for (const extra of [CATALOGUE, monitor && monitor.deviceCatalogue]) {
+    if (extra && !out.includes(extra)) out.push(extra);
+  }
+  return out;
+}
+
+// Rebuild the select from the options that apply right now and show the
+// catalogue in force. Cheap and idempotent — every path that could change either
+// calls it rather than reasoning about what moved.
+function syncBuildSelector() {
+  const sel = $('set-build');
+  if (!sel) return;                            // page older than this script
+  sel.textContent = '';
+  for (const name of buildOptions()) {
+    const o = document.createElement('option');
+    o.value = name;
+    o.textContent = name;
+    sel.appendChild(o);
+  }
+  const other = document.createElement('option');
+  other.value = BUILD_OTHER;
+  other.textContent = '- other -';
+  sel.appendChild(other);
+  sel.value = CATALOGUE;
+}
+
+on('set-build', 'change', (e) => {
+  const field = $('set-build-other');
+  if (e.target.value === BUILD_OTHER) {
+    // Name one the listing doesn't carry. The field replaces the choice rather
+    // than accompanying it, so nothing switches until a name is actually given.
+    if (field) { field.value = ''; field.hidden = false; field.focus(); }
+    return;
+  }
+  if (field) field.hidden = true;
+  setCatalogue(e.target.value, true);
+});
+
+// Enter or leaving the field commits it; leaving it empty is a change of mind,
+// and puts the selector back on the catalogue that is still in force.
+function commitOtherBuild() {
+  const field = $('set-build-other');
+  if (!field || field.hidden) return;
+  const name = cleanCatalogue(field.value.trim());
+  field.hidden = true;
+  if (name) setCatalogue(name, true); else syncBuildSelector();
+}
+on('set-build-other', 'change', commitOtherBuild);
+on('set-build-other', 'blur', commitOtherBuild);
 
 // ── flashing ────────────────────────────────────────────────────────────────
 // The download's own dialog. The image is fetched with the monitor still up and
@@ -2551,6 +2801,36 @@ async function loadFlashPlan(zipURL) {
   }
 }
 
+// An esptool argfile for write_flash: `--flag value` pairs, then one
+// `<offset> <file>` pair per image. Returns the flags as flash settings (the
+// names esptool-js wants, minus the leading dashes) and the images as
+// [offset, name] pairs in file order.
+//
+//     --flash_mode dio --flash_freq 80m --flash_size 16MB
+//     0x0 bootloader/bootloader.bin
+//     0x10000 reticulous.bin
+function parseEsptoolArgs(text) {
+  const settings = {};
+  const entries = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (!line) continue;
+    const tok = line.split(/\s+/);
+    for (let i = 0; i < tok.length; i++) {
+      if (tok[i].startsWith('--')) {
+        // A flag esptool takes without a value would swallow the next token;
+        // the ones that appear here are all `--flag value`.
+        settings[tok[i].replace(/^--/, '').replace(/-/g, '_')] = tok[i + 1] || '';
+        i++;
+      } else if (/^0x[0-9a-f]+$/i.test(tok[i]) && tok[i + 1]) {
+        entries.push([tok[i], tok[i + 1]]);
+        i++;
+      }
+    }
+  }
+  return { settings, entries };
+}
+
 async function unpackFlashPlan(zipURL) {
   const bytes = await fetchProgress(zipURL, (frac, got, total) => {
     dlProgress(frac, total ? `${fmtBytes(got)} of ${fmtBytes(total)}` : `${fmtBytes(got)} downloaded`);
@@ -2558,12 +2838,13 @@ async function unpackFlashPlan(zipURL) {
   dlProgress(1, `${fmtBytes(bytes.length)} downloaded — unpacking…`);
   const zip = await window.JSZip.loadAsync(bytes);
 
-  const argsFile = zip.file('flasher_args.json');
-  if (!argsFile) throw new Error('flasher.zip has no flasher_args.json');
-  const fargs = JSON.parse(await argsFile.async('string'));
-  const settings = fargs.flash_settings || {};
-  const entries = Object.entries(fargs.flash_files || {});
-  if (!entries.length) throw new Error('flasher_args.json lists no flash_files');
+  // The image's own flashing instructions: an esptool argfile named for the
+  // project that built it. Found by extension rather than by name — the project
+  // names itself, and this side has no business knowing what it chose.
+  const argsFile = zip.file(/\.esptool$/)[0];
+  if (!argsFile) throw new Error('image zip has no .esptool argfile');
+  const { settings, entries } = parseEsptoolArgs(await argsFile.async('string'));
+  if (!entries.length) throw new Error(`${argsFile.name} lists no images`);
 
   // esptool-js (0.6.0) wants each image as a Uint8Array of raw bytes. Passing a
   // binary string makes pako's deflater UTF-8-encode any byte >= 0x80, so the
@@ -2572,7 +2853,7 @@ async function unpackFlashPlan(zipURL) {
   const fileArray = [];
   for (const [offset, fname] of entries) {
     const f = zip.file(fname);
-    if (!f) throw new Error(`image "${fname}" missing from flasher.zip`);
+    if (!f) throw new Error(`image "${fname}" missing from the zip`);
     dlProgress(null, `unpacking ${fname} (${fileArray.length + 1} of ${entries.length})…`);
     fileArray.push({ data: await f.async('uint8array'), address: parseInt(offset, 16) });
   }
@@ -2757,9 +3038,11 @@ function renderDeviceBox() {
   if (!f || !$('device-overlay')) return;     // no facts, or a page older than this script
   const board = f.hw ? f.hw.replace(/^hw-/, '') : null;
   $('device-title').textContent = board || 'Device found';
-  $('device-sub').textContent = f.hw
-    ? `Identified as ${f.hw}. Everything read off the chip:`
-    : 'The chip answered the probe, but no supported board matched it.';
+  $('device-sub').textContent = !f.probed
+    ? `Identified as ${f.hw} from its own boot log — the chip has not been probed.`
+    : f.hw
+      ? `Identified as ${f.hw}. Everything read off the chip:`
+      : 'The chip answered the probe, but no supported board matched it.';
 
   const photo = $('device-photo');
   const src = f.hw ? deviceImage(f.hw) : null;
@@ -2773,22 +3056,28 @@ function renderDeviceBox() {
   const dl = $('device-facts');
   dl.textContent = '';
   factRow(dl, 'Port', f.usb);
-  factRow(dl, 'Chip', f.chip.join('\n'));
-  factRow(dl, 'Peripherals', f.periph.length ? f.periph.join('\n') : 'none reported');
-  factRow(dl, 'Stored data', f.state
-    ? `state partition at 0x${f.state.addr.toString(16)}, ${fmtBytes(f.state.size)}`
-    : 'no state partition on this chip yet');
+  // Only a detection run reads these off the chip. Without one there is nothing
+  // to say about them — which is not the same as "none found", so they are left
+  // out rather than reported empty.
+  if (f.probed) {
+    factRow(dl, 'Chip', f.chip.join('\n'));
+    factRow(dl, 'Peripherals', f.periph.length ? f.periph.join('\n') : 'none reported');
+    factRow(dl, 'Stored data', f.state
+      ? `state partition at 0x${f.state.addr.toString(16)}, ${fmtBytes(f.state.size)}`
+      : 'no state partition on this chip yet');
+  }
   const m = monitor;
   factRow(dl, 'Firmware', m && m.deviceVersion
-    ? `${PROJECT} build ${fmtStamp(m.deviceVersion)}`
+    ? `${PROJECT} ${m.deviceCatalogue || CATALOGUE} build ${fmtStamp(m.deviceVersion)}`
     : 'no build stamp reported (older firmware, or still booting)');
-  const offered = pendingFlash && (BUILDS.find((b) => b.name === pendingFlash.name) || {}).version;
   let catalogue;
   if (!f.hw) catalogue = 'no board identified, so nothing to match against';
-  else if (pendingFlash) catalogue = `build ${fmtStamp(offered)} is newer — the green button behind this box flashes it`;
-  else if (m && m.versionSettled) catalogue = 'nothing newer published for this board';
-  else catalogue = 'checking for a newer build…';
+  else if (pendingFlash) catalogue = `${CATALOGUE} build ${fmtStamp(pendingFlash.stamp)}`
+    + (pendingFlash.newer ? ' — newer than what runs here' : '');
+  else if (m && m.versionSettled) catalogue = `nothing published for this board in ${CATALOGUE}`;
+  else catalogue = 'checking the catalogue…';
   factRow(dl, 'Catalogue', catalogue);
+  renderFlashOffer();
 }
 
 function showDeviceBox(facts) {
@@ -2796,6 +3085,8 @@ function showDeviceBox(facts) {
   renderDeviceBox();
   if ($('device-overlay')) $('device-overlay').hidden = false;
 }
+
+function deviceBoxOpen() { return !!$('device-overlay') && !$('device-overlay').hidden; }
 
 function closeDeviceBox() { if ($('device-overlay')) $('device-overlay').hidden = true; }
 
@@ -2805,6 +3096,7 @@ on('device-ok', 'click', closeDeviceBox);
 on('device-overlay', 'click', (e) => {
   if (e.target === $('device-overlay')) closeDeviceBox();
 });
+on('flash-go', 'click', () => { closeDeviceBox(); runPendingFlash(); });
 
 // ── state-partition warning ─────────────────────────────────────────────────
 // Flash erases whole sectors, so a write erases from the start of the sector its
@@ -2907,34 +3199,25 @@ function projectSlug(project) {
   return (project || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'flashmon';
 }
 
-// A build's zip path: a build `make` has stamped carries its own `version:` (the
-// build datetime) and is named <slug>_<name>_<version>.zip; an unstamped one is
-// plain <name>.zip.
-function buildRel(name) {
-  const ver = (BUILDS.find((b) => b.name === name) || {}).version;
-  return ver ? `builds/${SLUG}_${name}_${ver}.zip` : `builds/${name}.zip`;
+// The URL of the newest published image for `name`, or null if the listing
+// doesn't have one. No HEAD probe: the listing is generated from the directory
+// it lists, so what it names is what is there.
+function findBuildUrl(name) {
+  const ver = VERSIONS[name];
+  return ver ? `${CAT_BASE}${SLUG}_${name}_${ver}.zip` : null;
 }
 
-// The URL of a published image for `name` (versioned first, plain fallback), or
-// null if none is there.
-async function findBuildUrl(name) {
-  for (const url of [buildRel(name), `builds/${name}.zip`]) {
-    try {
-      const res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
-      if (res.ok) return url;
-    } catch (_) { /* try the next */ }
-  }
-  return null;
-}
-
-// Is the catalogue's image for `name` newer than what's running? Both stamps are
-// YYYYMMDDhhmmss, which sorts lexicographically. We offer a flash UNLESS we know the
-// device is already at or past the catalogue's stamp — an unknown device stamp (old
-// firmware, or a non-catalogue image) or an unstamped catalogue entry stays offerable.
-function catalogueNewer(name, deviceVersion) {
-  const cv = (BUILDS.find((b) => b.name === name) || {}).version || '';
-  if (!cv || !deviceVersion) return true;
-  return cv > deviceVersion;
+// Is the published image for `name` newer than what's running? Both stamps are
+// YYYYMMDDhhmmss, which sorts lexicographically. An unknown device stamp (old
+// firmware, or a non-catalogue image) counts as newer: there is nothing to be
+// no-newer than. Comparing across catalogues is meaningless, so a device that
+// names a different catalogue than the one selected reads the same way — the
+// stamps come from two unrelated series.
+function catalogueNewer(name, m) {
+  const cv = VERSIONS[name] || '';
+  if (!cv || !m || !m.deviceVersion) return true;
+  if (m.deviceCatalogue && m.deviceCatalogue !== CATALOGUE) return true;
+  return cv > m.deviceVersion;
 }
 
 // Record the identified board on the live monitor and arm the grace window: the
@@ -2963,36 +3246,111 @@ async function refreshFlashOffer() {
   if (box && !box.hidden) renderDeviceBox();
 }
 
-// Resolve the identified board to the best available image and show the flash
-// button — but only when that image is newer than the running firmware. Reactive:
-// re-run whenever the board, the device's build stamp, or the catalogue changes. A
-// board-specific image names the device in the button; the generic fallback says so.
+// Resolve the identified board to the best available image, and offer it.
+// Reactive: re-run whenever the board, the device's build stamp, or the
+// catalogue changes. A board-specific image names the device in the offer; the
+// generic fallback says so.
 //
-// The green slot falls back to "Detect Hardware" while the board is unknown —
-// nothing can be resolved until either the boot log or a detection run names it.
+// The catalogue's image is offered whether or not it is newer — an image that is
+// already running, or older than what is, is a re-flash you may well want (a
+// device that came back wrong, a switch to another catalogue). What changes is
+// how it is put: `newer` drives the wording and the button, so a downgrade can
+// never be taken for an upgrade.
+//
+// Nothing can be resolved until the board is known — until then there is no
+// offer, and "Detect hardware" in the settings panel is what makes one possible.
 async function resolveFlashOffer() {
   const m = monitor;
   pendingFlash = null;
-  $('monitor-flash').hidden = true;
-  $('monitor-detect').hidden = !m || !!m.hw || detecting;
+  syncDetectButton();
   if (!m || !m.hw) return;
   // Hold off until the device's stamp has had a chance to arrive, so a current
-  // device doesn't briefly show (and let you click) a pointless re-flash.
+  // device isn't offered a pointless re-flash on the way to knowing better.
   if (!m.versionSettled && m.deviceVersion === null) return;
   for (const name of buildCandidates(m.hw)) {
-    const url = await findBuildUrl(name);
+    const url = findBuildUrl(name);
     if (!url) continue;
-    if (monitor !== m) return;                          // superseded mid-HEAD
-    if (!catalogueNewer(name, m.deviceVersion)) return; // device already current
     const device = m.hw.replace(/^hw-/, '');
     const label = name === 'generic'
       ? `Flash ${PROJECT} (generic build)`
       : `Flash ${PROJECT} to ${device}`;
-    pendingFlash = { url, name, label };
-    $('monitor-flash').textContent = label;
-    $('monitor-flash').hidden = false;
+    pendingFlash = { url, name, label, stamp: VERSIONS[name] || '', newer: catalogueNewer(name, m) };
+    maybeAutoFlash();
+    offerFlash();
     return;
   }
+  // Nothing published for this board any more. An open window is left up — the
+  // caller repaints it, and it drops back to the facts and an OK.
+}
+
+// With auto-flash on, an offer is the whole trigger — the run starts itself the
+// moment one resolves. Only for an image that is actually newer: auto-flash is
+// there to keep a board on the bench current, never to re-write what it already
+// runs or to walk it backwards. Once per image: `url` carries the stamp, so a
+// rebuild starts a new run while a failed or declined one doesn't loop. A run
+// already in flight (or a device the port isn't ours to take) is left alone.
+let autoFlashed = null;
+function maybeAutoFlash() {
+  if (!SETTINGS.autoFlash || !pendingFlash || !pendingFlash.newer || detecting) return;
+  if (autoFlashed === pendingFlash.url) return;
+  autoFlashed = pendingFlash.url;
+  offerShownFor = pendingFlash.url;      // it is being flashed, not offered
+  log(`Auto-flash: ${pendingFlash.label}`);
+  runPendingFlash();
+}
+
+// ── the flash offer ─────────────────────────────────────────────────────────
+// The offer lives in the device window, under the facts it follows from: what
+// the board is, what it runs, what the catalogue holds. Those facts are the
+// decision, so putting the button anywhere else would mean stating them twice.
+//
+// Two halves: renderFlashOffer paints the offer into an open window, and
+// offerFlash decides when that window should be up for it — once per published
+// image, so a connect that settles opens it, a build published while the page
+// is open opens it again, and a re-render of the same offer doesn't.
+
+// The offer's part of the device window: the warning (only when the image is not
+// an upgrade) and the button that goes ahead. Called from renderDeviceBox, so it
+// is repainted every time a fact lands.
+function renderFlashOffer() {
+  const f = pendingFlash;
+  const m = monitor;
+  const go = $('flash-go');
+  const warn = $('flash-warn');
+  if (!go || !warn) return;                   // page older than this script
+  go.hidden = !f;
+  warn.hidden = !f || f.newer;
+  $('device-ok').textContent = f ? 'Not now' : 'OK';
+  $('device-ok').className = f ? 'btn-ghost' : 'btn-primary';
+  if (!f) return;
+  // A device that reports no stamp is not being told this is an upgrade — there
+  // is nothing to compare — so it gets the plain green button and no warning.
+  if (!f.newer) {
+    warn.textContent = f.stamp && m && m.deviceVersion && f.stamp < m.deviceVersion
+      ? 'The published image is OLDER than the firmware on the device. Flashing it takes '
+        + 'the device back to that build.'
+      : 'This is the build the device already runs. Flashing writes the same image again.';
+  }
+  go.textContent = f.newer ? f.label : 'Flash anyway';
+  go.className = f.newer ? 'btn-primary' : 'btn-warn';
+}
+
+// Put the device window up for an offer that hasn't been shown yet. With the
+// window already open (a detection run just ended) the render alone is enough —
+// the button appears under the facts the user is reading. With nothing on
+// screen, the facts the boot log gave us are the window's contents.
+function offerFlash() {
+  const f = pendingFlash;
+  const m = monitor;
+  if (!f || !m || detecting || !$('device-overlay')) return;
+  // Already open: the caller's repaint puts the button under the facts being
+  // read, and the offer counts as shown without anything moving on screen.
+  if (deviceBoxOpen()) { offerShownFor = f.url; return; }
+  if (offerShownFor === f.url) return;
+  offerShownFor = f.url;
+  showDeviceBox(deviceFacts && deviceFacts.hw === m.hw ? deviceFacts : {
+    usb: usbInfoLine(m.port), chip: [], periph: [], hw: m.hw, state: statePart, probed: false,
+  });
 }
 
 // Flash the pending image, then reopen the monitor and reset into it. The image
@@ -3062,10 +3420,8 @@ async function runPendingFlash() {
   }
 }
 
-$('monitor-flash').addEventListener('click', runPendingFlash);
-
 // ── hardware detection ──────────────────────────────────────────────────────
-// Identify the board on demand, from the monitor's green slot. Probing needs the
+// Identify the board on demand, from the settings panel. Probing needs the
 // ROM loader, which means resetting the device and owning the port alone, so the
 // monitor is torn down for the run and reopened after — the same shape as an
 // in-monitor flash, minus the write. Runs on the intro screen so the detector's
@@ -3077,7 +3433,8 @@ async function runDetect() {
   closeDialogs(monitor);                    // clear any dialog on the way out
   await closeMonitor();
   $('monitor').hidden = true;               // reveal the intro screen behind it
-  $('monitor-detect').hidden = true;
+  closeSettings();                          // it was pressed in the panel; get it out of the way
+  syncDetectButton();
   bar.style.display = 'none';
   barfill.style.width = '0';
   logEl.textContent = '';
@@ -3113,6 +3470,7 @@ async function runDetect() {
         periph: detected.filter((l) => !l.startsWith('DETECTED:')),
         hw,
         state: statePart,
+        probed: true,
       };
     } else {
       banner = ['No ESP32 detected.'];
@@ -3137,24 +3495,38 @@ async function runDetect() {
     releaseTimers();
   }
   // Record what we learned (nothing, on a failed run — which puts the Detect
-  // Hardware button back) and offer a flash only if a newer build is published.
+  // Hardware button back) and resolve what the catalogue has for it. The offer
+  // lands in the same window as the findings below — it arrives a few seconds
+  // later, with the device's build stamp, and the window repaints around it.
   armFlashGrace(hw, true);
   // Only a run that reached the chip has anything to show.
   if (facts && monitor) showDeviceBox(facts);
 }
 
-$('monitor-detect').addEventListener('click', runDetect);
+on('monitor-detect', 'click', runDetect);
+
+// "Detect hardware" is a settings-panel action now, so it is always on screen
+// and says whether it can run instead of appearing and vanishing: disabled with
+// no port to run it on, and for the length of a run.
+function syncDetectButton() {
+  const b = $('monitor-detect');
+  if (b) b.disabled = !monitor || detecting;
+}
 
 let connecting = false;
 
-// Pop the serial chooser, open the monitor on the port, and identify the board:
-// the pick is followed straight away by a detection run, which resets the device,
-// reads the chip and its peripherals, and ends in the device box. Under
-// `?noreset` the pick opens the monitor and stops there — the device is not
-// probed and not reset, it keeps doing whatever it was doing, and identifying it
-// waits for the Detect Hardware button or the firmware's own `build: invocation`
-// line. requestPort() is called first, while the user gesture is fresh, before
-// any long await.
+// Pop the serial chooser, open the monitor on the port, and identify the board —
+// by asking it first, and only probing what cannot answer.
+//
+// The pick opens the monitor without touching the device, then asks it `show
+// sys.hw` over a frame. A device that answers is identified at that point, still
+// running, never reset. One that does not gets the detection run: reset, chip
+// probe, RAM-loaded detector, ending in the device window. "No reset" stops
+// short of that run — the asking costs the device nothing and happens either
+// way.
+//
+// requestPort() is called first, while the user gesture is fresh, before any
+// long await.
 //
 // This pick is what the tab is for. It becomes the tab's one port, and only
 // another pick — the reconnect dialog, or a console move — ever replaces it.
@@ -3162,6 +3534,7 @@ async function connect() {
   if (connecting || monitor) return;
   connecting = true;
   statePart = null;                  // a fresh pick may be a different chip
+  deviceFacts = null;                // …so nothing the last one reported carries over
 
   $('start').hidden = true;          // the action is underway — drop the CTA
   bar.style.display = 'none';
@@ -3180,13 +3553,10 @@ async function connect() {
       return;
     }
     pinPort(port);
-    const banner = AUTO_DETECT
-      ? ['Identifying the board — the device is about to be reset.']
-      : ['Monitoring only — the device has not been reset.',
-         'Press “Detect Hardware” to identify the board (that resets it).'];
+    const banner = ['Monitoring — the device has not been reset.'];
     const usb = usbInfoLine(port);
     await openMonitor(port, false, usb ? [usb, ...banner] : banner);
-    refreshFlashOffer();   // board unknown → the green slot offers detection
+    refreshFlashOffer();
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     $('intro-hint').innerHTML = `<span class="err">${msg}</span>`;
@@ -3195,9 +3565,44 @@ async function connect() {
     connecting = false;
   }
   // Identify the board the moment the monitor is up — outside the try above, so
-  // a detection failure reports itself in the monitor rather than putting the
-  // "pick a port" call to action back over a live session.
-  if (AUTO_DETECT && monitor) await runDetect();
+  // a failure reports itself in the monitor rather than putting the "pick a
+  // port" call to action back over a live session.
+  //
+  // Nothing is asked here, because nothing needs to be. Opening the port already
+  // sent the console a bare CR (syncConsole), and spangap answers that by saying
+  // who it is — `build: hw …` / `build: catalogue …` / `build: datetime …`, the
+  // same lines it prints at boot. The ordinary log parser picks them up and arms
+  // the board, so all this waits for is the round trip.
+  //
+  // That is the whole identification, and it is why there is no query channel to
+  // maintain: the device volunteers the fact to whoever turns up, rather than
+  // holding it until interrogated over a side-channel that has to be probed for,
+  // may not be armed, and cannot be relied on the moment a port opens.
+  if (!monitor) return;
+  if (!(await waitForBoardNamed(monitor))) {
+    // Silence means firmware too old to answer a CR with its identity, or none
+    // at all. Reading it off the chip is the only way left — and under "No
+    // reset" not even that, since the point of the setting is to leave the
+    // device alone.
+    if (autoDetect() && monitor) await runDetect();
+    else if (monitor) note(monitor, '\x1b[33m-- the device did not say which board it is; '
+                                  + '“Detect hardware” in the settings panel will read it off the chip --\x1b[0m');
+  }
+}
+
+// Wait for the console's answer to the CR that opening the port already sent.
+// A round trip on an open port, so this is short: what has not arrived in a
+// couple of seconds is not coming, and what is not coming means old firmware or
+// none. `m.hw` is set by the log parser the moment `build: hw` lands.
+const BOARD_NAMED_MS = 2500;
+
+async function waitForBoardNamed(m) {
+  for (let waited = 0; waited < BOARD_NAMED_MS; waited += 200) {
+    if (monitor !== m) return false;        // session replaced under us
+    if (m.hw) return true;
+    await sleep(200);
+  }
+  return !!m.hw;
 }
 
 // ── config ────────────────────────────────────────────────────────────────
@@ -3214,7 +3619,7 @@ function parseConfig(text) {
     if (i < 0) return;
     const k = kv.slice(0, i).trim();
     const v = kv.slice(i + 1).trim().replace(/^["']|["']$/g, '');
-    if (k === 'name' || k === 'version' || k === 'image') obj[k] = v;
+    if (k === 'name' || k === 'image') obj[k] = v;
   };
   const top = (st, key) => st.slice(st.indexOf(':') + 1).trim().replace(/^["']|["']$/g, '');
   for (const raw of text.split('\n')) {
@@ -3229,51 +3634,172 @@ function parseConfig(text) {
   return cfg;
 }
 
-// Prefer a gitignored flashmon.local.yaml (local deployment override) over the
-// checked-in flashmon.yaml. Missing/broken config falls back to defaults.
+// The selected catalogue's config. Missing or broken falls back to defaults —
+// the page still monitors, it just has nothing to offer.
 async function loadConfig() {
-  for (const f of ['flashmon.local.yaml', 'flashmon.yaml']) {
-    try {
-      const res = await fetch(f, { cache: 'no-store' });
-      if (res.ok) return parseConfig(await res.text());
-    } catch (_) { /* try the next */ }
-  }
+  try {
+    const res = await fetch(`${CAT_BASE}builds.yaml`, { cache: 'no-store' });
+    if (res.ok) return parseConfig(await res.text());
+  } catch (_) { /* served without a catalogue */ }
   return { project: 'flashmon', builds: [] };
+}
+
+// The images the catalogue actually holds, from its index.html: name -> newest
+// stamp. Every image is <slug>_<name>_<stamp>.zip, and the stamps sort
+// lexicographically, so the highest one per name is the current image. Read out
+// of the hrefs, so any listing that links its files works — this one is
+// generated by `spangap make-builds`.
+async function loadVersions() {
+  let text;
+  try {
+    const res = await fetch(`${CAT_BASE}index.html`, { cache: 'no-store' });
+    if (!res.ok) return {};
+    text = await res.text();
+  } catch (_) {
+    return {};
+  }
+  const out = {};
+  for (const m of text.matchAll(/href\s*=\s*["']([^"']+\.zip)["']/gi)) {
+    const base = m[1].replace(/^.*\//, '').replace(/\.zip$/i, '');
+    const parts = /^(.+?)_(.+)_(\d{8,14})$/.exec(base);
+    if (!parts) continue;
+    const [, , name, stamp] = parts;
+    if (!out[name] || stamp > out[name]) out[name] = stamp;
+  }
+  return out;
+}
+
+// The catalogues the tree says it holds, from `builds/index.html`: the directory
+// links in it, in the order it lists them. Read out of the hrefs, like the image
+// listing — any page that links its subdirectories works. A catalogue marked
+// `.unlisted` is deliberately absent here and is reached by naming it, which is
+// what the selector's "- other -" is for.
+async function loadCatalogueList() {
+  let text;
+  try {
+    const res = await fetch(`${BUILDS_BASE}index.html`, { cache: 'no-store' });
+    if (!res.ok) return [];
+    text = await res.text();
+  } catch (_) {
+    return [];                    // tree not served, or briefly unreachable
+  }
+  const out = [];
+  for (const m of text.matchAll(/href\s*=\s*["']([^"']+)\/["']/gi)) {
+    const name = cleanCatalogue(m[1].replace(/^.*\//, ''));
+    if (name && name !== '.' && name !== '..' && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+// The brand the catalogue wears. It comes out of the catalogue's own config, so
+// it is re-applied whenever the selected catalogue changes.
+function applyBrand(cfg) {
+  PROJECT = cfg.project || 'flashmon';
+  SLUG = projectSlug(PROJECT);
+  HOSTNAME_DEFAULT = (PROJECT.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'flashmon').slice(0, 20);
+}
+
+// Re-read the listing and re-evaluate the live offer. Called when the stamp file
+// moves, which is the catalogue telling us it has something new. Branding is
+// left as booted: a catalogue doesn't get to rename the page under a running
+// session (switching catalogue does — see setCatalogue).
+async function refreshCatalogue() {
+  const [cfg, versions] = await Promise.all([loadConfig(), loadVersions()]);
+  BUILDS = cfg.builds;
+  BUILD_NAMES = cfg.builds.map((b) => b.name).filter(Boolean);
+  VERSIONS = versions;
+  if (monitor) refreshFlashOffer();
+}
+
+// Serve images from a different catalogue from here on. Everything read out of
+// the old one goes — its images, its stamp, and the record of what has already
+// been offered, since an offer from another catalogue is a different offer even
+// when it names the same image. `pin` marks the choice as the user's, which
+// stops a device's own catalogue from moving it afterwards.
+async function setCatalogue(name, pin) {
+  const want = cleanCatalogue(name);
+  if (!want) return;
+  if (pin) cataloguePinned = true;
+  syncBuildSelector();
+  if (want === CATALOGUE) return;
+  CATALOGUE = want;
+  CAT_BASE = `${BUILDS_BASE}${CATALOGUE}/`;
+  VERSIONS = {};
+  LAST_STAMP = null;
+  offerShownFor = null;
+  autoFlashed = null;
+  const [cfg, versions, stamp] = await Promise.all([loadConfig(), loadVersions(), fetchStamp()]);
+  if (CATALOGUE !== want) return;              // switched again while loading
+  applyBrand(cfg);
+  BUILDS = cfg.builds;
+  BUILD_NAMES = cfg.builds.map((b) => b.name).filter(Boolean);
+  VERSIONS = versions;
+  LAST_STAMP = stamp;
+  setMonTitle(monitor ? monitor.hostname : null);
+  syncBuildSelector();
+  if (monitor) refreshFlashOffer();
+}
+
+// A device that says which catalogue it was flashed from moves the page there,
+// so what it is compared against is the series it came from. Only while nothing
+// has claimed the choice: a `?build=` or a pick in the panel outranks the
+// device, and stays put when the next board says something else.
+function adoptDeviceCatalogue(name) {
+  if (cataloguePinned) { syncBuildSelector(); return; }
+  setCatalogue(name, false);
+}
+
+// Poll the catalogue's stamp file: one small request, and the only thing that
+// has to be cheap because it runs whether or not anything is happening. The
+// listing is re-read only when the value moves.
+const STAMP_POLL_MS = 15000;
+async function fetchStamp() {
+  try {
+    const res = await fetch(`${CAT_BASE}timestamp`, { cache: 'no-store' });
+    if (!res.ok) return null;
+    return (await res.text()).trim();
+  } catch (_) {
+    return null;                  // catalogue not served, or briefly unreachable
+  }
+}
+
+async function pollStamp() {
+  const stamp = await fetchStamp();
+  if (stamp === null || stamp === LAST_STAMP) return;
+  LAST_STAMP = stamp;
+  await refreshCatalogue();
 }
 
 // ── boot ──────────────────────────────────────────────────────────────────
 async function boot() {
   const cfg = await loadConfig();
-  PROJECT = cfg.project || 'flashmon';
-  SLUG = projectSlug(PROJECT);
+  applyBrand(cfg);
   BUILDS = cfg.builds;
   BUILD_NAMES = cfg.builds.map((b) => b.name).filter(Boolean);
-  HOSTNAME_DEFAULT = (PROJECT.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'flashmon').slice(0, 20);
 
-  // Re-read the catalogue once a minute so a build published while the page is
-  // open becomes available without a reload; re-evaluate the live flash offer
-  // against the refreshed stamps. Branding (project/slug) is left as booted.
-  setInterval(async () => {
-    const c = await loadConfig();
-    BUILDS = c.builds;
-    BUILD_NAMES = c.builds.map((b) => b.name).filter(Boolean);
-    if (monitor) refreshFlashOffer();
-  }, 60000);
+  CATALOGUES = await loadCatalogueList();
+  VERSIONS = await loadVersions();
+  LAST_STAMP = await fetchStamp();
+
+  // Watch the catalogue for the rest of the session, so a build published while
+  // the page is open is picked up without a reload. Worker-held like the other
+  // background polls: a hidden tab is exactly when an unattended flasher is
+  // waiting for a build to land. Branding (project/slug) is left as booted.
+  wtSetInterval(pollStamp, STAMP_POLL_MS);
 
   // Markup this script drives that the page it loaded into doesn't have: the
   // page was served from cache, older than the script beside it. Flashing and
   // the monitor still work; the dialogs those elements belong to don't, and a
   // reload that bypasses the cache is the fix.
-  const stale = ['dl-overlay', 'device-overlay'].filter((id) => !$(id));
+  const stale = ['dl-overlay', 'device-overlay', 'flash-go', 'set-build'].filter((id) => !$(id));
   if (stale.length) {
     log(`This page is cached from an older deployment (missing: ${stale.join(', ')}). `
       + 'Reload with Shift held to fetch the current one.', 'err');
   }
 
   setMonTitle(null);
-  $('monitor-baud').textContent = fmtCfg(DEFAULT_CFG);
   $('ch-hostname').value = HOSTNAME_DEFAULT;
-  initCfgControls();
+  initSettingsControls();
 
   if (!('serial' in navigator)) {
     $('intro-hint').innerHTML = 'This page needs a <b>Chromium-based browser</b> to work, for now — '

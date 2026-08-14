@@ -1,16 +1,13 @@
 # flashmon is a generic installer (it lives in spangap's account); a deployment
-# brands it and lists its images by supplying its OWN flashmon.yaml, which is
-# never committed. So ALL config yaml is ignored — copy flashmon.yaml.example to
-# flashmon.yaml and edit it; flashmon.local.yaml overrides it per-machine.
-# (The CI workflow is .yml, so it stays tracked.)
+# brands it and lists its images by supplying its OWN builds.yaml, which lives
+# in the untracked builds/ tree beside the workspace's straddles and is never
+# committed here. Any config yaml that turns up in this repo is ignored — copy
+# builds.yaml.example into <workspace>/builds/<catalogue>/builds.yaml and edit
+# it there. (The CI workflow is .yml, so it stays tracked.)
 *.yaml
 
-# Built firmware images: produced by `make` in flashmon/builds/ (or CI), served
-# alongside the page — build artifacts, not source. builds/ stays via its Makefile.
-flashmon/builds/*.zip
-
 # Generated per-deployment artifacts: the branded standalone script and its
-# self-contained offline bundle(s) (made by `make` / `flashmon.py make-zip`).
+# self-contained offline bundle(s) (made by `flashmon.py make-zip`).
 flashmon/*-flashmon
 flashmon/*.zip
 
@@ -19,5 +16,5 @@ flashmon/*.zip
 flashmon/offline-installer/
 flashmon/offline-installer.new/
 
-# Python bytecode cache from running flashmon.py / make-builds.py.
+# Python bytecode cache from running flashmon.py.
 __pycache__/

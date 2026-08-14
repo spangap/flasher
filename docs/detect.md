@@ -1,51 +1,153 @@
-# Peripheral detection
+# Board detection
 
-How to identify, at runtime from code on the ESP32, every internal peripheral on
-the boards we support (the `hw-*` straddles). This is the reference behind the
-detection binary in [`../esp-idf/`](../esp-idf), which flashmon can upload
-after the chip probe to auto-detect what's attached.
+How a board says which board it is, and how a chip whose firmware is unknown is
+made to say it anyway.
 
-The detector works **per board**: `probe_hw_<straddle>()` powers that board's
-rail, checks a mandatory anchor peripheral on the board's pins, confirms with the
-radio, then reads the optional extras and prints `DETECTED: hw-<straddle>`. It
-tries the boards in turn and stops at the first match. The individual peripheral
-detectors take pin numbers and report only what they found — and where a part has
-no ID register (keyboard, RTC, OLED) the detector prints a bare `ack at 0x<addr>`
-rather than claiming a chip it can't actually confirm.
+## One function per board
 
-Two things shape the output. First, each probe gates on the **physical flash
-size** (read once via SFDP) and bails before touching a pin when its board can't
-be that size — 16 MB → tdeck/heltec, 8 MB → xiao-sense, 4 MB → t3s3/nibble (the
-xiao-sx1262 probe accepts **8 or 16 MB**, since the Wio-SX1262 fits both the base
-XIAO and the 16 MB Plus).
-(PSRAM size would split the 16 MB pair, but a single RAM image can't init PSRAM —
-octal vs quad is build-fixed — so the anchor settles those instead.) Second, the
-`DETECTED:` line is **only the straddle name**, with the radio in the name where
-it splits a board line (`hw-lilygo-t3s3-sx1262` … `-sx1280`); touch, GPS type and
-BME280 stay on the peripheral lines, never in brackets. On the wire every
-intentional line is prefixed `DETECT: ` as a whitelist flashmon strips.
+    hw-<board>/esp-idf/src/detect.cpp  ->  const char *detect_hw(void)
+
+Each board straddle answers exactly one question about itself: `detect_hw()`
+returns its own `hw-<straddle>` string when the hardware under it is that board,
+and NULL when it is not. Nothing in it enumerates other boards — the board is the
+only thing that knows its own pins, and that is all it claims to know.
+
+It is written once, there, and read by two callers:
+
+- **spangap-core**, from `serviceRunStart()` — before the first `onStart()`,
+  because the probe opens an I2C bus and the SPI host itself and a board's own
+  `onStart` is what claims them (hw-lilygo-tdeck creates the shared I2C0 bus
+  there). Anything later loses the bus and reads as an unrecognised board.
+  A staged board straddle means the image was built for that board, so a NULL (or
+  a different board) means the image is on the wrong hardware. spangap logs the
+  mismatch and then **stops where it stands** — the task blocks forever, awake,
+  so the console stays enumerated and the reason stays on screen. Every pin map
+  in that image belongs to someone else's board; a reboot loop would re-drive
+  those pins forever, and going to sleep would take the explanation down with the
+  port. Only a reset or a power cycle leaves it. A confirmed board is
+  published as `sys.hw`. The symbol is declared **weak** in spangap-core, so the
+  generic image — which stages no board straddle — links a null and the check
+  simply does not apply.
+- **flashmon's detector** ([`../esp-idf/`](../esp-idf)), which carries a **copy**
+  of each board's `detect_hw()` renamed
+  `detect_hw_<straddle_with_underscores>` — `detect_hw_lilygo_tdeck`,
+  `detect_hw_heltecv4`, … — and calls them in turn from RAM, stopping at the
+  first that answers.
+
+The copy is manual and deliberately so: it is a handful of self-contained
+functions, and a build-time mechanism to move them would cost more than it saves.
+`detect_probe.h` — the bus vocabulary the functions are written in — is copied
+the same way, from `spangap-core/esp-idf/include/`. Change one, change the other.
+What catches a drift is the firmware itself: a board whose `detect_hw()` no
+longer recognises it halts on the next boot.
+
+## The device says so, unasked
+
+Because spangap confirms the board at every boot and halts on a mismatch, a
+device that is *running* has already settled the question — its baked-in board
+and its actual board cannot be seen to disagree. The only problem left is getting
+that answer to whoever wants it.
+
+It is **announced**, not queried:
+
+```
+build: hw hw-lilygo-tdeck
+build: catalogue stable
+build: datetime 20260814130700
+```
+
+`spangapLogBuildIdentity()` prints those at boot, and again every time a console
+attaches — cli.cpp answers a bare Enter with them, right after the "Spangap
+console on serial jtag" line. A line is omitted when its fact does not exist, so
+a generic image names no board and an image from outside a catalogue run carries
+no stamp; absent is the honest answer, and it is what tells a tool to go and look
+for itself.
+
+That second call is the whole design. A boot happens once and almost nobody
+watches it, so a device that announced itself only then forced every tool that
+turned up later to **interrogate** it — over the framed RPC, whose availability
+is advertised by a marker printed once at boot, which is exactly the thing the
+late arrival missed. Probing for it is unreliable in the moment a port opens, and
+a probe that draws a blank is indistinguishable from firmware that cannot answer
+at all. The consequence was a reset and an eight-second detector run on a device
+that was perfectly able to report for itself.
+
+So flashmon asks nothing. Opening the port already sends a CR (it is how the
+console is confirmed to be the console), the device answers with its identity,
+and the ordinary log parser reads it. The detector is for devices that stay
+silent: firmware too old to know the convention, or none at all.
+
+## What a probe is made of
+
+`detect_probe.h` supplies the reads: I2C bus open / ACK / register read, SCCB for
+camera sensors, a LoRa radio probe over SPI, passive NMEA autobaud for GNSS,
+physical flash size, and rail drive/release.
+
+Reads that identify **nothing** — the T-Deck's touch, RTC and GNSS, the Nibble
+Zero's environmental sensor — sit behind `DETECT_EXTRAS`, which only the detector
+defines. They are there for the trace a person reads, and they are not free: the
+GNSS autobaud listens 1.2 s per rate, and the firmware runs this on every boot to
+answer a question the anchor and the radio have already settled. Everything is a bus read or a
+scratch write the real firmware overwrites at init; nothing writes flash. Where a
+part has no ID register (keyboard, RTC, OLED) a probe reports a bare ACK rather
+than claiming a chip it cannot confirm.
+
+I2C is the `i2c_master` driver, never the legacy `driver/i2c.h`: the legacy one
+latches a process-wide flag that makes every later `i2c_new_master_bus` fail, so
+a single probe on the old API would take down the keyboard, touch, RTC and codec
+of the firmware that ran it.
+
+Two things shape a probe. First, the **physical flash size** (SFDP), which rules
+a board out before a single pin is touched — 16 MB -> tdeck/heltec, 8 MB ->
+xiao-sense, 4 MB -> t3s3/nibble; the xiao-sx1262 accepts **8 or 16 MB**, since
+the Wio-SX1262 fits both the base XIAO and the Plus. (PSRAM size would split the
+16 MB pair, but a RAM-loaded detector cannot init PSRAM — octal vs quad is
+build-fixed — so the anchor settles those instead.) Second, the **anchor**: one
+mandatory peripheral on that board's pins, confirmed by the radio. Where the
+radio splits a board line it is also what names the straddle, so
+`hw-lilygo-t3s3-sx1262` answers for an SX1262 and stays silent for an LR1121 on
+the same PCB — which is exactly the mismatch the firmware check exists to catch.
 
 The model to copy for a real *identification* is the **T-Deck GPS**: the Plus
 ships one of two GNSS receivers with nothing host-visible to tell them apart, so
-`hw-lilygo-tdeck/docs/gps.md` autobauds (38400 → u-blox MIA-M10Q, 9600 → Quectel L76K)
-and infers the chip from the baud that produced the first checksum-valid NMEA
-sentence. Most peripherals are easier — an I²C ACK plus a chip-ID register read —
-but the principle is the same: probe, then confirm with a value only that part
-returns.
+`hw-lilygo-tdeck/docs/gps.md` autobauds (38400 -> u-blox MIA-M10Q, 9600 ->
+Quectel L76K) and infers the chip from the baud that produced the first
+checksum-valid NMEA sentence. Most peripherals are easier — an I2C ACK plus a
+chip-ID register read — but the principle is the same: probe, then confirm with a
+value only that part returns.
 
-All six boards are **ESP32-S3**. Nothing below is destructive: every check is a
-bus read (or, for the radios, a register write/read-back on the radio's own
-scratch registers), and it can run from RAM without flashing (see the esp-idf
-README).
+## Ordering is a safety property
 
-**Probe ordering is a safety property.** Boards identifiable by passive bus reads
-alone (nibble, t3s3, seeed, xiao) are probed before boards whose probe drives
-power-enable / reset GPIOs (heltec Vext GPIO36 + reset GPIO21, then tdeck rail
-GPIO10). Since probing stops at the first hit, a read-only board is identified
-before any rail-driving probe pokes a pin that means something else on it; each
-rail-driving probe also restores the pins it drove to hi-Z on exit. When adding a
-board whose probe drives GPIOs, place it after any board those drives could
-disturb.
+**The fragile boards come first.** A board identifiable by passive bus reads
+alone (nibble, t3s3, xiao-sense, xiao-sx1262) is settled before any probe that
+DRIVES a power-enable or reset GPIO (heltec Vext GPIO36 + reset GPIO21, then
+tdeck rail GPIO10) — because that pin means something else entirely on the board
+it is not looking at. Since the run stops at the first hit, a passively-read
+board is identified before a rail-driving probe ever touches it.
+
+A probe that drives a rail **releases it when it fails, and leaves it when it
+succeeds**. Both are right in both callers: on the board this actually is, the
+firmware wants the rail exactly as the probe left it (and the board's own
+`onStart` drove it already), and the detector is hard-reset into real firmware the
+moment the run ends. On the board it was not looking at, the release is what makes
+the next probe safe.
+
+When adding a board whose probe drives GPIOs, place it after any board those
+drives could disturb.
+
+## On the wire
+
+The detector emits two kinds of line, and flashmon keeps both:
+
+    DETECT: DETECTED: hw-lilygo-tdeck        the result, printed for the parser
+    I (1234) detect: hw_lilygo_tdeck found   the trace, ordinary ESP-IDF logging
+
+Everything a probe learns on the way is logged at **debug** under the tag
+`detect`; the single line saying which board this is, is **info**. The detector
+raises that tag to debug for its own run, so the whole trace is captured. The
+same lines appear on a real boot after `log tag detect debug`.
+
+All six boards are **ESP32-S3**.
 
 ## Boards at a glance
 

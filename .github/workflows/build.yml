@@ -1,11 +1,20 @@
 name: Build firmware images
 
-# Manually triggered: builds every entry in flashmon/flashmon.yaml and uploads
-# the resulting flashmon/builds/*.zip as a downloadable artifact. The zips are
-# gitignored build artifacts, so they are NOT committed back to the repo — deploy
-# them alongside the page from this artifact (or run `make` locally).
+# Manually triggered: builds a catalogue and uploads the resulting images as a
+# downloadable artifact. Nothing is committed back — deploy the artifact's
+# contents as the `builds/<catalogue>/` directory beside the page (or run
+# `spangap make-builds` locally).
+#
+# The catalogue config is supplied at dispatch time rather than read from the
+# repo: flashmon ships no committed config, because it is a generic installer and
+# the catalogue belongs to whoever deploys it.
 on:
   workflow_dispatch:
+    inputs:
+      catalogue:
+        description: 'builds.yaml contents (project, url, builds[])'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -32,19 +41,25 @@ jobs:
           chmod +x "$HOME/.local/bin/spangap"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build all images
+      - name: Build the catalogue
+        env:
+          CATALOGUE: ${{ inputs.catalogue }}
         run: |
           set -eu
-          # Turn the checkout's parent into a spangap workspace, then build the
-          # catalogue. `make images` runs make-builds.py, which reads
-          # flashmon/flashmon.yaml and writes each flasher.zip to
-          # flashmon/flashmon/builds/<slug>_<name>_<datetime>.zip.
+          # Turn the checkout's parent into a spangap workspace, drop the
+          # catalogue in beside the straddles, and build it. make-builds writes
+          # the images plus the index.html + timestamp the page reads.
           spangap init "$GITHUB_WORKSPACE/ws"
-          make -C "$GITHUB_WORKSPACE/ws/flashmon/flashmon/builds" images
+          mkdir -p "$GITHUB_WORKSPACE/ws/builds/stable"
+          printf '%s\n' "$CATALOGUE" > "$GITHUB_WORKSPACE/ws/builds/stable/builds.yaml"
+          cd "$GITHUB_WORKSPACE/ws/builds/stable" && spangap make-builds
 
       - name: Upload images
         uses: actions/upload-artifact@v4
         with:
           name: firmware-images
-          path: ws/flashmon/flashmon/builds/*.zip
+          path: |
+            ws/builds/stable/*.zip
+            ws/builds/stable/index.html
+            ws/builds/stable/timestamp
           if-no-files-found: error

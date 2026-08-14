@@ -2,51 +2,68 @@
 
 A tiny, static, browser-based firmware **flasher + serial monitor** for spangap
 devices. Point a Chromium browser at it, plug in a device over USB, and it drops
-into an interactive serial monitor without touching the device; one button then
-identifies the board and offers the right firmware image to flash — no install,
-no toolchain.
+into an interactive serial monitor without touching the device, asks it which
+board it is, and offers the right firmware image to flash — no install, no
+toolchain.
 
-It brands itself from a config file (`flashmon/flashmon.yaml`), so a deployment
-reads as its own product (e.g. **Reticulous**) rather than "flashmon".
+It brands itself from the catalogue it serves (`builds/<catalogue>/builds.yaml`),
+so a deployment reads as its own product (e.g. **Reticulous**) rather than
+"flashmon".
 
 ## Layout
 
+The page and the images it offers are **two sibling directories**, and the page
+reaches the catalogue at the relative `../builds/<catalogue>/`. That holds in a
+deployment and under `spangap dev` alike, so there is no base URL to configure.
+
 ```
-flashmon/                     ← this repo
-  flashmon/                   ← everything served to the browser (the web root)
-    index.html
-    flashmon.js
-    flashmon.py               ← single-file terminal flasher (for non-browser users)
-    <project>-flashmon        ← branded copy of flashmon.py `make` writes: deployment
-                                URL baked in (gitignored generated artifact)
-    flashmon.yaml.example     ← template config (checked in); copy → flashmon.yaml
-    flashmon.yaml             ← your config: project brand + catalogue (gitignored)
-    detect/spangap_detect.bin ← the peripheral detector (checked in)
-    devices/                  ← board photos for the device box (optional)
-    vendor/                   ← esptool-js, JSZip, xterm.js (no runtime CDN)
-    builds/
-      Makefile                ← `make` builds every image in flashmon.yaml
-      hw-<board>.zip          ← one ready-to-flash image per supported board
-      generic.zip             ← fallback image for any board without its own
-  esp-idf/                    ← source of the detector (NOT served)
-    Makefile                  ← `make` builds + stages ../flashmon/detect/…
-    main/detect.c, …
-  docs/detect.md              ← how each peripheral is identified (NOT served)
-  docs/serial.md              ← how the monitor session survives the device
-                                re-enumerating or moving its console (NOT served)
-  docs/fnb58.md               ← how the FNB58 current graph works (NOT served)
+<workspace>/
+  flashmon/                     ← this repo
+    builds.yaml.example         ← template catalogue config (checked in)
+    flashmon/                   ← everything served to the browser (the web root)
+      index.html
+      flashmon.js
+      flashmon.py               ← single-file terminal flasher (for non-browser users)
+      <project>-flashmon        ← branded copy of flashmon.py (gitignored artifact)
+      detect/spangap_detect.bin ← the peripheral detector (checked in)
+      devices/                  ← board photos for the device window (optional)
+      vendor/                   ← esptool-js, JSZip, xterm.js (no runtime CDN)
+    esp-idf/                    ← source of the detector (NOT served)
+      Makefile                  ← `make` builds + stages ../flashmon/detect/…
+      main/detect.c, …
+    docs/detect.md              ← how each peripheral is identified (NOT served)
+    docs/serial.md              ← how the monitor session survives the device
+                                  re-enumerating or moving its console (NOT served)
+    docs/fnb58.md               ← how the FNB58 current graph works (NOT served)
+  builds/                       ← the catalogues (untracked; `spangap make-builds`)
+    index.html                  ← the catalogues, minus any marked `.unlisted`;
+                                  the Build selector's options
+    stable/                     ← the catalogue in force until something names
+                                  another; see "Which catalogue" below
+      builds.yaml               ← the brand + what to compile
+      index.html                ← the images that exist, and at which stamp
+      timestamp                 ← the newest stamp here; polled by the page
+      <slug>_<board>_<stamp>.zip
+      <slug>_generic_<stamp>.zip  ← fallback for a board without its own image
 ```
 
-Serve the **`flashmon/`** subdirectory (the web root) from anywhere static —
-GitHub Pages, an S3 bucket, `python3 -m http.server`, the device's own web
+Serve **`flashmon/flashmon/`** and **`builds/`** as siblings from anywhere static
+— GitHub Pages, an S3 bucket, `python3 -m http.server`, the device's own web
 server. Web Serial needs a **secure context**, so serve over HTTPS (or
 `http://localhost`).
 
-Deploying is just copying that whole web root to the server (e.g. `rsync` the
-`flashmon/flashmon/` directory) — so the **gitignored generated artifacts** ride
-along and get served even though they aren't tracked: the branded
-`<project>-flashmon` script, `builds/*.zip`, and `offline-installer/`. Run a full
-`make` (below) before deploying so they're present.
+`<host>/flashmon` works with or without the trailing slash. Without it the
+document's base is the parent directory, which would send every relative URL in
+the page one level too high; most servers redirect a directory URL onto its slash
+and settle it, and the page pins its own base for the servers that don't.
+
+Deploying is copying both directories to the server (e.g. `rsync` them) — so the
+**untracked generated artifacts** ride along and get served even though they
+aren't tracked: the whole `builds/` tree, and the branded `<project>-flashmon`
+script. Run `spangap make-builds` (below) before deploying so they're present.
+
+Under `spangap dev` neither is copied anywhere: the dev server mounts both
+straight out of the workspace, at the same two paths.
 
 ## What it does when you connect
 
@@ -54,60 +71,139 @@ The page shows its title (**`<project> Flasher`**) and goes straight to the
 serial port picker on your first click/keypress (the browser only lets the
 chooser open in response to a user gesture; it never silently reuses a
 remembered device). Once you pick a device it opens the port, shows the **serial
-monitor**, and immediately **resets the device and identifies it** — the same
-detection run the *Detect Hardware* button performs, described below. What it
-found is then shown in the **device box** over the terminal: the board and its
-photo, the chip facts, the peripherals, where the device keeps its own data, and
-which firmware it is running. **OK** dismisses it and leaves the monitor in its
-normal state — including the green *Flash* button, if the catalogue has something
-newer than what the device already runs.
+monitor** — and the device **says which board it is**, unasked.
 
-Add **`?noreset`** to the URL to keep the device untouched: the port is opened
-and the monitor watches, the device is not probed and not reset, whatever it is
-doing keeps running, and identifying the board waits for the button (or for the
-boot log to say it). Reach for it when the device is doing something you don't
-want interrupted.
+```
+browser -> device   <CR>                        (the console sync it already sends)
+device  -> browser  Spangap console on serial jtag. Start typing to enter CLI
+device  -> browser  build: hw hw-lilygo-tdeck
+device  -> browser  build: catalogue stable
+device  -> browser  build: datetime 20260814130700
+```
 
-Everything past that is board-specific, so it waits until the board is known. The
-board is identified either way round:
+That is the whole identification, and nothing was interrogated to get it.
+Opening the port already sends the console a bare CR — that is how flashmon
+confirms the port it opened is the console at all — and spangap answers it by
+restating who it is: the same three lines it printed at boot. flashmon's ordinary
+log parser reads them.
 
-- **From the log, for free.** spangap-core logs `build: invocation spangap build
-  … --with spangap/hw-<board>` on boot — the `spangap build` command the running
-  image was compiled with. The `hw-<board>` in it names the board, so a device
-  that boots (or is reset) while the monitor is open identifies itself with no
-  probe at all.
-- **From the hardware.** This is the run that fires on connect, and a green
-  **Detect Hardware** button repeats it on demand — it sits where the flash
-  button goes (left of *Open Device UI* and *Reset*), and appears whenever the
-  board is still unknown (after a `?noreset` connect, or a run that found
-  nothing). It **probes** the chip over the ROM loader (esptool-js — chip, revision, features,
-  flash size), **RAM-loads the peripheral detector**
-  (`detect/spangap_detect.bin`) into SRAM and jumps to it (**no flash write**),
-  captures its one-shot findings into the cyan banner (which board, which
-  peripherals), then **resets** the device back into its real firmware. See
-  [`esp-idf/`](esp-idf) and [`docs/detect.md`](docs/detect.md). This reads the
-  actual hardware, so it outranks the log's claim about the image.
+The board in `build: hw` is not a claim about the image. It is what the board
+straddle's own `detect_hw()` read off the hardware at the top of that boot,
+checked against the board the image was built for — spangap halts rather than run
+on a board it does not recognise (see [`docs/detect.md`](docs/detect.md)). So it
+is exactly what a detection run would find, arriving for free.
 
-Once the board is known, that same green slot turns into **Flash `<project>` to
-`<board>`** if the catalogue holds a newer image for it. Pressing it downloads
-that image behind a progress box over the terminal (bytes fetched of the
-`Content-Length`, then the unpack), unzips it in the browser (JSZip), flashes
-every image at its offset over Web Serial, then reopens the monitor and resets
-into the freshly-flashed firmware. The download happens with the monitor still up
-and the device still running, so a fetch that fails costs the session nothing.
+**Why the device volunteers it rather than answering a query.** A boot happens
+once and almost nobody watches it. A device that announced itself only then, to
+an empty room, forced every tool that turned up later to interrogate it — over a
+side-channel that has to be probed for, may not be armed, and cannot be relied on
+in the moment a port opens. Saying it again to whoever shows up costs three lines
+and removes that channel entirely.
+
+Only a device that says **nothing** gets probed: firmware too old to answer a CR
+with its identity, or none at all. Then the connect falls back to the detection
+run below.
+
+What is known either way is shown in the **device window** over the terminal: the
+board and its photo, where the device keeps its own data, which firmware it is
+running, and what the catalogue has for it — plus the chip facts and peripherals
+when a detection run read them. The catalogue part arrives a few seconds later
+with the device's build stamp, and the window repaints around it; the flash is
+offered **in the same window**, under the facts it follows from.
+
+Tick **No reset** in the settings panel (the gear, top right) to stop before the
+fallback probe: the port is opened, the monitor watches, the device is asked
+(which costs it nothing) and never reset. Reach for it when the device is doing
+something you don't want interrupted.
+
+### Reading the board off the chip
+
+**Detect hardware**, in the settings panel, is the run for a device that cannot
+answer for itself. It **probes** the chip over the ROM loader (esptool-js — chip,
+revision, features, flash size), **RAM-loads the detector**
+(`detect/spangap_detect.bin`) into SRAM and jumps to it (**no flash write**),
+captures which board and which peripherals it found, then **resets** the device
+back into its real firmware. The detector is every board straddle's own
+`detect_hw()`, copied in and run in turn — the same function the firmware uses to
+confirm itself. See [`esp-idf/`](esp-idf) and [`docs/detect.md`](docs/detect.md).
+
+It also reports the device's **state partition**, which the firmware never states
+and which the flash-overlap warning below needs.
+
+Once the board is known, whatever the catalogue holds for it is **offered in the
+device window**, and that window is the only place a flash is started from —
+there is no flash button parked at the top of the screen. The facts already on
+it *are* the decision (which board, which image, which catalogue, the stamp it
+runs against the stamp on offer), so the offer is a green **Flash** under them
+rather than a second dialog restating them.
+
+An image that is **not** an upgrade is offered too, since a re-flash of what is
+already there — or a step back to an older build, or a switch to another
+catalogue — is a thing you do on a bench. It just says so: an amber warning names
+which of the two it is (same build, or older than what runs), and the button
+reads **Flash anyway**.
+
+The window opens **once per published image**: when a connect settles, and again
+when a build lands while the page is open — that second one with whatever facts
+are to hand, which after a *No reset* connect is the board and stamp off the boot
+log and no chip probe. If it is already up when the offer resolves, nothing
+moves: the button simply appears under what you are reading. *Not now* is a full
+answer until the next image. With **Auto-flash** ticked in the settings panel a
+**newer** image doesn't wait to be asked about at all — it starts flashing
+itself, once per image, which is what makes a tab left open on a bench keep a
+board current.
+Auto-flash never fires on an image that isn't newer; walking a device backwards
+is always a deliberate click.
+
+Going ahead downloads that image behind a progress box over the terminal (bytes
+fetched of the `Content-Length`, then the unpack), unzips it in the browser
+(JSZip), flashes every image at its offset over Web Serial, then reopens the
+monitor and resets into the freshly-flashed firmware. The download happens with
+the monitor still up and the device still running, so a fetch that fails costs
+the session nothing.
+
+### Which catalogue
+
+Images come from one catalogue at a time, and four things get a say — each
+outranking the one before it:
+
+1. **`stable`**, when nothing else has anything to say.
+2. **The attached device.** spangap-core logs `build: catalogue <name>` on boot —
+   the catalogue the running image was published from (`sys.build.catalogue`,
+   baked in by `spangap make-builds`). The page moves there, so a board flashed
+   from `dev` is compared against `dev` and not against a `stable` series it has
+   nothing to do with. Stamps from two catalogues are unrelated numbers, so an
+   image from a catalogue the device didn't come from is always offered, never
+   called "newer".
+3. **`?build=<name>`** in the URL, which pins the choice for that load.
+4. **The Build selector** in the settings panel. Its options are the catalogues
+   `builds/index.html` lists, plus the one in force and the one the device named
+   — either can be `.unlisted`. **- other -** takes a name that is served but
+   listed nowhere. Picking one pins it: the next device's own catalogue no longer
+   moves the page.
+
+Switching catalogue re-reads everything, re-brands the page from the new
+catalogue's `project:`, and offers what the new catalogue holds for the attached
+board.
 
 ### How an image is matched
 
 The board is named `hw-<straddle>` (e.g. `hw-lilygo-tdeck`) whichever way it was
-identified. The button looks for `builds/hw-<straddle>.zip`, trying successively
-shorter prefixes (so an unlisted `hw-foo-bar-baz` falls back to a listed
-`hw-foo-bar` image), and finally `builds/generic.zip`. If none is published, or
-the published image is no newer than the running firmware's build stamp, no flash
-button appears — you still get the monitor.
+identified. The catalogue's `index.html` says which images exist and at which
+stamp, so the page looks up `hw-<straddle>` there, trying successively shorter
+prefixes (so an unlisted `hw-foo-bar-baz` falls back to a listed `hw-foo-bar`
+image), and finally `generic`. If none is published there is nothing to offer —
+you still get the monitor.
+
+The catalogue is re-read while the page is open: every 15 s it fetches
+`timestamp` (one small request), and only when that value moves does it re-read
+`index.html` and re-evaluate the offer. So an image published from a build run
+next to it is picked up within seconds, with no reload and no polling of anything
+large.
 
 ### When flashing would erase the device's data
 
-A **Detect Hardware** run also reports the device's `state` partition — the
+A **Detect hardware** run also reports the device's `state` partition — the
 LittleFS store holding its settings, keys and files (see
 [`docs/detect.md`](docs/detect.md)). Before writing anything, the flash compares
 the image's own offsets against it: flash erases in 4 KB sectors, so an image is
@@ -144,19 +240,38 @@ A fullscreen xterm.js terminal, fully interactive — keystrokes are sent to the
 device, so its serial line switches to the interactive CLI. Controls float over
 it:
 
-- **Detect Hardware** (green, left) — identify the board (see above). Shown while
-  the board is unknown; it costs the device a reset.
-- **Flash `<project>` to `<board>`** (green, same slot) — flash the matched image
-  (see above). Replaces *Detect Hardware* once the board is known and a newer
-  image is available for it.
 - **Open Device UI** (blue) — appears once the device reports it joined WiFi;
   opens `<hostname>.local` (then the IP) in a new tab.
-- **Reset** (red, top-right) — hard-resets the attached device on demand.
-- **Line settings** (bottom-right, e.g. `115200 N 8 1`) — click to change baud,
-  data bits, parity, and stop bits; the port re-opens with the new settings and
-  the terminal buffer is kept. Defaults to 115200 N 8 1 (`?monitor_baud=<n>`
-  sets the initial baud).
-- **FNB58 current graph** (bottom-right, above the line settings) — if you have a
+- **Reset** (red) — hard-resets the attached device on demand.
+
+Neither flashing nor identifying is among them. The flash is offered in the
+device window (above), beside the stamps the decision rests on; identifying is a
+settings-panel action, because a running device answers for free and the run is
+only for the ones that cannot.
+
+Everything else lives behind the **gear** (top right, a white-on-black button the
+same height as the ones beside it, on screen from the first paint — these matter
+before a port is picked as much as during a session):
+
+- **Re-select port** — for a board that came back as a *different* port to the
+  browser. Always there; nothing has to go wrong for it to appear.
+- **Detect hardware** — reset the device and read the board off the chip
+  (above). Disabled with no port to run it on, and for the length of a run.
+- **Build** — which catalogue images come from (see *Which catalogue* above).
+  Not stored by *Set as defaults*: it follows the attached device until you pick
+  one, and a pick holds for the rest of the session.
+- **Line settings** (baud, data bits, parity, stop bits) — *Apply* re-opens the
+  port with them and keeps the terminal buffer. Defaults to 115200 N 8 1
+  (`?monitor_baud=<n>` sets the initial baud). Hidden entirely when the port is
+  the chip's own USB (vendor `0x303A` — USB-Serial-JTAG or a native CDC
+  console), where the console rides USB packets and the line rate is a number
+  nobody reads.
+- **No reset** — open the monitor without resetting or identifying (above).
+- **Auto-flash** — flash a newer image for the attached board as soon as one is
+  published, without asking in the device window (above). Newer only.
+- **Set as defaults** — store the panel's current state, so the page loads with
+  it next time. Until it's pressed, a change applies to this tab only.
+- **FNB58 current graph** — if you have a
   FNIRSI FNB58/FNB48 USB power meter inline on the device's power, click to graph
   its current draw live across the top of the monitor. It rides **WebHID**
   alongside the serial monitor in the same tab. A row of pills picks the visible
@@ -217,7 +332,10 @@ into the same scrollback. **A port going away never pops a dialog** — ports go
 away on every reset and almost always come straight back, so interrupting you
 would be wrong far more often than right.
 
-Two things end an outage differently:
+An outage has no timeout, either: the loop holds the port and its grant and keeps
+retrying, quietly, for as long as it takes. A board can sit unpowered for an
+afternoon and still be the same board when it comes back. One thing ends an
+outage differently:
 
 - The device **says** it is moving its console (`usb cdc` / `usb jtag`, which
   swap it between two different USB devices). That is the one departure known
@@ -227,10 +345,11 @@ Two things end an outage differently:
   filtered to the new device's two ports. Take the **first**; that is the
   console. So you are asked on the first move only; every one after that is
   free, in both directions.
-- Half a minute of nothing at all, usually because the board was unplugged and
-  replugged and is now a *different* port to the browser. An amber **Re-select
-  port** button appears in the monitor and waits — no modal, and the loop keeps
-  trying the old port in the background in case it simply comes back.
+
+The one thing the loop cannot solve on its own is a board that returns as a
+*different* port object — nothing about it says it is the same board. **Re-select
+port**, in the settings panel, is the answer, and it is on screen the whole time
+rather than being announced after some interval that would only ever be a guess.
 
 See [`docs/serial.md`](docs/serial.md) for the full mechanism and the notice
 vocabulary.
@@ -247,9 +366,17 @@ is open, the hostname in the monitor's title bar is what identifies the board.
 
 For people who can't run a Chromium browser, `flashmon.py` does the same flow
 from a plain terminal: pick a port, probe the chip, RAM-load the detector, flash
-the matching image, then open a full-screen serial monitor. It reads the same
-`flashmon.yaml` + `builds/` + `detect/` the browser does — either from a served
-deployment or from a local flashmon folder:
+the matching image, then open a full-screen serial monitor.
+
+> `flashmon.py` still expects the catalogue inside the web root
+> (`flashmon.yaml` + `builds/`) and reads `flasher_args.json` out of an image
+> zip. Both moved — the catalogue to `../builds/<catalogue>/`, the flashing
+> instructions to the `<project>.esptool` argfile in the zip — so it needs its
+> own pass before it works against a current deployment. The browser flasher is
+> unaffected.
+
+It reads the same config + images + `detect/` the browser does — either from a
+served deployment or from a local flashmon folder:
 
 ```sh
 ./flashmon.py --url https://<host>/flashmon/   # a served deployment
@@ -284,7 +411,7 @@ web-UI address — F8 opens the default `<project>.local` rather than its real
 hostname, until it is flashed and reboots. Nothing is inferred from log text, so
 nothing can be inferred wrongly.
 
-`make` also writes a **branded** copy of it next to it, named for the project —
+`flashmon.py make-brand` writes a **branded** copy of it next to it, named for the project —
 `<project>-flashmon` (e.g. `reticulous-flashmon`). It's the identical script with
 the deployment's `url:` baked into its `PROJECT_URL`, so a downloaded copy runs
 with **no arguments** and already knows where to fetch its config and images.
@@ -293,82 +420,105 @@ entry point inside the offline `<project>-flashmon.zip` bundle (where it finds i
 config/images/tool-wheels alongside itself and runs fully offline). Like the
 images, it's a gitignored generated artifact (`*-flashmon`), not tracked source.
 
-## Configuration — `flashmon/flashmon.yaml`
+## Configuration — `builds/<catalogue>/builds.yaml`
 
 flashmon is a **generic installer**: it ships no committed config, so anyone can
-run it and brand it as their own. To make it yours, copy the template and edit
-it — every `.yaml` here is **gitignored**, so your config never lands upstream:
+run it and brand it as their own. Its config lives with the images it describes,
+in the untracked `builds/` tree beside this repo — so your config and your
+catalogue travel together, and neither lands upstream:
 
 ```sh
-cp flashmon/flashmon.yaml.example flashmon/flashmon.yaml   # then edit it
+mkdir -p ../builds/stable
+cp builds.yaml.example ../builds/stable/builds.yaml   # then edit it
 ```
+
+`stable` is the catalogue the page starts on; a device's own
+`build: catalogue`, `?build=<name>` and the panel's Build selector each move it
+(see *Which catalogue* above), which is how a bleeding-edge or
+customer-specific catalogue sits beside the public one on one deployment. A
+catalogue directory holding a file named `.unlisted` still builds and is still
+reachable by name — it is only left out of `builds/index.html`, and so out of the
+selector's list until a device or a hand names it.
 
 The page fetches it at boot; it sets the **brand** and the **catalogue**:
 
 ```yaml
-project: Reticulous              # shown in the title, the flash button, the
+project: Reticulous              # shown in the title, the flash offer, the
                                  # default device hostname
 builds:
   - name: hw-lilygo-tdeck        # matched against the detected hw-<straddle>
-    image: devices/hw-lilygo-tdeck.jpg   # optional: photo for the device box
+    image: devices/hw-lilygo-tdeck.jpg   # optional: photo for the device window
     invocation: reticulous/reticulous --with spangap/hw-lilygo-tdeck
   - name: generic                # fallback for any board without its own image
     invocation: reticulous/reticulous
 ```
 
 Each entry names an image and gives the `spangap build` invocation that produces
-it. A `flashmon/flashmon.local.yaml` (also gitignored) is preferred over
-`flashmon.yaml` when present, for a per-machine override without touching your
-own file.
+it.
 
-`image:` is the board's **photo**, shown in the device box when a detection run
+`image:` is the board's **photo**, shown in the device window when a detection run
 identifies that board — a path in the web root (`devices/<board>.jpg` by
 convention; see [`flashmon/devices/`](flashmon/devices)), never a remote URL,
 since nothing here loads from a CDN. It is optional both ways: an entry without
 one, a board with no catalogue entry at all, or a file that 404s just leaves the
 box text-only.
 
-`make` fills in three more fields per entry, which you never hand-edit:
-`version:` (the run stamp), `flash_floor_kb:` (the minimum chip size the image
-needs) and `image_bytes:` (what it writes). The entry's `name:` is also its
-**distribution identity** — the device reports it back as `sys.build.dist`, so a
-re-flash offer means "same dist, newer stamp". That is why identity lives in
-`name` and ordering in `version`: `name` is free-format, so a board can have
-several entries differing in what is left out to fit its flash, while `version`
-is a sortable stamp that answers whether something newer exists. The floor is
-what lets flashmon say an image won't fit a board *before* downloading it.
+Nothing writes this file — it is entirely hand-written. What was built, and when,
+is in the `index.html` beside it: the images are named
+`<slug>_<name>_<stamp>.zip`, so the listing carries both the identity and the
+ordering. The entry's `name:` is the image's **distribution identity** — the
+device reports it back as `sys.build.dist`, so a re-flash offer means "same dist,
+newer stamp". That is why identity lives in `name` and ordering in the stamp:
+`name` is free-format, so a board can have several entries differing in what is
+left out to fit its flash, while the stamp answers whether something newer
+exists.
 
-## Producing the images — `flashmon/builds/`
+## Producing the images — `spangap make-builds`
 
 From inside the spangap workspace this repo is checked out in:
 
 ```sh
-cd flashmon/builds && make                             # every image + branded script + offline bundle
-cd flashmon/builds && make images                      # every image, no bundle
-cd flashmon/builds && make images BUILD=hw-lilygo-tdeck # rebuild just one image (an image name)
+cd ../builds/stable && spangap make-builds                  # every image in this catalogue
+cd ../builds/stable && spangap make-builds hw-lilygo-tdeck  # rebuild just this one
+cd ../builds && spangap make-builds                         # every catalogue in the tree
 ```
 
-`make` runs `make-builds.py` (a directory up), which builds each catalogue entry
-in the spangap container via `spangap build` (no local ESP-IDF needed), writes each
-`flasher.zip` to `builds/<slug>_<name>_<datetime>.zip`, and records that datetime as
-the entry's `version:` in `flashmon.yaml` — so the flasher fetches exactly what's on
-disk, and a subset rebuild re-stamps only the images it rebuilt. It also exports
-the entry's name as `SPANGAP_BUILD_DIST` (which the image reports back as
-`sys.build.dist`) and records the fit numbers `flash_floor_kb:` and
-`image_bytes:`, read out of the `sdkconfig` and `flasher.zip` that build just
-produced — no `spangap build` change, just a read of config the build already
-wrote. The offline bundle
-covers the whole catalogue, so it only comes from a full `make` (a `BUILD=` subset is
-refused). The zips are **gitignored build artifacts** (only `builds/Makefile` is
-tracked) — produce them here before you serve or deploy the page (see the CI
-workflow, which builds them and uploads them as a downloadable artifact).
+It builds each entry in the spangap container via `spangap build` (no local
+ESP-IDF needed) and writes each `flasher.zip` to
+`<slug>_<name>_<datetime>.zip` in the catalogue directory. Every image of one run
+shares that datetime. Two more things go into the build and come back out of the
+running device: the entry's name as `SPANGAP_BUILD_DIST` (reported as
+`sys.build.dist`) and the catalogue directory's own name as
+`SPANGAP_BUILD_CATALOGUE` (reported as `sys.build.catalogue`, and logged on boot
+as `build: catalogue <name>`). That second one is how a device tells the flasher
+which catalogue it came from, and so which listing its stamp belongs to.
 
-`make` also packages a self-contained **offline installer** — the flasher, images and
-flashing tools bundled into one cross-platform zip (for people who can't use a
-Chromium browser) — into `offline-installer/`, alongside a small `index.html` that
-offers it for download. `make-zip` rebuilds that directory each run and swaps it in
-wholesale, so only the latest bundle is kept; serve it at `/offline-installer/`. It's
-a gitignored build artifact.
+Each entry it builds also loses its **older images** — same entry, same
+catalogue, earlier stamp. One entry in one catalogue means one image, since the
+page only ever offers the newest per name, so the rest are bytes you `rsync` to
+the server for nobody. Entries a run didn't build keep theirs.
+
+Two files beside the images are rewritten from what is actually on disk, so a
+subset rebuild leaves the images it didn't touch listed exactly as they were:
+
+- **`index.html`** — the listing, and the record of which images exist at which
+  stamp. It is what the page reads to decide what to offer, and what a browser
+  renders if you point one at the directory.
+- **`timestamp`** — the newest stamp present, so the page can poll one tiny file
+  instead of re-reading the listing every 15 s.
+
+A run in the tree above the catalogues does every one of them, `.unlisted`
+included, then rewrites `builds/index.html`. The first failing build ends the
+run: the images built before it keep their fresh stamp, the listing still matches
+what is on disk, and the exit status is non-zero.
+
+`spangap make-builds` runs on the **host** rather than in the container, because
+each image is a `spangap build` and those clone missing dependencies with the
+host's git credentials.
+
+Everything it writes is untracked — produce it before you serve or deploy the
+page (see the CI workflow, which builds the images and uploads them as a
+downloadable artifact).
 
 ## Producing the detector — `esp-idf/`
 

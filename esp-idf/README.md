@@ -1,49 +1,57 @@
-# spangap peripheral-detection binary
+# spangap board-detection binary
 
-A tiny ESP32-S3 app that probes the `hw-*` boards one at a time and stops at the
-first it can identify. Every intentional line is prefixed with **`DETECT: `** (a
-whitelist — flashmon keeps only those and strips the prefix, so boot chatter
-and IDF logs are ignored). Each peripheral it finds prints a plain,
-board-agnostic line; the identified board prints a `DETECTED: hw-<straddle>`:
+A tiny ESP32-S3 app that runs every board straddle's own `detect_hw()` in turn
+and stops at the first that answers. It is uploaded into SRAM by the flasher —
+nothing is written to flash — and used only where a device cannot say for itself
+which board it is (see [`../docs/detect.md`](../docs/detect.md)).
+
+It emits two kinds of line, and flashmon keeps both:
 
 ```
-DETECT: I2C(18/8): ack at 0x55
-DETECT: SPI(sck40/mosi41/miso38/cs9): SX126x LoRa (SX1262/68)
-DETECT: I2C(18/8): GT911 touch at 0x5D
-DETECT: UART(rx44): u-blox MIA-M10Q GPS at 38400
+D (0812) detect: flash 16 MB, want 4 MB: no
+D (0813) detect: flash 16 MB, want 16 MB: yes
+D (0910) detect: i2c: 0x55 acks
+D (0940) detect: spi(sck40/mosi41/miso38/cs9): radio sx1262
+D (0980) detect: i2c(18/8): GT911 touch present
+D (2200) detect: uart(rx44): u-blox MIA-M10Q GPS at 38400
+I (2201) detect: hw_lilygo_tdeck found
 DETECT: DETECTED: hw-lilygo-tdeck
 DETECT:
 DETECT: DETECTED: spangap state partition at 0x800000 size 0x800000
 DETECT: SPANGAP-DETECT-END
 ```
 
-The `DETECTED: hw-<straddle>` line carries **only the straddle name** — where the
-radio splits a board line it's in the name (`hw-lilygo-t3s3-sx1262`,
-`hw-lilygo-t3s3-sx1280`, …); everything that doesn't affect straddle choice
-(touch, GPS type, BME280) stays on the peripheral lines above, never in brackets.
-
-The pin maps and the chip-ID values behind each check are in
-[`../docs/detect.md`](../docs/detect.md) — keep the two in sync.
+- **`I`/`D (…) detect: …`** — ordinary ESP-IDF logging under the tag `detect`.
+  This is the probe trace, and it is the *same code path* the firmware logs on a
+  real boot: everything a probe learns is debug, and the one line naming the
+  board it found is info. `app_main` raises the tag to debug for its own run.
+- **`DETECT: …`** — the results, printed deliberately for flashmon's parser: the
+  board that was settled on, the spangap state partition, and the
+  `SPANGAP-DETECT-END` sentinel. Anything else on the wire (IDF boot chatter) is
+  dropped.
 
 ## How it's structured
 
-`main/detect.c` has two layers:
+`main/detect.c` is **copies**. Each board straddle owns exactly one function —
 
-- **Peripheral detectors** — each takes explicit **pin numbers** and reports only
-  what it found, never a board name (`det_gt911`, `det_es7210`, `det_bme280`,
-  `det_ov2640`, `det_radio`, `det_gps`, and `det_ack` for the ACK-only parts —
-  keyboard, RTC, OLED — which print a bare `ack at 0x<addr>` rather than guessing
-  the chip). Passing pins is what makes them reusable across boards.
-- **Board probes** — `probe_hw_<straddle>()`. Each powers its board's rail (if
-  any), checks a mandatory **anchor** peripheral on that board's pins (bail if
-  absent), **confirms** with the radio, reads the optional extras, and prints
-  `DETECTED: hw-<straddle> (…extras…)`. The board identifier is always the
-  straddle name.
+    hw-<board>/esp-idf/src/detect.cpp  ->  const char *detect_hw(void)
 
-`app_main()` reads the physical flash size once (SFDP), calls the probes in order
-and **stops at the first** that returns true, then reports the spangap state
-partition and the `SPANGAP-DETECT-END` sentinel. To add a board, write a
-`probe_hw_*` and slot it into the `PROBES[]` array (mind the ordering below).
+— returning its own `hw-<straddle>` string when the hardware under it is that
+board, and NULL when it is not. Those functions are copied in here verbatim,
+renamed `detect_hw_<straddle_with_underscores>` so they can sit side by side, and
+`app_main()` calls them in order. `detect_probe.h` — the bus vocabulary they are
+written in (I2C ACK and register reads, SCCB, the LoRa radio probe, NMEA
+autobaud, flash size, rail drive/release) — is likewise a copy of
+`spangap-core/esp-idf/include/detect_probe.h`.
+
+The copy is manual and deliberately so: it is a handful of self-contained
+functions, and a build-time mechanism to move them would cost more than it saves.
+What catches a drift is the firmware itself, which calls the original at every
+boot and halts on a board it no longer recognises.
+
+To add a board: write its `detect_hw()` in the straddle, copy it here under the
+renamed symbol, and slot it into the `BOARDS[]` array — minding the ordering
+below.
 
 ## Flash-size gate
 
@@ -61,15 +69,21 @@ so a probe is never skipped just because the size couldn't be read.
 
 ## Probe ordering (a safety property)
 
-`PROBES[]` is ordered deliberately: probes identifiable by **passive bus reads**
-(nibble, t3s3, seeed, xiao) run first; probes that **drive power-enable / reset
-GPIOs** (heltec Vext GPIO36 + OLED reset GPIO21, then tdeck rail GPIO10) run
-**last**. Because probing stops at the first hit, a board found by reads alone is
-identified before any rail-driving probe pokes a pin that means something else on
-it. Every rail-driving probe restores the pins it drove to hi-Z before returning
-(`rail_release`), and flashmon hard-resets the chip into real firmware
-afterwards. If you add a probe that drives GPIOs, place it so boards its drives
-could disturb are identified before it runs.
+`BOARDS[]` is ordered deliberately — **the fragile hardware comes first**. Boards
+identifiable by **passive bus reads** (nibble, t3s3, xiao-sense, xiao-sx1262) run
+before any board whose probe **drives a power-enable or reset GPIO** (heltec Vext
+GPIO36 + OLED reset GPIO21, then tdeck rail GPIO10), because those pins mean
+something else entirely on the board they are not looking at. Since the run stops
+at the first hit, a board found by reads alone is settled before a rail-driving
+probe ever touches it.
+
+A probe that drives a rail **releases it when it fails** (`detect_rail_release`)
+and **leaves it when it succeeds** — right in both callers: the firmware wants the
+rail exactly as the probe left it on the board this actually is, and here the chip
+is hard-reset into real firmware the moment the run ends.
+
+If you add a board whose probe drives GPIOs, place it after any board those drives
+could disturb.
 
 ## Build
 
@@ -114,12 +128,12 @@ build/spangap_detect.bin`, then open a serial monitor at 115200.
 
 - **ESP32-S3 only** — every supported board is an S3. Other targets would need
   their own pin tables.
-- **Power rails:** the heltec and tdeck probes drive the Heltec Vext (GPIO36 LOW)
+- **Power rails:** the heltec and tdeck functions drive the Heltec Vext (GPIO36 LOW)
   + OLED reset (GPIO21) and the T-Deck master rail (GPIO10 HIGH) so those boards'
   buses respond. These pins mean other things on other boards, so those two
   probes run last (see ordering above), the drives are brief, each is restored to
   hi-Z on exit, and the chip is reset into real firmware afterward.
-- **GNSS** is probed only **inside** `probe_hw_lilygo_tdeck`, after the keyboard and
+- **GNSS** is probed only **inside** `detect_hw_lilygo_tdeck`, after the keyboard and
   radio have already confirmed a T-Deck — so the GPS UART pins (43/44), which are
   the console UART on other boards, are only touched once we know it's a T-Deck.
   It listens **passively** on RX44 (no TX) and takes the baud whose first
