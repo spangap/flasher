@@ -640,9 +640,11 @@ included, then rewrites `builds/index.html`. The first failing build ends the
 run: the images built before it keep their fresh stamp, the listing still matches
 what is on disk, and the exit status is non-zero.
 
-`spangap make-builds` runs on the **host** rather than in the container, because
-each image is a `spangap build` and those clone missing dependencies with the
-host's git credentials.
+Every straddle a run compiles has to be **in the workspace already**: cloning one
+takes the host's git credentials, which the container has none of. The host half
+of `spangap` therefore reads the run's invocations and clones for each of them
+before the run itself starts in the container; a target still missing by then
+stops the run, named, rather than being fetched.
 
 Everything it writes is untracked — produce it before you serve or deploy the
 page (see the CI workflow, which builds the images and uploads them as a
