@@ -16,6 +16,186 @@ Serial keeps permission grants that may or may not still open and delivers
 Everything below turns that into one continuous terminal — under one rule, which
 is that a tab talks to the one port it was given and asks before that changes.
 
+## The transport under the ports
+
+Everything in this document is written in Web Serial's vocabulary — a port with
+`readable`, `writable`, `setSignals`, and `connect`/`disconnect` events — and one
+of two browser interfaces supplies it. `chooseSerial()` picks at load, and
+nothing above it can tell which was picked.
+
+**Web Serial** (`navigator.serial`) is the desktop one, and the only one that
+reaches a board through a **USB-to-serial bridge chip**: a bridge speaks a vendor
+protocol that belongs to the operating system's driver, and a page has no way to
+speak it.
+
+**WebUSB** (`navigator.usb`) is what Android implements for a USB peripheral. It
+hands a page raw endpoints, so a page can itself drive a port that is plain
+USB CDC-ACM (Communications Device Class, Abstract Control Model) — which is what
+an ESP32 with native USB presents on both of its transports: the USB-Serial-JTAG
+controller, and the CDC ports `usb cdc` moves the console to.
+[`vendor/web-serial-polyfill.js`](../flashmon/vendor/web-serial-polyfill.js)
+turns those endpoints into a `SerialPort`, and `usbSerial()` in `flashmon.js`
+supplies what the polyfill leaves out.
+
+Android is the reason the choice exists. Chrome there does expose
+`navigator.serial`, but it enumerates Bluetooth serial ports only: the chooser
+opens with a board plugged into the phone and lists nothing. So on Android the
+page goes to WebUSB — at the cost of the bridge-chip boards, which are absent
+from the chooser rather than broken in it. `?serial=native` / `?serial=usb`
+forces one road for a load.
+
+### What the adapter adds
+
+The polyfill mints a fresh `SerialPort` on every call, and everything under
+[Only ports this tab was given](#only-ports-this-tab-was-given) rests on object
+identity, so `usbSerial()` wraps each `USBDevice` exactly once and every path
+hands back that one wrapper. It also carries the two things the session loop
+reads and the polyfill does not have:
+
+- **`connect` / `disconnect`**, translated from the WebUSB events of the same
+  names, carrying the tab's own port object as `e.port`. A device with no CDC-ACM
+  interface raises nothing — it is not a port.
+- **`connected`**, set false the moment a device is seen leaving and before the
+  event is dispatched, because `detachStreams` reads it to decide whether a close
+  has anything to release.
+- **A close that ends with the device closed**, which is what releases the
+  claimed interfaces. The polyfill finishes its close by dropping DTR and RTS,
+  and that control transfer throws against a device that has just left the bus —
+  which here is the ordinary case, since every teardown follows a reset: the
+  detector run and the flash both hand back a rebooting chip. Left alone, the
+  throw skips the device close under it, the interfaces stay claimed, and the
+  next open fails on `claimInterface` — flashing succeeds and the console after
+  it never opens again.
+- **An open that survives one leaked claim**, closing the device outright and
+  asking once more, since nothing above the transport can act on a stale claim.
+- **An open that puts the control lines where the desktop puts them.** DTR and
+  RTS are not decoration on a chip whose native USB wires them to its own reset
+  and boot-mode logic. Of the four states, `(DTR 1, RTS 0)` — the polyfill's own
+  choice — is half of the auto-reset sequence, the half that holds the boot pin
+  down; `(0, 0)` is an idle line that jogs nothing but also tells the device no
+  host is there, and a console that answers only a host it can see stays silent
+  to that one; `(1, 1)` is what Web Serial does on the desktop, which is the
+  configuration this page is known to work in. So both are asserted, in **one**
+  control transfer — the pair is what the chip's logic reads, and stepping
+  through a corner of the square on the way would be the reset the open is
+  promising not to do. `?signals=none` leaves them down, for comparing the two
+  against real hardware.
+- **Endpoint resync on open.** Every bulk endpoint carries a one-bit sequence
+  number (DATA0/DATA1) both ends must agree on. A receiver that sees the wrong
+  one ACKs the packet — the sender counts it delivered — and silently discards
+  it as a retransmission, so one direction of the port stops carrying data with
+  every counter on both sides reading healthy. The ends drift whenever endpoint
+  state moves without a bus event the other side can see: interfaces claimed
+  and released around a detect run or a flash, a chip that resets without
+  re-enumerating (USB-Serial-JTAG rides through chip reset). A kernel serial
+  driver never meets this because it holds one continuous view of the endpoint
+  from plug to unplug — and this page is the driver here, so its open does what
+  a driver's open does: `CLEAR_FEATURE(ENDPOINT_HALT)` on both endpoints,
+  resetting the toggle to DATA0 on device and host alike. Every control
+  request the open path makes is raced against a deadline — one that has not
+  answered in 1.5 s is not going to, and an awaited request that never settles
+  is worse than one that fails: no catch fires, and the page sits on "Opening
+  serial monitor…" forever with nothing to show. A hang is recorded in the
+  readout by name (`clearHalt: no completion in 1500 ms`) and the open
+  proceeds without it. A silently one-way
+  port — a console mute mid-boot-log, a keyboard the firmware never hears,
+  while every transfer reports success — is this fault, and nothing else looks
+  like it. It is also why a flash can succeed over a link whose console is
+  dead: the loader protocol retries and re-syncs at every step, and a console
+  stream retries nothing.
+- **The byte streams themselves.** `readable` and `writable` are built here over
+  `transferIn` / `transferOut` rather than taken from the polyfill, so both
+  directions are one transfer in flight and every failure is a rejection with
+  the endpoint status in it. The endpoints are named in the monitor's opening
+  banner (`CDC iface 1, in EP2, out EP1`): a console that answers nothing looks
+  the same whether the device is quiet or the page is on the wrong pipe, and
+  that line is what tells them apart.
+
+### One packet per read
+
+A bulk IN transfer ends when the requested length is reached or a **short
+packet** arrives, and not otherwise. Ask for several packets' worth and a device
+that stops talking on a packet boundary leaves the transfer open: everything
+already received sits in the host, undelivered, until the device speaks again.
+
+The USB-Serial-JTAG controller's transmit FIFO is one packet deep, so a packet
+boundary is exactly where its bursts end. That reads as a console that prints a
+screenful and stops, a CR whose answer never arrives — so every session probes a
+board that would have told it what it is — and a keystroke whose echo appears
+only when the next one is typed.
+
+So a read asks for exactly one packet, which is the only length that always
+completes. It costs a round trip per 64 bytes; a boot log arrives in a few
+hundred transfers and a console never notices.
+
+### Eight of them at once
+
+One transfer at a time is not slow, it is **lossy**. Between a transfer
+completing and its replacement being posted sits everything the page does with
+the bytes — the frame sniffer, the log parser, the terminal, a repaint — and for
+that whole window the endpoint has nowhere to put anything. A device talking
+faster than the page can turn transfers around fills its one-packet FIFO and
+drops the rest.
+
+This is the buffering an operating system would have done. A serial port on the
+desktop is drained by a kernel driver that keeps its own transfers queued and
+hands the page a tty's worth of bytes; over raw WebUSB there is no driver, and
+the only buffer between the device and this script is the transfers this script
+has posted. Eight are kept outstanding, so the endpoint stays stocked while the
+page is busy with the last chunk.
+
+Transfers on one endpoint complete in the order they were posted, so a queue of
+them is still a byte stream: post at the tail, take from the head.
+
+A queue has to be told when it is over. A transfer posted before a teardown
+still completes after it, and the pull sitting on that transfer wakes into a
+stream that no longer exists — where an enqueue throws. That is an **ordinary
+end**, not a failure, and reporting it as a USB read error puts a failure that
+never happened at the top of the diagnosis while burying the one that did. So
+the read stream carries a `finished` flag, set by its cancel and by the port's
+close, and a pull that wakes to find it set stops without a word.
+
+The symptom of getting this wrong is a boot log that arrives as its first page
+and then nothing — not because the stream died, but because the device gave up
+on the rest of it.
+
+### The wire test — `?usbprobe=1`
+
+A console that says nothing back has three causes and they are identical from
+the terminal: the byte never left, the byte left and the device had nothing to
+say, or the device answered and something between the endpoint and the screen
+ate it. A dozen layers sit in that gap — streams, session, frame sniffer, log
+parser, terminal — and each of them could be the one at fault.
+
+`?usbprobe=1` turns the Start button into a test that has none of them. It picks
+a port, opens it, and then, with its own hands: **listens first**, writes one
+carriage return straight to the OUT endpoint, listens again, and prints the
+endpoint numbers, every read's status and byte count, the write's status and
+byte count, and whatever came back as text. It closes the port and stops.
+
+The listen before the write is what makes it more than an echo test. A running
+board that has been left alone is quiet there; **bytes before anything is asked
+of it are a board the open disturbed**, and early-boot text says so outright.
+
+It keeps **one** transfer posted across the whole run rather than a fresh one per
+wait. Giving up on a wait does not unpost a transfer, and a posted transfer will
+take the next packet the device sends — so a probe that abandoned one would eat
+the answer the next phase is listening for and report a silence it caused itself.
+
+Whatever it reports is true of the wire, so it splits the question in one run:
+
+- **`wrote CR → threw`, or a status other than `ok`** — the write is the fault,
+  and the message says why.
+- **`wrote CR → status ok`, then `nothing in 700 ms`** — the byte left and the
+  device did not answer it. The fault is past the wire: which pipe, or what the
+  firmware does with a bare CR on it.
+- **`wrote CR → status ok` and bytes back** — the wire is whole and the answer
+  is being lost above the transport.
+
+A device that re-enumerates under a **new** `USBDevice` costs the pairing: the
+port returns as a stranger and the session recovers through **Re-select port**,
+the same path that covers every other way a port comes back unrecognisable.
+
 ## A session per port, one terminal
 
 `makeSession(port, term, resizeObserver, muted)` builds one port's worth of
@@ -130,6 +310,42 @@ detection run's re-enumerates the device, because the USB-Serial-JTAG controller
 is not reset with the chip (see
 [spangap-core's usb-console](../../spangap-core/docs/usb-console.md)). The port
 object survives and the session simply reattaches.
+
+## Losing the streams, not the port
+
+A port's `readable` and `writable` are **one-shot**: a single failed transfer
+errors the stream for good, and the port builds a fresh pair only when asked
+again. The device is fine, the port is still there, and the session is neither
+`gone` nor detached — so none of the machinery below is reached.
+
+Left alone this presents as a session that is alive on screen and deaf and mute
+in fact: no device output, and typing that goes nowhere. Worse, it is silent at
+both ends — the reader loop simply ends, and a write rejects into a `catch` that
+was written for a port that went away.
+
+`restreamAfterDrop(m, err)` is what turns that into a recovery. Two places
+notice, because a stream dies between transfers as readily as during one:
+
+- **The reader loop**, when it ends while the session still holds its reader.
+  `detachStreams` clears `m.reader` *before* cancelling, so an ordinary teardown
+  and a stream that died on its own are told apart by that one field.
+- **`writer.closed`**, which is where a write-side error always surfaces —
+  the rejection often lands on a later write than the one that failed, or on no
+  write at all, when nothing more is typed.
+
+Either way the drop is said out loud (`-- serial stream dropped: … --`) and the
+streams are rebuilt over the same port, reattaching with `poke` rather than
+`sync`: the device kept running through this, and its output is mid-flow, which
+is exactly what the sync handshake would discard.
+
+What cannot be rebuilt is a stream over a port that has actually gone, and the
+budget tells the two apart: four drops with no bytes in between hands the
+session to the port-level recovery below, which can ask for a new port. Bytes
+arriving clear the run, so a session that drops once an hour never reaches it.
+
+A reset is the common trigger — every transfer in flight when the chip resets
+fails — which is why this is felt most as "the reset worked but the boot log
+never came".
 
 ## Losing a port, and getting it back
 

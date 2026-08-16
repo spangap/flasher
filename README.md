@@ -27,7 +27,8 @@ deployment and under `spangap dev` alike, so there is no base URL to configure.
       <project>-flashmon        ← branded copy of flashmon.py (gitignored artifact)
       detect/spangap_detect.bin ← the peripheral detector (checked in)
       devices/                  ← board photos for the device window (optional)
-      vendor/                   ← esptool-js, JSZip, xterm.js (no runtime CDN)
+      vendor/                   ← esptool-js, JSZip, xterm.js, web-serial-polyfill
+                                  (no runtime CDN)
     esp-idf/                    ← source of the detector (NOT served)
       Makefile                  ← `make` builds + stages ../flashmon/detect/…
       main/detect.c, …
@@ -49,8 +50,9 @@ deployment and under `spangap dev` alike, so there is no base URL to configure.
 
 Serve **`flashmon/flashmon/`** and **`builds/`** as siblings from anywhere static
 — GitHub Pages, an S3 bucket, `python3 -m http.server`, the device's own web
-server. Web Serial needs a **secure context**, so serve over HTTPS (or
-`http://localhost`).
+server. Reaching a USB device from a page needs a **secure context**, so serve
+over HTTPS (or `http://localhost`) — a phone on the LAN has no localhost
+exemption, so testing from one means real HTTPS.
 
 `<host>/flashmon` works with or without the trailing slash. Without it the
 document's base is the parent directory, which would send every relative URL in
@@ -249,6 +251,39 @@ device window (above), beside the stamps the decision rests on; identifying is a
 settings-panel action, because a running device answers for free and the run is
 only for the ones that cannot.
 
+**One terminal in the container, always.** A monitor that throws part-way
+through opening has already put its terminal on screen, and every caller answers
+a failed open by opening again — so a failed open takes its own terminal down
+with it. Two terminals in one container is two cursors and two hidden input
+boxes, with the keystrokes going to whichever was built last.
+
+### On a touch screen
+
+The characters a soft keyboard produces reach a page through composition events
+that a hidden textarea sitting at a terminal cursor was never really built for,
+and a console nobody can type into is not a console. So a touch screen gets a
+**line of input of its own** under the terminal: type a line, Enter sends it with
+a carriage return, and the terminal above shows the device's echo. **`^C`** sits
+beside it, because a soft keyboard has no way to produce one and a CLI that
+cannot be interrupted is a CLI you can get stuck in.
+
+Focusing the terminal raises the on-screen keyboard, so on a coarse pointer the
+terminal is focused by a **tap on it** and by nothing else — never by the page
+deciding a session is ready. On any device, a dialog on screen both blocks a
+focus and takes one back: the terminal is behind it, and a terminal holding the
+focus is a keyboard covering the dialog that just opened.
+
+The keyboard shrinks the visual viewport and leaves the layout one alone, so a
+fixed full-height element keeps its full height *behind* the keyboard — and the
+bottom of a terminal is the part being read. Everything fixed to the window is
+sized or offset to the visual viewport instead (`--vv-top` / `--vv-height`,
+tracked from script): the monitor, the dialogs, the gear and its panel. The
+terminal reflows to fewer rows with its last line just above the keyboard, a
+dialog re-centres in the band that is left, and the gear stays beside the action
+buttons rather than scrolling off while they stay put. A refit that loses rows
+keeps the bottom on screen, unless the session was scrolled back to read
+something older.
+
 Everything else lives behind the **gear** (top right, a white-on-black button the
 same height as the ones beside it, on screen from the first paint — these matter
 before a port is picked as much as during a session):
@@ -269,6 +304,10 @@ before a port is picked as much as during a session):
 - **No reset** — open the monitor without resetting or identifying (above).
 - **Auto-flash** — flash a newer image for the attached board as soon as one is
   published, without asking in the device window (above). Newer only.
+- **Delete stored wifi and node passwords** — forget the setup answers this
+  browser was told to reuse (above), so the next fresh device is asked again.
+  Disabled while nothing is stored, so the button also says whether this browser
+  is holding any.
 - **Set as defaults** — store the panel's current state, so the page loads with
   it next time. Until it's pressed, a change applies to this tab only.
 - **FNB58 current graph** — if you have a
@@ -294,8 +333,89 @@ before a port is picked as much as during a session):
   unplug/replug it. See [`docs/fnb58.md`](docs/fnb58.md) for the HID protocol and
   rendering. Browser only — `flashmon.py` has no equivalent.
 
-A fresh device (no admin password, or falling back to its own AP) is walked
-through a one-time setup: a password dialog, then a WiFi-connect dialog.
+### Setting up a fresh device
+
+A fresh device — no admin password, or falling back to its own AP — is walked
+through a one-time setup: a **password**, a **hostname**, a **WiFi network**,
+then (where the device has them to give) the **LoRa radio** and a **name on the
+mesh**. Each is settled before the next opens, and everything chosen goes to the
+device in one batch at the end. Every dialog can be skipped; the rest still runs.
+
+The last two have no boot line to watch — "this radio was never given a
+frequency" and "there is no identity yet" are states, not events — so they are
+asked for over the framed channel once the earlier questions are settled:
+`show s.lora.0.enable`, `show s.lora.0.frequency`, `show s.lora.0.SUPE.enable`,
+`show s.lxmf.id.0.label`, `show s.lxmf.version`. One key per query, never a
+subtree: a reply frame is length-counted while the device's log echo reaches the
+same wire on its own path, so a log line that lands inside a frame is
+unrecoverable for this side — and the wider the frame, the wider that window.
+A `(no matches)` reply is how an absent straddle, an absent key and an unset
+value stay distinguishable with no new firmware verb. Firmware that doesn't
+speak frames is left alone: it can't be asked, so it isn't guessed at and
+neither dialog opens.
+
+The **LoRa** dialog is one window: the frequency in MHz (set large — it is the
+one value that gets read back and compared against another node's), then
+spreading factor, bandwidth and coding rate, which every node on a mesh has to
+agree on. **Enable SUPE** appears only on a build that carries SUPE, which the
+page knows because the key exists. Its OK is the only thing that switches the
+radio on (`s.lora.0.enable`) — a skipped dialog leaves it off rather than on a
+frequency nobody confirmed.
+
+Two of those three answers are the same on every node you set up, so either
+dialog can be told to keep its answer for the next one:
+
+- **Set this password on all new nodes**, in the password dialog. Every later
+  device that reports no admin password gets it without asking, and the dialog
+  doesn't open again.
+- **Set this wifi password whenever this AP is visible**, in the WiFi dialog.
+  The SSID and its password are kept together, and any number of them can be. A
+  device that falls back to its own AP is given the first remembered network its
+  own scan actually saw — a stored network out of range says nothing about where
+  this node belongs — and the dialog doesn't open. When none is in range it
+  opens as usual.
+
+Both are held in the browser's LocalSettings for this deployment, and the
+settings panel's **Delete stored wifi and node passwords** wipes both. A skipped
+dialog is never silent about it: the monitor says which stored answer was used
+(`-- using the stored node password --`, `-- using the stored network "…" --`)
+before the batch goes out.
+
+The **hostname** is never remembered: it is the one answer that is about this
+node, and `<hostname>.local` is how its web UI is reached. That is why it has its
+own dialog rather than a field in the WiFi one — with the other two answered from
+storage, naming the node is the whole of setting it up, and it still gets asked
+when the network beside it doesn't. The **name on the mesh** is the same kind of
+answer and is asked last, prefilled from the hostname.
+
+### When the device sets itself up
+
+A build can say it does its own onboarding, and then this page does none. Three
+things say it, and any one is enough:
+
+- **The device, on every boot** — `setup: on-device` in the log, which describes
+  the build rather than the boot. It arrives during the init walk, so a session
+  that watched the boot start has it in hand before the walk ends.
+- **The catalogue**, for an image about to be written: an entry marked
+  `onboarding: device` (see *Configuration* below) rides into the listing as
+  `data-onboarding` on that image's link. Flashing such an image ends this
+  session's part in setup before the device has even booted.
+- **The device, asked** — `show s.onboard.done`, whose key exists only in a build
+  carrying on-device setup. This is the one for a session that attached
+  mid-flight and so never saw the marker go by.
+
+**A watched boot waits for `spangap ready` before anything is asked.** The
+device's own onboarding registers near the *end* of the init walk while
+"No device password set" comes out near the beginning, so acting on the early
+line is exactly how a dialog opens ten seconds before the device says it never
+needed one. Waiting costs a few seconds of a boot nobody is typing into, and
+takes every frame this page sends out of the busiest part of it.
+
+Two surfaces asking for the same password at the same moment is a race whose
+winner nobody can predict, and a board with a panel in the operator's hands is
+the better of the two. An unmarked image is the flasher's to set up, which is the
+safe default: a build that cannot ask for itself and is never asked is a node
+nobody set up.
 
 Those commands go out over the **framed console channel** on firmware that
 offers it — announced by the `serial: framed rpc v1` marker at boot, or
@@ -306,7 +426,7 @@ echoed, never enter the device's line editor and never flip its console into CLI
 mode, so setup can't collide with whatever you are typing and each command is
 answered rather than hoped for — the terminal shows `-- setup sent --`, not a
 replayed transcript of the commands. Without the marker they are typed at the
-console in one batch, exactly as before.
+console in one batch.
 
 Which dialogs open is still decided from the boot log here; only the sending is
 framed. `flashmon.py` pulls that state with queries too.
@@ -448,6 +568,7 @@ project: Reticulous              # shown in the title, the flash offer, the
 builds:
   - name: hw-lilygo-tdeck        # matched against the detected hw-<straddle>
     image: devices/hw-lilygo-tdeck.jpg   # optional: photo for the device window
+    onboarding: device           # optional: it has a screen and asks for itself
     invocation: reticulous/reticulous --with spangap/hw-lilygo-tdeck
   - name: generic                # fallback for any board without its own image
     invocation: reticulous/reticulous
@@ -455,6 +576,13 @@ builds:
 
 Each entry names an image and gives the `spangap build` invocation that produces
 it.
+
+`onboarding: device` on an entry says that image sets a fresh node up from its
+own screen, so the flasher asks for nothing after writing it (above). It reaches
+the page through the generated `index.html`, as `data-onboarding` on that image's
+link — an attribute rather than a comment, because a comment is only ever *near*
+the row it is about while an attribute is part of it: one parser pass reads the
+href and the facts together and nothing can separate them.
 
 `image:` is the board's **photo**, shown in the device window when a detection run
 identifies that board — a path in the web root (`devices/<board>.jpg` by
@@ -544,12 +672,76 @@ CDN at runtime. Pinned versions are in `vendor/VERSIONS.txt`:
 - `jszip.min.js` — [JSZip](https://github.com/Stuk/jszip).
 - `xterm.js` + `xterm.css` + `xterm-addon-fit.js` —
   [xterm.js](https://github.com/xtermjs/xterm.js) (the serial monitor).
+- `web-serial-polyfill.js` —
+  [web-serial-polyfill](https://github.com/google/web-serial-polyfill), the Web
+  Serial interface built on WebUSB (the Android road; see below).
 
 To update, re-fetch the pinned files and bump `VERSIONS.txt`.
 
 ## Browser support
 
-Web Serial is Chromium-only (Chrome, Edge, Opera, Brave) on desktop. Firefox and
-Safari don't support it. The FNB58 current graph needs **WebHID**, same
-Chromium-only story; where it's missing the feature just stays off and the rest
-of the monitor works.
+Chromium only (Chrome, Edge, Opera, Brave) — Firefox and Safari reach a USB
+device from a page by neither road. The FNB58 current graph additionally needs
+**WebHID**; where that is missing the feature stays off and the rest of the
+monitor works.
+
+Which road the page takes is decided at load and is invisible above the
+transport: everything is written against the Web Serial shape.
+
+- **Desktop — Web Serial.** The operating system owns the port and its driver,
+  so every board is reachable, bridge chip or not.
+- **Android — WebUSB.** Chrome there does expose `navigator.serial`, but it
+  enumerates Bluetooth serial ports only: the chooser opens with a board plugged
+  into the phone and lists nothing. WebUSB hands the page raw endpoints instead,
+  and the polyfill drives the CDC-ACM protocol over them.
+
+The Android road reaches a board whose serial port is **the chip's own USB** —
+the USB-Serial-JTAG controller, and the CDC ports `usb cdc` moves the console to.
+A board behind a **USB-to-serial bridge chip** (CP2102, CH340, FTDI) is not
+offered at all: a bridge speaks a vendor protocol that belongs to a driver, not
+to a page. An Android app holding the device also locks the browser out, so
+dismiss whatever offers to open when the board is plugged in.
+
+`?serial=native` and `?serial=usb` force one road for a load, which is how the
+two are compared on one machine. `?readqueue=N` sets how many bulk IN transfers
+are kept posted at once (8 by default), so a transport that misbehaves only when
+several are outstanding can be caught against real hardware without a deploy.
+`?signals=none` opens the port with DTR and RTS down instead of both asserted. `?usbprobe=1` turns the Start button into a
+raw wire test — one carriage return written straight to the endpoint, whatever
+comes back printed as counts and text, nothing of the page in between. See
+[`docs/serial.md`](docs/serial.md).
+
+`?debug=1` pins a line of counters over the monitor, in its own DOM rather than
+the terminal's, because half of what it is for is telling a session that has
+stopped receiving from one that is receiving and not showing:
+
+```
+usb in 4096B/64 (0.3s ago, 8 posted) out 12B/3 err 0 · loop 4096B/64 (0.3s ago, behind 0.0s) · keys 2/2 · term 53x40 box 372x480 · view 0/0 · hw hw-heltecv4
+session live drops 0
+first read: A transfer error has occurred.
+```
+
+`usb` is what the transport took off the wire, `loop` what the reader loop took
+delivery of; the two disagreeing means the stream. Both climbing with nothing on
+screen means the terminal — and `term` against `box` says whether it was sized
+to the space it has. `keys` is input captured over input the device accepted, so
+a keyboard reaching the page but not the wire reads as `7/0`. `first` and `last` are the
+transport's failures in its own words — both, because later ones are usually
+consequences of the first and the first is the one worth reading. `session` says
+which recovery is in play: `gone`, `reattaching`, the RNG watchdog, the
+consecutive-drop count, and whether a dialog is up waiting on the answer.
+
+Debug mode also changes behaviour, deliberately:
+
+- **No automatic detection.** A session that probes has already failed at the
+  thing a debug session exists to observe — and the run itself destroys the
+  evidence, resetting the device and burying the dead console under a fresh
+  boot. The settings-panel button still runs one on purpose.
+- **One reopen-to-resync per silence stretch.** IN silence with transfers
+  posted for `?resync=N` seconds (10 by default) triggers a single reopen,
+  re-armed only by bytes actually arriving. Output that resumes after each
+  reopen convicts host-side endpoint state; silence that survives it convicts
+  the device.
+- **Tap-to-copy carries the configuration, the port's own name string, and
+  `tail`** — the last bytes heard before the stream went quiet, which names the
+  log line a console died on.

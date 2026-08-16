@@ -831,13 +831,17 @@ def flash_image(src, rel, port, state=None):
     if hits and not confirm_state_overlap(state, hits):
         return "cancelled"
 
+    # The SPI-flash flags go in their two-letter form: the long names differ
+    # between esptool 4 (--flash_mode) and esptool 5 (--flash-mode, the
+    # underscore form deprecated), while -fm/-ff/-fs mean the same in both and
+    # in whatever version the venv resolved.
     args = ["--chip", "esp32s3", "-p", port, "-b", "460800", "write_flash"]
     if settings.get("flash_mode"):
-        args += ["--flash_mode", settings["flash_mode"]]
+        args += ["-fm", settings["flash_mode"]]
     if settings.get("flash_freq"):
-        args += ["--flash_freq", settings["flash_freq"]]
+        args += ["-ff", settings["flash_freq"]]
     if settings.get("flash_size"):
-        args += ["--flash_size", settings["flash_size"]]
+        args += ["-fs", settings["flash_size"]]
     for off, fname in sorted(files.items(), key=lambda kv: int(kv[0], 16)):
         args += [off, os.path.join(tmpdir, fname)]
     rc, _ = _esptool(args)

@@ -34,6 +34,18 @@
 #                           devices/README.md), never a remote URL. Left out, or
 #                           pointing at a file that isn't there, the box is
 #                           simply text-only.
+#               onboarding  optional. `device` says this image sets a fresh node
+#                           up from its own screen, so the flasher asks for
+#                           nothing after writing it — it says so and stops.
+#                           Two surfaces asking for the same password at the same
+#                           moment is a race whose winner nobody can predict, and
+#                           a board with a panel in the operator's hands is the
+#                           better of the two. Anything else, and the absence of
+#                           the key, means the flasher asks: the safe default,
+#                           since a build that cannot ask for itself and is never
+#                           asked is a node nobody set up. It lands in the
+#                           generated index.html as data-onboarding on that
+#                           image's link.
 #
 # Nothing writes this file. What was built, and when, lives in the index.html
 # `spangap make-builds` leaves next to the images.
@@ -46,6 +58,7 @@ url: https://myproject.example/flashmon/
 builds:
   - name: hw-lilygo-tdeck
     image: devices/hw-lilygo-tdeck.jpg
+    onboarding: device            # it has a screen; it asks for itself
     invocation: myorg/myproject --with spangap/hw-lilygo-tdeck
   - name: generic
     invocation: myorg/myproject

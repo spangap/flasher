@@ -41,6 +41,7 @@
 import { ESPLoader, Transport } from './vendor/esptool-bundle.js';
 import { Terminal } from './vendor/xterm.js';
 import { FitAddon } from './vendor/xterm-addon-fit.js';
+import { SerialPort as UsbSerialPort } from './vendor/web-serial-polyfill.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -89,6 +90,15 @@ let SLUG = 'flashmon';
 // index.html. The listing is the record of what exists: the config says what the
 // catalogue is meant to hold, this says what it actually holds right now.
 let VERSIONS = {};
+// Build name -> how a device running that image gets set up, off the same
+// listing: `device` means the image asks for itself on its own screen and this
+// page must not. Filled by loadVersions alongside VERSIONS, since both come off
+// one pass over the same anchors.
+let ONBOARDING = {};
+// Set once a device-onboarding image has been written to the attached board:
+// from then on this session stays out of setup entirely, whatever the device's
+// boot log says it is missing — the device is asking for it on its screen.
+let deviceOnboards = false;
 // The stamp file's last value. A change is the signal to re-read the listing;
 // nothing else about it matters.
 let LAST_STAMP = null;
@@ -527,19 +537,54 @@ function trimToLineStart(m, buf) {
 // ring happened to wrap. A carriage return makes the console speak, which
 // flushes what it was holding; that whole exchange happens muted and is thrown
 // away, and only then does a second return produce the greeting the user sees.
+// The handshake writes, said out loud when they fail. These run inside the
+// attach, before there is a session to recover, so all they can do is report —
+// but reporting is the point: a console that never answers because the byte
+// asking never left is indistinguishable, on screen, from a device that has
+// nothing to say, and the second reading is the one people arrive at.
+// A write that neither completes nor fails is the third outcome, and the one
+// that reads as a device with nothing to say: the transfer is posted, sits in a
+// queue, and no promise ever settles. Bounded here so it is named instead.
+const WRITE_STALL_MS = 2000;
+
+async function writeConsole(m, bytes) {
+  let timer;
+  const stalled = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`no answer from the port in ${WRITE_STALL_MS} ms`)),
+                       WRITE_STALL_MS);
+  });
+  try {
+    await Promise.race([m.writer.write(bytes), stalled]);
+    return true;
+  } catch (e) {
+    note(m, `\x1b[31m-- could not write to the port: ${e && e.message ? e.message : e} --\x1b[0m`);
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function sendTyped(m, bytes) {
+  keyEvents++;
+  if (!m || !m.writer) return false;
+  const ok = await writeConsole(m, bytes);
+  if (ok) keySent += bytes.length;
+  return ok;
+}
+
 async function syncConsole(m) {
   const CR = () => new Uint8Array([0x0d]);
   const wasMuted = m.muted;
   m.muted = true;                       // the reader drops everything meanwhile
   try {
-    await m.writer.write(CR());
+    await writeConsole(m, CR());
     await sleep(100);
   } catch (_) { /* port went away mid-handshake */ }
   // The mute window has already discarded the partial opening line, so the
   // byte-level trim has nothing left to do and would only eat the greeting.
   if (m.lineSync) m.lineSync.pending = false;
   m.muted = wasMuted;
-  if (!wasMuted) { try { await m.writer.write(CR()); } catch (_) { /* gone */ } }
+  if (!wasMuted) await writeConsole(m, CR());
 }
 
 // Ask the console to say where it is. The firmware answers a bare CR with the
@@ -548,7 +593,7 @@ async function syncConsole(m) {
 // not the device's second CDC port. Nothing is muted around it: a port that has
 // just come back may be mid-boot-log, and that is precisely what must survive.
 async function pokeConsole(m) {
-  try { await m.writer.write(new Uint8Array([0x0d])); } catch (_) { /* port went away */ }
+  await writeConsole(m, new Uint8Array([0x0d]));
 }
 
 // Emit one of flashmon's own "-- … --" notices, with exactly one empty line
@@ -576,8 +621,26 @@ function note(target, text) {
 
 // Detach the reader/writer and close the port (leaving the terminal intact).
 async function detachStreams(m) {
-  if (m.reader) { try { await m.reader.cancel(); } catch (_) { /* gone */ } m.reader = null; }
-  if (m.writer) { try { await m.writer.abort(); } catch (_) { /* gone */ } m.writer = null; }
+  // Cancelling settles the reader loop but leaves the stream locked to it, and a
+  // locked stream is one a close cannot cancel. The loop's own finally releases
+  // too, from a task that has not necessarily run yet — so release here, where
+  // the close is about to happen, and let whichever call comes second throw into
+  // its catch.
+  // Cleared before the cancel, not after: the reader loop checks m.reader on its
+  // way out to tell a teardown from a stream that died on its own, and the
+  // cancel is what ends that loop. Clearing afterwards is a race it can lose.
+  if (m.reader) {
+    const reader = m.reader;
+    m.reader = null;
+    try { await reader.cancel(); } catch (_) { /* gone */ }
+    try { reader.releaseLock(); } catch (_) { /* the loop got there first */ }
+  }
+  if (m.writer) {
+    const writer = m.writer;
+    m.writer = null;
+    try { await writer.abort(); } catch (_) { /* gone */ }
+    try { writer.releaseLock(); } catch (_) { /* already released */ }
+  }
   // Only close a port that still has a device behind it. With the device gone
   // the OS handle is already dead — close() has nothing to release, and on a
   // vanished port it is one of Web Serial's known hang spots, which would wedge
@@ -612,8 +675,17 @@ async function attachStreams(m, mode = 'poke') {
   m.reader = m.port.readable.getReader();
   m.writer = m.port.writable.getWriter();
 
+  // The write side's death notice. A stream errors between writes as readily as
+  // during one, so the rejection often lands on a later write than the one that
+  // failed — or on no write at all, when nothing more is typed. `closed` is the
+  // one place it always surfaces. detachStreams clears m.writer before aborting,
+  // so an ordinary teardown does not read as a drop here.
+  const writer = m.writer;
+  writer.closed.catch((e) => { if (m.writer === writer) restreamAfterDrop(m, e); });
+
   const reader = m.reader;   // capture: m.reader is swapped out on reconfigure
   (async () => {
+    let lost = null;
     try {
       for (;;) {
         const { value, done } = await reader.read();
@@ -621,6 +693,11 @@ async function attachStreams(m, mode = 'poke') {
         // Muted until the first reset is issued, so only post-reset output shows.
         if (value && !m.muted) {
           m.rxSeq++;                 // any byte activity (watched by the stuck watchdog)
+          m.rxBytes = (m.rxBytes || 0) + value.length;   // against the transport's own count
+          m.rxAt = Date.now();
+          // Where a stream died is half of diagnosing why: keep the tail.
+          if (DEBUG_HUD) m.tail = tailBytes(m.tail, value);
+          m.drops = 0;               // bytes flowing: the last drop is behind us
           if (!$('stuck-overlay').hidden) $('stuck-overlay').hidden = true;  // device came back
           // Activity counts above even while the opening partial line is being
           // dropped; only what reaches the terminal and the parser is trimmed.
@@ -637,17 +714,68 @@ async function attachStreams(m, mode = 'poke') {
           if (m.rngArmed && !m.rngJustArmed) { clearTimeout(m.rngTimer); m.rngArmed = false; }
         }
       }
-    } catch (_) {
-      /* cancel() during detach lands here — expected */
+    } catch (e) {
+      lost = e;                // cancel() during detach also lands here
     } finally {
       try { reader.releaseLock(); } catch (_) { /* */ }
     }
+    // A reader that ends while the session still holds it was not detached —
+    // the stream died underneath it. detachStreams clears m.reader, so that is
+    // exactly what tells a teardown from a drop.
+    if (m.reader === reader) restreamAfterDrop(m, lost);
   })();
 
   // The console is asked to identify itself, unless a reset is about to make
   // the question moot and the byte that asked it a stray keystroke.
   if (sync) await syncConsole(m);
   else if (mode !== 'quiet') await pokeConsole(m);
+}
+
+// Rebuild a session's streams after the transport dropped them under it.
+//
+// A stream is one-shot: a single failed USB transfer errors it for good, and
+// the port hands out a fresh pair only when asked again. Nothing above notices
+// on its own — the reader loop just ends, the writer just starts rejecting —
+// which presents as a session that is alive on screen, deaf and mute in fact:
+// no device output, and typing that goes nowhere. The device is fine and the
+// port is still there; the streams over it are what died, most often over a
+// reset, which every transfer in flight at that moment fails.
+//
+// So the drop is reported and the streams are rebuilt. What cannot be rebuilt
+// is a stream over a port that has actually gone, and the budget below is what
+// tells the two apart: a run of drops with no bytes in between hands the
+// session to the port-level recovery, which can ask for a new port. Bytes
+// arriving clear the run, so a session that drops once an hour never reaches it.
+const RESTREAM_MAX = 4;
+
+async function restreamAfterDrop(m, err) {
+  if (monitor !== m || m.gone || m.reattaching) return;
+  m.reattaching = true;
+  const why = err && err.message ? `: ${err.message}` : '';
+  try {
+    m.drops = (m.drops || 0) + 1;
+    if (m.drops > RESTREAM_MAX) {
+      note(m, `\x1b[31m-- the serial stream keeps dropping${why}; the port is not usable --\x1b[0m`);
+      m.gone = true;
+      hideOpenUi();
+      askReconnect(null);
+      return;
+    }
+    note(m, `\x1b[33m-- serial stream dropped${why}; reopening --\x1b[0m`);
+    await detachStreams(m);
+    if (monitor !== m) return;
+    // `poke` rather than `sync`: the device kept running through this and its
+    // output is mid-flow, which is precisely what the sync handshake discards.
+    await attachStreams(m);
+    note(m, '\x1b[32m-- serial stream back --\x1b[0m');
+  } catch (e) {
+    note(m, `\x1b[31m-- could not reopen the stream: ${e && e.message ? e.message : e} --\x1b[0m`);
+    m.gone = true;
+    hideOpenUi();
+    scheduleRescan();
+  } finally {
+    m.reattaching = false;
+  }
 }
 
 async function closeMonitor() {
@@ -681,10 +809,11 @@ async function resetDevice(port) {
 // renders into the terminal the first one was already using.
 function makeSession(port, term, resizeObserver, muted) {
   return { port, term, resizeObserver, cfg: { ...DEFAULT_CFG }, reader: null, writer: null,
-           gone: false, reattaching: false, muted,
+           gone: false, reattaching: false, muted, drops: 0, rxBytes: 0,
            lineBuf: '', decoder: new TextDecoder(), aps: new Map(), hostname: HOSTNAME_DEFAULT,
-           // Setup coordinator: password dialog → wifi dialog → one batched send.
+           // Setup coordinator: password → hostname → wifi, then one batched send.
            needPasswd: false, passwdResolved: false, newPasswd: null, passwdOpen: false,
+           hostResolved: false, newHostname: null, hostOpen: false,
            wifiNeeded: false, wifiResolved: false, wifiCfg: null, wifiOpen: false,
            connectedSeen: false, setupSent: false, hostnameQueried: false,
            // Flash offer: the identified board, the catalogue the running image
@@ -731,6 +860,519 @@ function portLabel(port) {
   return 'Serial port';
 }
 
+// ── the transport under the ports ───────────────────────────────────────────
+// Two browser interfaces reach a serial device, and this page uses whichever
+// the platform actually implements. Everything above and below this section is
+// written against the Web Serial shape — requestPort, a port with readable /
+// writable / setSignals, connect and disconnect events — and never learns which
+// one is underneath.
+//
+// Web Serial (navigator.serial) is the desktop one. It is also the only one
+// that reaches a board through a USB-to-serial bridge chip, because a bridge
+// speaks a vendor protocol that the operating system's driver knows and a web
+// page does not.
+//
+// WebUSB (navigator.usb) hands a page raw endpoints instead, so a page can
+// itself drive a port that is standard USB CDC-ACM (Communications Device
+// Class, Abstract Control Model). That is exactly what an ESP32 with native USB
+// presents, on the USB-Serial-JTAG controller and on the firmware's own CDC
+// ports alike. web-serial-polyfill builds the Web Serial shape out of those
+// endpoints, and the adapter below completes it.
+//
+// Android is the whole reason for the choice. Chrome there does expose
+// navigator.serial, but it enumerates Bluetooth serial ports only: the chooser
+// opens on a phone with a board plugged into it and lists nothing, and no
+// amount of retrying changes that. WebUSB is what Android implements for a USB
+// peripheral, so that is the road taken there — at the cost of the bridge-chip
+// boards, which no page can drive over raw endpoints.
+//
+// `?serial=native` / `?serial=usb` forces one for a load, which is how the two
+// are compared on the same machine.
+const HAVE_WEB_SERIAL = 'serial' in navigator;
+const HAVE_WEBUSB = 'usb' in navigator;
+const IS_ANDROID = /Android/i.test(navigator.userAgent || '');
+
+// The USB class code of a CDC-ACM control interface. Both the chooser filter
+// and the polyfill's interface hunt key on it: a device carrying one has a
+// serial port a page can open, and one that doesn't is not a port at all.
+const CDC_CONTROL_CLASS = 0x02;
+// Its data interface, which carries the two bulk endpoints the bytes travel on.
+const CDC_DATA_CLASS = 0x0a;
+
+const hex4 = (n) => (n != null ? n.toString(16).toUpperCase().padStart(4, '0') : '????');
+
+// An awaited USB request that never settles is worse than one that fails: a
+// catch does nothing against it, and whatever awaited it — ultimately the
+// "Opening serial monitor…" hint — waits forever with no error to show. So
+// every request the open path makes is raced against a deadline and turned
+// into a rejection that names itself.
+function bounded(label, ms, work) {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}: no completion in ${ms} ms`)), ms);
+  });
+  return Promise.race([work, late]).finally(() => clearTimeout(timer));
+}
+
+// The bulk pair a CDC-ACM device moves serial data over. Null for a device that
+// has no such interface, which is a device this page cannot drive.
+function cdcEndpoints(device) {
+  const data = (device.configurations[0]?.interfaces || [])
+    .find((i) => i.alternates[0].interfaceClass === CDC_DATA_CLASS);
+  if (!data) return null;
+  const eps = data.alternates[0].endpoints;
+  const inEp = eps.find((e) => e.direction === 'in');
+  const outEp = eps.find((e) => e.direction === 'out');
+  if (!inEp || !outEp) return null;
+  return { inEp, outEp, iface: data.interfaceNumber };
+}
+
+// A bulk IN transfer asks for exactly one packet, and that is not a throughput
+// choice — it is the only length that always completes.
+//
+// A bulk transfer ends when the requested length is reached or a short packet
+// arrives, and nothing else. Ask for several packets' worth and a device that
+// stops talking on a packet boundary leaves the transfer open: everything
+// already received is held by the host, undelivered, until the device speaks
+// again. The USB-Serial-JTAG controller's transmit FIFO is one packet deep, so
+// that boundary is where its bursts naturally end — which is a console that
+// prints a screenful and stops, an answer to a CR that never arrives, and a
+// keystroke whose echo appears only once something else is typed.
+//
+// One packet per transfer makes every packet complete one, at the cost of a
+// round trip per 64 bytes. A console never notices; a boot log arrives in a
+// few hundred transfers.
+const readLength = (inEp) => inEp.packetSize;
+
+// How many of those transfers are kept outstanding at once.
+//
+// This is the buffering an operating system would have done. A serial port on
+// the desktop is drained by a kernel driver that keeps its own transfers queued
+// and hands the page a tty's worth of bytes; over raw WebUSB there is no such
+// driver, and the only buffer between the device and this script is the
+// transfers this script has posted.
+//
+// One at a time is therefore not slow, it is lossy. Between a transfer
+// completing and its replacement being posted sits everything the page does
+// with the bytes — the parser, the terminal, a repaint — and for that whole
+// window the endpoint has nowhere to put anything. A device that talks faster
+// than the page can turn transfers around fills its FIFO and drops the rest,
+// which is a boot log that arrives as its first page and then nothing.
+//
+// Transfers on one endpoint complete in the order they were posted, so a queue
+// of them is still a byte stream: post at the tail, take from the head.
+// `?readqueue=N` overrides it, so a depth can be tried against real hardware
+// without a deploy — a transport that only misbehaves when several transfers
+// are posted at once says so in one run.
+const READ_QUEUE = Math.min(32, Math.max(1, parseInt(params.get('readqueue'), 10) || 8));
+
+// The Web Serial surface, over WebUSB. What the polyfill leaves out is what a
+// long-lived monitor session is built on: stable port identity, the
+// connect/disconnect events, and the `connected` flag.
+//
+// Identity is the load-bearing part. This page tells one board from an
+// identical one by object identity alone (see the next section), and the
+// polyfill mints a fresh SerialPort on every call, so each USBDevice is wrapped
+// exactly once here and every path hands back that one wrapper. A device
+// re-enumerating under a new USBDevice does cost the pairing — the port comes
+// back as a stranger, and the session recovers through the same "Re-select
+// port" path that covers every other way a port can return unrecognisable.
+function usbSerial() {
+  const ports = new WeakMap();       // USBDevice -> its one SerialPort
+  const unplugged = new WeakSet();   // devices seen leaving; drives port.connected
+  const events = new EventTarget();
+
+  const wrap = (device) => {
+    const known = ports.get(device);
+    if (known) return known;
+    let port;
+    // Both throw for a device with no CDC-ACM interface — a keyboard, a power
+    // meter, a phone. Nothing here can drive it, so it is not offered as a port.
+    const eps = cdcEndpoints(device);
+    if (!eps) return null;
+    try { port = new UsbSerialPort(device); } catch (_) { return null; }
+    // Web Serial's liveness flag. detachStreams reads it to decide whether a
+    // close has anything left to release, and skips the close when it doesn't.
+    Object.defineProperty(port, 'connected', { get: () => !unplugged.has(device) });
+
+    // The bytes, both ways — the polyfill's own streams are left unbuilt.
+    //
+    // Its read source starts each transfer in a detached task and returns
+    // nothing, so the stream counts a pull as finished the moment it is made and
+    // pulls again, up to a high-water mark that defaults to 255. That leaves a
+    // pile of bulk IN transfers pending at once against a device that has
+    // nothing to say — and behind them, on the same device queue, every OUT
+    // transfer: the console's own CR, and every keystroke after it, posted and
+    // never sent. A monitor on a running board then shows nothing, answers
+    // nothing, and reports nothing, because none of it ever failed.
+    //
+    // These are built here instead, over a queue of transfers this side controls.
+    let readable = null;
+    let writable = null;
+    let endRead = null;                // marks the live read stream finished
+    const dropStreams = () => {
+      if (endRead) endRead();
+      readable = null;
+      writable = null;
+    };
+
+    // Counted at the transport, so what the wire delivered can be compared
+    // against what the session made of it. The two disagreeing is the whole
+    // question when a monitor shows a screenful and then nothing.
+    port.usbStats = { bytesIn: 0, reads: 0, bytesOut: 0, writes: 0, errors: 0 };
+
+    // Named in the monitor's opening banner, because a console that answers
+    // nothing looks the same whether the device is quiet or the page is talking
+    // to the wrong pipe.
+    port.usbEndpoints = { iface: eps.iface, in: eps.inEp.endpointNumber, out: eps.outEp.endpointNumber };
+    port.usbDevice = device;          // for the readout's claim check
+    // What the device calls itself, for the banner and the readout: two rows
+    // in a chooser are indistinguishable by VID:PID alone, and WebUSB hands us
+    // the strings that tell them apart.
+    port.usbName = [device.productName,
+                    device.serialNumber ? `#${device.serialNumber}` : '']
+      .filter(Boolean).join(' ') || null;
+
+    // The bare wire, with everything above it taken away.
+    //
+    // A console that says nothing back has three possible causes and they look
+    // identical from the terminal: the byte never left, the byte left and the
+    // device had nothing to say, or the device answered and something between
+    // the endpoint and the screen ate it. This writes one carriage return with
+    // its own hands, reads whatever comes back with its own hands, and prints
+    // the raw counts and bytes — no streams, no session, no parser, no terminal.
+    // Whatever it reports is true of the wire.
+    port.usbProbe = async (say) => {
+      const inN = eps.inEp.endpointNumber;
+      const outN = eps.outEp.endpointNumber;
+      say(`device ${hex4(device.vendorId)}:${hex4(device.productId)} — CDC iface ${eps.iface}, `
+        + `in EP${inN} (${eps.inEp.packetSize}-byte packets), out EP${outN}`);
+      const claims = ((device.configuration && device.configuration.interfaces) || [])
+        .map((i) => `${i.interfaceNumber}:${i.claimed ? 'ours' : 'NOT OURS'}`).join(' ');
+      say(`configuration ${device.configuration ? 'selected' : 'NONE'} — interfaces ${claims || '(none listed)'}`);
+
+      // One transfer is kept across the whole probe rather than a fresh one per
+      // wait. Giving up on a wait does not unpost the transfer, and a posted
+      // transfer will take the next packet the device sends — so a probe that
+      // abandoned one would eat the very answer the next phase is listening
+      // for, and report silence it caused itself.
+      let pending = null;
+      const takeRead = async (waitMs) => {
+        if (!pending) {
+          pending = device.transferIn(inN, eps.inEp.packetSize).then((v) => v, (error) => ({ error }));
+        }
+        const r = await Promise.race([pending, new Promise((res) => setTimeout(() => res('quiet'), waitMs))]);
+        if (r !== 'quiet') pending = null;
+        return r;
+      };
+
+      const readFor = async (label, tries, waitMs) => {
+        let total = 0;
+        const seen = [];
+        for (let attempt = 0; attempt < tries && total < 240; attempt++) {
+          const r = await takeRead(waitMs);
+          if (r === 'quiet') { say(`${label} read ${attempt + 1} → nothing in ${waitMs} ms`); break; }
+          if (r.error) { say(`${label} read ${attempt + 1} → threw: ${r.error.message || r.error}`); break; }
+          const n = r.data ? r.data.byteLength : 0;
+          say(`${label} read ${attempt + 1} → status ${r.status}, ${n} byte(s)`);
+          if (!n) continue;
+          total += n;
+          for (let i = 0; i < n; i++) seen.push(r.data.getUint8(i));
+        }
+        say(`${label} total: ${total} byte(s)`);
+        if (total) {
+          const text = seen.map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b)
+                                      : b === 10 ? '\\n' : b === 13 ? '\\r' : '.')).join('');
+          say(`${label} as text: ${text.slice(0, 400)}`);
+        }
+        return total;
+      };
+
+      // Before anything is asked of it. A running board that has been left alone
+      // is quiet here; bytes at this point are a board that the open disturbed,
+      // and early-boot text says so outright.
+      const unasked = await readFor('idle', 3, 500);
+      say(unasked ? 'the device spoke without being asked — opening the port disturbed it'
+                  : 'the device was quiet before being asked, which is what a running board should be');
+
+      try {
+        const w = await device.transferOut(outN, Uint8Array.of(0x0d));
+        say(`wrote CR → status ${w.status}, ${w.bytesWritten} byte(s) accepted`);
+      } catch (e) {
+        say(`wrote CR → threw: ${e && e.message ? e.message : e}`);
+      }
+
+      const answered = await readFor('answer', 6, 700);
+      say(answered ? 'the carriage return was answered — the wire is whole in both directions'
+                   : 'no answer to the carriage return');
+    };
+
+    Object.defineProperty(port, 'readable', {
+      get() {
+        if (readable || !device.opened) return readable;
+
+        // A transfer posted before a teardown still completes after it, and a
+        // pull sitting on one wakes up into a stream that is already over. That
+        // is an ordinary end, not a failure: `finished` is what tells the two
+        // apart, so a torn-down port stops quietly instead of reporting a USB
+        // read error it never had — and leaving that error as the last word on
+        // what went wrong.
+        let finished = false;
+        let ctrl = null;
+        const inflight = [];
+        // Rejections are caught into a value on the way in: a queued transfer
+        // this stream never gets to look at must not surface as an unhandled
+        // rejection when the device closes under it.
+        const post = () => device.transferIn(eps.inEp.endpointNumber, readLength(eps.inEp))
+          .then((r) => r, (error) => ({ error }));
+        // Closing, not just flagging: a port closed while a reader still holds
+        // the stream would otherwise leave that reader's read() pending on a
+        // stream nothing will ever feed again — silent, and indistinguishable
+        // from a device with nothing to say.
+        const stop = () => {
+          finished = true;
+          inflight.length = 0;
+          try { if (ctrl) ctrl.close(); } catch (_) { /* already closed or errored */ }
+          ctrl = null;
+        };
+        endRead = stop;
+
+        readable = new ReadableStream({
+          start(controller) { ctrl = controller; },
+          async pull(controller) {
+            try {
+              while (!finished && inflight.length < READ_QUEUE) inflight.push(post());
+              port.usbStats.posted = inflight.length;
+              const r = await inflight.shift();
+              if (finished) return;              // torn down while this was in flight
+              if (r.error) throw r.error;
+              if (r.status !== 'ok') throw new Error(`USB read ${r.status}`);
+              const d = r.data;
+              port.usbStats.reads++;
+              if (d && d.byteLength) {
+                port.usbStats.bytesIn += d.byteLength;
+                port.usbStats.lastAt = Date.now();
+                controller.enqueue(new Uint8Array(d.buffer, d.byteOffset, d.byteLength));
+              }
+            } catch (e) {
+              stop();
+              readable = null;          // the port builds a fresh one when asked
+              port.usbStats.errors++;
+              // The message, not just the count. A read that keeps failing is
+              // the whole question, and "err 8" does not answer it.
+              port.usbStats.lastError = `read: ${(e && e.message) || e}`.slice(0, 90);
+              if (!port.usbStats.firstError) port.usbStats.firstError = port.usbStats.lastError;
+              controller.error(e);
+            }
+          },
+          cancel() { stop(); readable = null; },
+        }, { highWaterMark: 1 });
+        return readable;
+      },
+    });
+
+    Object.defineProperty(port, 'writable', {
+      get() {
+        if (writable || !device.opened) return writable;
+        writable = new WritableStream({
+          async write(chunk) {
+            const r = await device.transferOut(eps.outEp.endpointNumber, chunk);
+            if (r.status !== 'ok') {
+              port.usbStats.errors++;
+              port.usbStats.lastError = `write: ${r.status}`;
+              if (!port.usbStats.firstError) port.usbStats.firstError = port.usbStats.lastError;
+              throw new Error(`USB write ${r.status}`);
+            }
+            port.usbStats.writes++;
+            port.usbStats.bytesOut += chunk.byteLength;
+          },
+          abort() { writable = null; },
+          close() { writable = null; },
+        });
+        return writable;
+      },
+    });
+
+    // A close that always ends with the device closed, because closing the
+    // device is what releases the interfaces.
+    //
+    // The polyfill finishes its close by dropping DTR and RTS, and that is a
+    // control transfer — which throws against a device that has just left the
+    // bus. Every teardown here follows a reset, so that is the ordinary case,
+    // not the rare one: the detector run and the flash both hand back a chip
+    // that is rebooting. The throw skips the device close underneath it, the
+    // interfaces stay claimed, and the next open fails on claimInterface —
+    // flashing works and the console that follows it never opens again.
+    const closePort = port.close.bind(port);
+    port.close = async () => {
+      // Ours to tear down, since they are ours to build. Cancelling first stops
+      // the read pull from posting another transfer into a closing device.
+      const [r, w] = [readable, writable];
+      dropStreams();
+      if (r && !r.locked) { try { await r.cancel(); } catch (_) { /* already dead */ } }
+      if (w && !w.locked) { try { await w.abort(); } catch (_) { /* already dead */ } }
+      try { await closePort(); } catch (_) { /* the signal write, on a device already gone */ }
+      if (device.opened) { try { await device.close(); } catch (_) { /* already gone */ } }
+    };
+
+    // An open that survives one claim left behind. Nothing above this can act on
+    // a stale claim, and closing the device releases every interface it holds —
+    // so a failed open closes it and asks once more. The polyfill does that
+    // cleanup itself when it can; this covers the times it could not, and costs
+    // a genuinely absent device one extra refusal.
+    const openPort = port.open.bind(port);
+    const setSignals = port.setSignals.bind(port);
+
+    // Every bulk endpoint carries a one-bit sequence number (DATA0/DATA1) that
+    // both ends must agree on. A receiver that sees the wrong one ACKs the
+    // packet — the sender counts it delivered — and silently discards it as a
+    // retransmission. Nothing errors and nothing retries; one direction of the
+    // port just stops carrying data, which on a console reads as a device that
+    // went mute mid-boot-log, or a keyboard the firmware never hears, while
+    // every transfer on both sides reports success.
+    //
+    // The two ends drift whenever endpoint state moves without a bus event the
+    // other side can see — interfaces claimed and released around a detect run
+    // or a flash, a chip that resets without re-enumerating (USB-Serial-JTAG
+    // rides through chip reset). A kernel serial driver never meets this
+    // because it holds one continuous view of the endpoint from plug to
+    // unplug. This page is the driver here, so its open does what a driver's
+    // open does: CLEAR_FEATURE(ENDPOINT_HALT) on both endpoints, resetting the
+    // toggle to DATA0 on device and host alike.
+    const noteEp0 = (e) => {
+      port.usbStats.lastError = `${(e && e.message) || e}`.slice(0, 90);
+      if (!port.usbStats.firstError) port.usbStats.firstError = port.usbStats.lastError;
+    };
+    const resyncEndpoints = async () => {
+      // Bounded, and a refusal or a hang is worth knowing about but not worth
+      // failing the open for: the endpoints may well be in sync already. A
+      // control transfer that has not answered in this long is not going to.
+      try {
+        await bounded('clearHalt', 1500, device.clearHalt('in', eps.inEp.endpointNumber));
+        await bounded('clearHalt', 1500, device.clearHalt('out', eps.outEp.endpointNumber));
+      } catch (e) {
+        noteEp0(e);
+      }
+    };
+
+    // An open that puts the control lines where the desktop puts them.
+    //
+    // DTR and RTS are not decoration on a chip whose native USB wires them to
+    // its own reset and boot-mode logic. Of the four states, two are wrong in
+    // different directions and one is right:
+    //
+    //   (DTR 1, RTS 0)  the polyfill's own choice, and half of the auto-reset
+    //                   sequence — the half that holds the boot pin down.
+    //   (DTR 0, RTS 0)  an idle line. Nothing is jogged, but nothing is told a
+    //                   host is there either, and a console that answers only a
+    //                   host it can see stays silent to this one.
+    //   (DTR 1, RTS 1)  both asserted, which is what Web Serial does on the
+    //                   desktop when it opens a port — and the desktop is the
+    //                   configuration this page is known to work in.
+    //
+    // So: both, in ONE control transfer, because the pair is what the chip's
+    // logic reads and stepping through a corner of the square on the way would
+    // be the reset this open is promising not to do. The polyfill's own lone
+    // assertion is swallowed for the length of the open so the chip never sees
+    // that corner. `?signals=none` leaves them down, for comparing the two
+    // against real hardware.
+    port.open = async (options) => {
+      // Anything still held from the last session belongs to the device as it
+      // was then. A fresh open gets fresh streams.
+      dropStreams();
+      port.setSignals = async () => {};
+      try {
+        try {
+          await bounded('open', 10000, openPort(options));
+        } catch (_) {
+          if (device.opened) { try { await device.close(); } catch (_) { /* about to fail anyway */ } }
+          await bounded('open', 10000, openPort(options));
+        }
+      } catch (e) {
+        // "Unable to claim interface" is the browser saying something else has
+        // the device, and it is the one failure here a person can actually do
+        // something about — but not from that sentence. Over raw USB the page
+        // needs the interfaces exclusively, and an operating system that has
+        // already bound its own serial driver to them, or an app that opened
+        // the device first, holds them against it.
+        throw /claim/i.test((e && e.message) || '') ? new Error(
+          'Could not take the device’s serial interfaces: something else on this '
+          + 'machine already holds them. Close whatever opened the device — on a phone, '
+          + 'the app that offered to open it when you plugged it in — then unplug and '
+          + 'replug the board. On Linux the holder is usually the kernel’s own cdc_acm '
+          + 'driver, which has to be unbound from this device first.') : e;
+      } finally {
+        port.setSignals = setSignals;
+      }
+      await resyncEndpoints();
+      const on = params.get('signals') !== 'none';
+      try {
+        await bounded('setSignals', 1500, setSignals({ dataTerminalReady: on, requestToSend: on }));
+      } catch (e) {
+        noteEp0(e);          // named in the readout, not fatal to the open
+      }
+    };
+
+    ports.set(device, port);
+    return port;
+  };
+
+  // Chooser filters arrive in Web Serial's vocabulary (usbVendorId /
+  // usbProductId) and WebUSB wants its own, plus the class code so the list
+  // holds serial devices rather than every peripheral on the bus.
+  const usbFilters = (filters) => {
+    const out = (filters || []).map((f) => {
+      const u = { classCode: CDC_CONTROL_CLASS };
+      if (f.usbVendorId !== undefined) u.vendorId = f.usbVendorId;
+      if (f.usbProductId !== undefined) u.productId = f.usbProductId;
+      return u;
+    });
+    return out.length ? out : [{ classCode: CDC_CONTROL_CLASS }];
+  };
+
+  navigator.usb.addEventListener('connect', (e) => {
+    unplugged.delete(e.device);
+    const port = wrap(e.device);
+    if (port) events.dispatchEvent(Object.assign(new Event('connect'), { port }));
+  });
+  // Marked gone before the dispatch: the handlers read `connected` on the way
+  // through, and a port whose device has just left must not read as live.
+  navigator.usb.addEventListener('disconnect', (e) => {
+    unplugged.add(e.device);
+    const port = ports.get(e.device);
+    if (port) events.dispatchEvent(Object.assign(new Event('disconnect'), { port }));
+  });
+
+  return {
+    async requestPort(options) {
+      const filters = usbFilters(options && options.filters);
+      const port = wrap(await navigator.usb.requestDevice({ filters }));
+      if (!port) throw new Error('That device has no USB CDC serial interface, so this page cannot open it.');
+      return port;
+    },
+    async getPorts() {
+      return (await navigator.usb.getDevices()).map((d) => wrap(d)).filter(Boolean);
+    },
+    addEventListener: (...a) => events.addEventListener(...a),
+    removeEventListener: (...a) => events.removeEventListener(...a),
+  };
+}
+
+function chooseSerial() {
+  switch (params.get('serial')) {
+    case 'native': return HAVE_WEB_SERIAL ? navigator.serial : null;
+    case 'usb': return HAVE_WEBUSB ? usbSerial() : null;
+  }
+  if (HAVE_WEBUSB && (IS_ANDROID || !HAVE_WEB_SERIAL)) return usbSerial();
+  return HAVE_WEB_SERIAL ? navigator.serial : null;
+}
+
+// Null on a browser with neither interface, which boot() reports and stops on.
+const SERIAL = chooseSerial();
+// True when the ports come from WebUSB, and so when the CDC-ACM-only limit
+// applies: a board reached through a bridge chip is not in the chooser at all.
+const SERIAL_OVER_USB = !!SERIAL && SERIAL !== navigator.serial;
+
 // ── the tab's ports ─────────────────────────────────────────────────────────
 // A tab opens the ports it was handed by a chooser pick, and no others, ever.
 // Not a preference — the only correct rule available. getInfo() exposes the USB
@@ -765,8 +1407,298 @@ function pinPort(port) {
 // it has already been pointed at. The recovery paths open these and nothing else.
 const isOurs = (p) => !!p && pickedPorts.includes(p);
 
+// ── the screen the keyboard leaves ──────────────────────────────────────────
+// An on-screen keyboard shrinks the visual viewport and leaves the layout one
+// alone, so a fixed full-height element keeps its full height behind the
+// keyboard. Publishing the visual viewport as CSS variables lets the monitor
+// and the dialogs size themselves to what is actually on screen (see
+// index.html): the terminal reflows to fewer rows with its last line just above
+// the keyboard, and a dialog re-centres in the band that is left.
+function syncViewport() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const s = document.documentElement.style;
+  s.setProperty('--vv-top', `${vv.offsetTop}px`);
+  s.setProperty('--vv-height', `${vv.height}px`);
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', syncViewport);
+  window.visualViewport.addEventListener('scroll', syncViewport);
+  syncViewport();
+}
+
+// Focusing the terminal raises the keyboard, so on a touch device the terminal
+// is focused by a tap on it and by nothing else — never by the page deciding a
+// session is ready, which is a keyboard nobody asked for over a screen nobody
+// has touched yet. A pointing device has no such cost, and there the focus is
+// what makes the first keystroke reach the device.
+const TAP_TO_FOCUS = matchMedia('(pointer: coarse)').matches;
+
+const dialogOpen = () => !!document.querySelector('.modal-overlay:not([hidden])');
+
+// Never focus the terminal out from under a dialog either, on any device: the
+// terminal is behind it, and the focus belongs to whatever the dialog is asking.
+function focusTerm(term) {
+  if (!term || TAP_TO_FOCUS || dialogOpen()) return;
+  term.focus();
+}
+
+// The other half of that rule: a dialog opening over a terminal that already
+// holds the focus. Nothing tells the terminal to give it up, so the keyboard
+// stays up over the dialog that just appeared. Watched rather than wired into
+// each dialog — there are a dozen, opened from as many places.
+const dialogFocusWatch = new MutationObserver(() => {
+  if (!dialogOpen()) return;
+  const el = document.activeElement;
+  if (el && $('monitor-term').contains(el)) el.blur();
+});
+for (const el of document.querySelectorAll('.modal-overlay'))
+  dialogFocusWatch.observe(el, { attributes: true, attributeFilter: ['hidden'] });
+
+// And the tap that does raise it. xterm focuses itself on a mouse press and a
+// tap normally reaches that path, but the terminal is the only way to type to
+// the device, so it does not rest on "normally".
+if (TAP_TO_FOCUS) {
+  // A tap, not the end of a scroll. Focusing raises the keyboard, and a drag
+  // that finishes over the terminal is someone reading scrollback, not asking
+  // to type — a focus there kills the gesture, pops the keyboard over what
+  // they were reading, and makes the scrollback effectively unscrollable.
+  // Distance, not duration, is what separates the two.
+  let downAt = null;
+  on('monitor-term', 'pointerdown', (e) => { downAt = { x: e.clientX, y: e.clientY }; });
+  on('monitor-term', 'pointerup', (e) => {
+    const moved = downAt ? Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) : 0;
+    downAt = null;
+    if (moved < 12 && monitor && !dialogOpen()) monitor.term.focus();
+  });
+}
+
+// ── the readout, and the way in ─────────────────────────────────────────────
+// `?debug=1` pins a line of counters over the monitor. Its own DOM, not the
+// terminal's, because half of what it is for is telling a session that has
+// stopped receiving from one that is receiving and not showing: the transport's
+// byte count beside the reader loop's, and the terminal's geometry beside the
+// box it is supposed to fill.
+const DEBUG_HUD = params.get('debug') === '1';
+// Under ?debug=1 only: IN silence this long, with transfers posted, triggers
+// one reopen-to-resync per silence stretch (below). `?resync=N` sets seconds.
+const SILENCE_RESYNC_MS = (parseInt(params.get('resync'), 10) || 10) * 1000;
+let hudResyncedAt = 0;
+
+// A rolling last-bytes buffer, enough to name the log line a stream died on.
+function tailBytes(tail, chunk) {
+  const both = new Uint8Array((tail ? tail.length : 0) + chunk.length);
+  if (tail) both.set(tail, 0);
+  both.set(chunk, tail ? tail.length : 0);
+  return both.length > 240 ? both.slice(-240) : both;
+}
+let hudEl = null;
+let keyEvents = 0;         // input handed over by the terminal or the input line
+let keySent = 0;           // …and how much of it the device accepted
+
+let hudFlash = '';
+
+// Which interfaces of a port's device this page actually holds. WebUSB says so
+// directly, and an open that reported success while claiming nothing is
+// indistinguishable, from every other angle, from a device with nothing to say.
+function claimedOf(port) {
+  const d = port && port.usbDevice;
+  if (!d || !d.configuration) return null;
+  return (d.configuration.interfaces || [])
+    .map((i) => `${i.interfaceNumber}${i.claimed ? '+' : '-'}`).join('');
+}
+
+function hudReport() {
+  const m = monitor;
+  const e = m && m.port && m.port.usbEndpoints;
+  return `flashmon ${location.search || '(no parameters)'}\n`
+    + `transport ${SERIAL_OVER_USB ? 'webusb' : 'web serial'}`
+    + `${e ? ` iface ${e.iface} in EP${e.in} out EP${e.out}` : ''}`
+    + ` readqueue ${READ_QUEUE}`
+    + (m && m.port && m.port.usbName ? ` "${m.port.usbName}"` : '') + '\n'
+    + `${hudEl ? hudEl.dataset.body || '' : ''}`
+    + (m && m.tail && m.tail.length
+        ? `\ntail ${JSON.stringify(new TextDecoder().decode(m.tail))}` : '');
+}
+
+function updateHud() {
+  if (!hudEl) return;
+  const m = monitor;
+  const st = (m && m.port && m.port.usbStats) || {};
+  const box = $('monitor-term');
+  const t = m && m.term;
+  let view = '-';
+  try { const b = t.buffer.active; view = `${b.viewportY}/${b.baseY}`; } catch (_) { /* no terminal */ }
+  // How long since each layer last saw a byte. A fresh transport over a stale
+  // loop is the stream between them; both stale is the device; the transport
+  // stale with transfers posted is a device that has stopped talking to a page
+  // that is still listening.
+  const ago = (t) => (t ? `${((Date.now() - t) / 1000).toFixed(1)}s` : 'never');
+  hudEl.textContent =
+    `usb in ${st.bytesIn || 0}B/${st.reads || 0} (${ago(st.lastAt)}, ${st.posted || 0} posted)`
+    + ` out ${st.bytesOut || 0}B/${st.writes || 0} err ${st.errors || 0}`
+    + ` · loop ${m ? (m.rxBytes || 0) : '-'}B/${m ? (m.rxSeq || 0) : '-'} (${ago(m && m.rxAt)}`
+    + `, behind ${m && m.rxAt && st.lastAt ? ((st.lastAt - m.rxAt) / 1000).toFixed(1) : '0.0'}s)`
+    + ` · keys ${keyEvents}/${keySent}`
+    + ` · term ${t ? `${t.cols}x${t.rows}` : '-'}`
+    + ` box ${box ? `${box.clientWidth}x${box.clientHeight}` : '-'}`
+    + ` · view ${view} · hw ${(m && m.hw) || '-'}`
+    + ` · claimed ${claimedOf(m && m.port) || '-'}`
+    + `\nsession ${m ? [m.gone ? 'gone' : 'live',
+                        m.reattaching ? 'reattaching' : '',
+                        m.rngArmed ? 'rng-armed' : '',
+                        m.rngRecovering ? 'rng-recovering' : '',
+                        `drops ${m.drops || 0}`,
+                        $('stuck-overlay') && !$('stuck-overlay').hidden ? 'stuck-dialog' : '',
+                        $('reconnect-overlay') && !$('reconnect-overlay').hidden ? 'reconnect-dialog' : '',
+                       ].filter(Boolean).join(' ') : 'none'}`
+    + (st.firstError ? `\nfirst ${st.firstError}` : '')
+    + (st.lastError && st.lastError !== st.firstError ? `\nlast ${st.lastError}` : '');
+  // The experiment that splits the one open question: transfers posted, no
+  // completions, no errors is either the host's endpoint state gone bad — a
+  // reopen (which resyncs the endpoints) revives it — or the device deciding
+  // to stop sending, which nothing on this side revives. One reopen per
+  // silence stretch, re-armed only by bytes actually arriving, so a dead port
+  // is reopened once and then left to say dead. Debug-gated deliberately:
+  // if it proves itself as a recovery it gets promoted to one.
+  if (m && !m.gone && !m.reattaching && m.reader && st.lastAt
+      && (st.posted || 0) > 0
+      && Date.now() - st.lastAt > SILENCE_RESYNC_MS
+      && st.lastAt !== hudResyncedAt) {
+    hudResyncedAt = st.lastAt;
+    // Cheapest probe first. A healthy console that is merely idle answers a
+    // bare CR, which settles the question without tearing down streams that
+    // work — a reopen costs a mute window and a pair of notes, and doing one
+    // every quiet stretch turns an idle session into churn. Only a CR that
+    // goes unanswered escalates to the reopen-and-resync.
+    const silentFor = Math.round((Date.now() - st.lastAt) / 1000);
+    (async () => {
+      const seq0 = m.rxSeq;
+      await pokeConsole(m);
+      for (let waited = 0; waited < 1500 && monitor === m && m.rxSeq === seq0; waited += 100)
+        await sleep(100);
+      if (monitor === m && m.rxSeq === seq0) {
+        restreamAfterDrop(m, new Error(
+          `no input for ${silentFor} s with ${st.posted} transfers posted, and a CR went unanswered`));
+      }
+    })();
+  }
+  hudEl.dataset.body = hudEl.textContent;
+  hudEl.textContent = `${hudEl.textContent}\n${hudFlash || 'tap to copy'}`;
+}
+
+function ensureHud() {
+  if (hudEl || !DEBUG_HUD) return;
+  hudEl = document.createElement('div');
+  hudEl.id = 'hud';
+  // At the bottom, clear of the action row, and tappable: a readout nobody can
+  // get off the screen is a readout that gets transcribed by hand, badly. One
+  // tap puts the whole thing on the clipboard.
+  hudEl.style.cssText = `position:absolute;left:0;right:0;bottom:${TAP_TO_FOCUS ? '2.8rem' : '0'};`
+    + 'z-index:45;font:10px/1.35 ui-monospace,SFMono-Regular,monospace;color:#7ee787;'
+    + 'background:rgba(0,0,0,.85);padding:.15rem .3rem;white-space:pre-wrap;'
+    + 'cursor:pointer;user-select:text;-webkit-user-select:text';
+  hudEl.title = 'tap to copy';
+  hudEl.addEventListener('click', async () => {
+    const text = hudReport();
+    let done = false;
+    try { await navigator.clipboard.writeText(text); done = true; } catch (_) { /* denied */ }
+    // Selecting it is the fallback when the clipboard is refused: from there a
+    // long-press copy is the platform's own.
+    if (!done) {
+      const r = document.createRange();
+      r.selectNodeContents(hudEl);
+      const sel = getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+    hudFlash = done ? 'copied' : 'selected — long-press to copy';
+    setTimeout(() => { hudFlash = ''; updateHud(); }, 2000);
+    updateHud();
+  });
+  $('monitor').appendChild(hudEl);
+  setInterval(updateHud, 500);
+}
+
+// A line of input that does not depend on a terminal being able to take
+// keystrokes. On a phone the characters a soft keyboard produces reach a page
+// through composition events that a hidden textarea sitting at a cursor was
+// never really built for, and a console nobody can type into is not a console.
+// So a touch screen gets a plain input: a line is typed, Enter sends it with a
+// carriage return, and the terminal above shows the device's echo of it.
+//
+// `^C` is beside it because a soft keyboard has no way to produce one and a CLI
+// that cannot be interrupted is a CLI you can get stuck in.
+let touchBar = null;
+
+function ensureTouchInput() {
+  if (touchBar || !TAP_TO_FOCUS) return;
+  touchBar = document.createElement('div');
+  touchBar.id = 'touch-line';
+  touchBar.style.cssText = 'position:absolute;left:.6rem;right:.6rem;bottom:.4rem;z-index:44;'
+    + 'display:flex;gap:.4rem;align-items:center';
+
+  const field = document.createElement('input');
+  field.id = 'touch-input';
+  field.type = 'text';
+  field.placeholder = 'type a command, then Enter';
+  field.autocomplete = 'off';
+  field.autocapitalize = 'off';
+  field.spellcheck = false;
+  field.setAttribute('autocorrect', 'off');
+  field.style.cssText = 'flex:1;min-width:0;font:12px/1.4 ui-monospace,SFMono-Regular,monospace;'
+    + 'color:#e6edf3;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.35rem .45rem';
+
+  const btn = 'font:600 12px/1.4 ui-monospace,SFMono-Regular,monospace;color:#e6edf3;'
+    + 'background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.35rem .5rem';
+
+  // The button, not the key, is the reliable way to send a line: Android soft
+  // keyboards routinely report their Enter as keyCode 229 with no usable `key`,
+  // which is a keydown handler that never fires.
+  const enter = document.createElement('button');
+  enter.id = 'touch-send';
+  enter.type = 'button';
+  enter.textContent = '\u23ce';
+  enter.style.cssText = btn;
+
+  const ctrlC = document.createElement('button');
+  ctrlC.id = 'touch-intr';
+  ctrlC.type = 'button';
+  ctrlC.textContent = '^C';
+  ctrlC.style.cssText = btn;
+
+  const send = (bytes) => sendTyped(monitor, bytes);
+  const sendLine = () => {
+    const line = field.value;
+    field.value = '';
+    send(new TextEncoder().encode(`${line}\r`));
+  };
+
+  field.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    sendLine();
+  });
+  ctrlC.addEventListener('click', () => send(Uint8Array.of(0x03)));
+  enter.addEventListener('click', sendLine);
+
+  touchBar.append(field, enter, ctrlC);
+  $('monitor').appendChild(touchBar);
+  // The terminal ends above the bar rather than behind it.
+  $('monitor-term').style.bottom = '2.6rem';
+}
+
 async function openMonitor(port, doReset, banner) {
   $('monitor').hidden = false;
+  syncViewport();
+  // One terminal in this container, always. A monitor that throws part-way
+  // through opening — a port that will not open, most often — has already put
+  // its terminal on screen, and both callers answer a failed open by opening
+  // again. Two terminals in one container is two cursors and two hidden input
+  // boxes, with the keystrokes going to whichever was built last. The catch at
+  // the end of this function is what keeps that from happening; this is the
+  // backstop for a terminal that got left behind some other way.
+  $('monitor-term').textContent = '';
 
   const term = new Terminal({
     fontSize: 12,
@@ -779,44 +1711,86 @@ async function openMonitor(port, doReset, banner) {
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open($('monitor-term'));
-  fit.fit();
-  // The monospace cell size isn't known until the font loads; an early fit
-  // over-counts rows so the content overflows. Re-fit once the font is ready
-  // (and after a tick, as a backstop), and focus so keystrokes reach xterm.
-  if (document.fonts?.ready) document.fonts.ready.then(() => fit.fit());
-  setTimeout(() => { fit.fit(); term.focus(); }, 50);
-  const resizeObserver = new ResizeObserver(() => fit.fit());
-  resizeObserver.observe($('monitor-term'));
+  ensureHud();
+  ensureTouchInput();     // before the fit, so the terminal is sized to what is left
 
-  // Drop incoming bytes until the first reset (below); a plain terminal with no
-  // reset shows everything from the start.
-  monitor = makeSession(port, term, resizeObserver, doReset);
-  syncDetectButton();      // there is a port to run one on now
-  showCfg(monitor.cfg);
-  updateBaudVisibility(port);
-  setMonTitle(null);   // new session: no hostname until the device logs one
+  // Everything from the terminal being on screen to the session running, so
+  // that whatever goes wrong in between, nothing of this attempt is left behind.
+  let live = true;
+  let resizeObserver = null;
+  try {
+    fit.fit();
+    // Every later fit goes through this, so a terminal disposed by the cleanup
+    // below is not re-fitted by a timer or an observer that outlived it.
+    //
+    // A refit that loses rows — the keyboard coming up, most of all — must keep
+    // the bottom of the log on screen, because that is the part being read. A
+    // session scrolled back to read something older is left where it was put.
+    const refit = () => {
+      if (!live) return;
+      const b = term.buffer.active;
+      const atBottom = b.viewportY >= b.baseY;
+      fit.fit();
+      if (atBottom) term.scrollToBottom();
+    };
+    // The monospace cell size isn't known until the font loads; an early fit
+    // over-counts rows so the content overflows. Re-fit once the font is ready
+    // (and after a tick, as a backstop), and focus so keystrokes reach xterm.
+    if (document.fonts?.ready) document.fonts.ready.then(refit);
+    setTimeout(() => { refit(); if (live) focusTerm(term); }, 50);
+    resizeObserver = new ResizeObserver(refit);
+    resizeObserver.observe($('monitor-term'));
 
-  // Forward keystrokes to the current writer. The device's serial line stays in
-  // log mode until it receives input, then switches to the interactive CLI.
-  const encoder = new TextEncoder();
-  term.onData((data) => {
-    const w = monitor && monitor.writer;
-    if (w) w.write(encoder.encode(data)).catch(() => { /* port gone */ });
-  });
+    // Drop incoming bytes until the first reset (below); a plain terminal with no
+    // reset shows everything from the start.
+    monitor = makeSession(port, term, resizeObserver, doReset);
+    syncDetectButton();      // there is a port to run one on now
+    showCfg(monitor.cfg);
+    updateBaudVisibility(port);
+    setMonTitle(null);   // new session: no hostname until the device logs one
 
-  // A reset is its own flush — the boot log that follows starts at a line
-  // boundary — so the handshake that discards a wrapped backlog is only for the
-  // sessions that open on a device left running, and a reset session opens
-  // without writing a byte.
-  await attachStreams(monitor, doReset ? 'quiet' : 'sync');
+    // Forward keystrokes to the current writer. The device's serial line stays in
+    // log mode until it receives input, then switches to the interactive CLI.
+    // A rejected write is the same drop seen from the other side, and the more
+    // likely side to see it first: the reader is idle between bursts, while a
+    // keystroke goes out the moment it is typed. Silently swallowing it is what
+    // makes a dead stream look like a device that stopped listening.
+    const encoder = new TextEncoder();
+    term.onData((data) => { sendTyped(monitor, encoder.encode(data)); });
 
-  if (banner && banner.length) {
-    for (const line of banner) term.writeln(`\x1b[36m${line}\x1b[0m`);
-    term.writeln('');
-  }
-  if (doReset) {
-    await resetDevice(port);
-    monitor.muted = false;   // from here on, show the device's post-reset output
+    // A reset is its own flush — the boot log that follows starts at a line
+    // boundary — so the handshake that discards a wrapped backlog is only for the
+    // sessions that open on a device left running, and a reset session opens
+    // without writing a byte.
+    await attachStreams(monitor, doReset ? 'quiet' : 'sync');
+
+    if (banner && banner.length) {
+      for (const line of banner) term.writeln(`\x1b[36m${line}\x1b[0m`);
+      term.writeln('');
+    }
+    if (doReset) {
+      await resetDevice(port);
+      monitor.muted = false;   // from here on, show the device's post-reset output
+    }
+  } catch (e) {
+    // A half-open monitor is of no use to anyone above, and the retry that
+    // follows builds its own — so this one leaves nothing behind, terminal
+    // included.
+    live = false;
+    if (resizeObserver) resizeObserver.disconnect();
+    const half = monitor;
+    monitor = null;
+    if (half) { try { await detachStreams(half); } catch (_) { /* never attached */ } }
+    term.dispose();
+    $('monitor-term').textContent = '';
+    setMonTitle(null);
+    syncDetectButton();
+    // And out of the way. Every caller answers a failed open by putting the
+    // reason on the intro screen — which is behind this overlay. Left up, a
+    // port that would not open presents as a black rectangle that does nothing,
+    // with the sentence explaining it hidden underneath.
+    $('monitor').hidden = true;
+    throw e;
   }
 }
 
@@ -854,7 +1828,7 @@ async function applyCfg() {
   } catch (e) {
     monitor.term.writeln(`\r\n\x1b[31m── reconfigure failed: ${e && e.message ? e.message : e} ──\x1b[0m`);
   }
-  monitor.term.focus();
+  focusTerm(monitor.term);
 }
 
 // ── monitor UI wiring ───────────────────────────────────────────────────────
@@ -876,14 +1850,18 @@ $('monitor-reset').addEventListener('click', async () => {
     note(term, `\x1b[31m-- reset failed: ${e && e.message ? e.message : e} --\x1b[0m`);
   }
   term.scrollToBottom();   // snap to the bottom so the boot log scrolls into view
-  term.focus();            // so the next Enter goes to the device, not this button
+  focusTerm(term);         // so the next Enter goes to the device, not this button
 });
 
 // ── settings panel ──────────────────────────────────────────────────────────
 // The gear, top right, on screen from the first paint: everything here is worth
 // changing before a port is picked (a device that logs at a different rate, a
 // session that must not reset the board) as well as during a session.
-function openSettings() { $('settings-box').hidden = false; $('settings-overlay').hidden = false; }
+function openSettings() {
+  syncForgetButton();   // another tab may have stored or wiped since this one opened
+  $('settings-box').hidden = false;
+  $('settings-overlay').hidden = false;
+}
 function closeSettings() { $('settings-box').hidden = true; $('settings-overlay').hidden = true; }
 
 on('gear', 'click', () => {
@@ -907,6 +1885,20 @@ on('set-defaults', 'click', () => {
       : 'Could not save: this browser is not storing anything for this page.';
   }
 });
+
+// Drop the answers setup was told to reuse, so the next fresh node asks again.
+on('set-forget', 'click', () => {
+  forgetStoredAnswers();
+  const msg = $('settings-saved');
+  if (msg) msg.textContent = 'Stored device password and wifi networks deleted.';
+});
+
+// The button is also the answer to "is this browser holding any?" — nothing
+// stored, nothing to press.
+function syncForgetButton() {
+  const b = $('set-forget');
+  if (b) b.disabled = !haveStoredAnswers();
+}
 
 // The baud selector is meaningless on a native USB device: the ESP32-S3's own
 // USB (both the Serial/JTAG peripheral and a CDC console) carries the console
@@ -1839,6 +2831,26 @@ function handleNetLine(m, line) {
     if (ssid) m.aps.set(ssid, { ssid, open });
     return;
   }
+  // `setup: on-device` — this build asks a fresh node's questions on its own
+  // screen. Printed every boot, before the device decides whether it has
+  // anything to ask, so it is the build talking rather than this boot: the one
+  // thing this page needs in order to stay out of the way. It also arrives
+  // before `spangap ready`, which is what makes the wait below exact.
+  if (line.includes('setup: on-device')) {
+    if (!m.deviceOnboards) {
+      m.deviceOnboards = true;
+      closeSetupDialogs(m);
+    }
+    return;
+  }
+  // `spangap ready` — the boot walk is done, so everything that was going to
+  // announce itself has. Until then a watched boot's setup flow waits: the
+  // device's own onboarding registers near the END of that walk, and asking
+  // before it has had its say is how two surfaces end up asking at once.
+  if (line.includes('spangap ready')) {
+    if (!m.bootDone) { m.bootDone = true; advanceSetup(m); }
+    return;
+  }
   // `No device password set` — the device has no admin password. Kick off the
   // setup flow (password dialog first, then wifi if needed).
   if (line.includes('No device password set')) {
@@ -1935,26 +2947,30 @@ function openConnectDialog(m) {
   other.dataset.other = '1';
   sel.appendChild(other);
 
-  $('ch-hostname').value = m.hostname || HOSTNAME_DEFAULT;
   $('ch-ssid-custom').value = '';
   $('ch-pass').value = '';
+  if ($('ch-remember')) $('ch-remember').checked = false;
   updateConnectFields();
   $('connect-overlay').hidden = false;
-  $('ch-hostname').focus();
+  // Land on the field that still needs typing: the SSID when the scan found
+  // nothing to pick from, otherwise the password — or the select itself when the
+  // chosen network is open and there is nothing left to fill in.
+  if (!$('ch-ssid-other').hidden) $('ch-ssid-custom').focus();
+  else if (!$('ch-pass-wrap').hidden) $('ch-pass').focus();
+  else $('ch-ssid').focus();
 }
 
 function closeConnectDialog() { $('connect-overlay').hidden = true; }
 
 $('ch-ssid').addEventListener('change', updateConnectFields);
-// Block any insertion that contains an illegal hostname char (typed or pasted)
-// before it lands, so nothing happens — the text and caret are untouched, and
-// nothing has to be reported after the fact. Deletions/navigation have null data
-// and pass through. The 20-char cap is the input's native maxlength.
-$('ch-hostname').addEventListener('beforeinput', (e) => {
-  if (e.data && /[^A-Za-z0-9_]/.test(e.data)) e.preventDefault();
-});
+// Enter anywhere in the wifi box is Connect: the fields it has are already
+// filled from the scan unless the network is secured or unlisted, so typing the
+// one value and pressing return is the whole dialog.
+for (const id of ['ch-ssid', 'ch-ssid-custom', 'ch-pass']) {
+  on(id, 'keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('ch-send').click(); } });
+}
 
-// Cancelling the wifi box skips wifi but still lets the setup flow finish
+// Skipping the wifi box skips wifi but still lets the setup flow finish
 // (e.g. set the password). "Connect" records the choice; the batched send
 // happens in advanceSetup once every needed dialog is settled.
 $('ch-cancel').addEventListener('click', () => {
@@ -1970,10 +2986,6 @@ $('ch-cancel').addEventListener('click', () => {
 $('ch-send').addEventListener('click', () => {
   const m = monitor;
   if (!m) { closeConnectDialog(); return; }
-  // The field can only ever hold legal hostname characters (the beforeinput
-  // filter above) up to its maxlength, so whatever is in it is usable as-is; an
-  // empty field means "keep the default".
-  const hostname = $('ch-hostname').value.trim() || HOSTNAME_DEFAULT;
   const sel = $('ch-ssid');
   const opt = sel.selectedOptions[0];
   const isOther = !!(opt && opt.dataset.other === '1');
@@ -1982,34 +2994,355 @@ $('ch-send').addEventListener('click', () => {
   const isOpen = !isOther && opt && opt.dataset.open === '1';
   const pass = isOpen ? '' : $('ch-pass').value;
 
-  m.hostname = hostname;
-  m.wifiCfg = { hostname, ssid, pass };
+  if ($('ch-remember') && $('ch-remember').checked) rememberWifi(ssid, pass);
+  m.wifiCfg = { ssid, pass };
   m.wifiResolved = true;
   m.wifiOpen = false;
   closeConnectDialog();
   advanceSetup(m);
 });
 
+// ── hostname dialog ─────────────────────────────────────────────────────────
+// The one answer that is about this node and cannot be reused, so it is asked
+// on its own — a name typed on every node, next to two dialogs that a browser
+// holding the answers will skip.
+function openHostDialog(m) {
+  m.hostOpen = true;
+  $('hn-name').value = m.hostname || HOSTNAME_DEFAULT;
+  $('host-overlay').hidden = false;
+  $('hn-name').focus();
+  $('hn-name').select();
+}
+
+function closeHostDialog() { if ($('host-overlay')) $('host-overlay').hidden = true; }
+
+// Block any insertion that contains an illegal hostname char (typed or pasted)
+// before it lands, so nothing happens — the text and caret are untouched, and
+// nothing has to be reported after the fact. Deletions/navigation have null data
+// and pass through. The 20-char cap is the input's native maxlength.
+on('hn-name', 'beforeinput', (e) => {
+  if (e.data && /[^A-Za-z0-9_]/.test(e.data)) e.preventDefault();
+});
+on('hn-name', 'keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('hn-ok').click(); } });
+
+on('hn-skip', 'click', () => {
+  const m = monitor;
+  closeHostDialog();
+  if (!m) return;
+  m.newHostname = null;          // the device keeps whatever name it has
+  m.hostResolved = true;
+  m.hostOpen = false;
+  advanceSetup(m);
+});
+
+on('hn-ok', 'click', () => {
+  const m = monitor;
+  if (!m) { closeHostDialog(); return; }
+  // The field can only ever hold legal hostname characters (the beforeinput
+  // filter above) up to its maxlength, so whatever is in it is usable as-is; an
+  // empty field means "keep the default".
+  const hostname = $('hn-name').value.trim() || HOSTNAME_DEFAULT;
+  m.hostname = hostname;
+  m.newHostname = hostname;
+  m.hostResolved = true;
+  m.hostOpen = false;
+  closeHostDialog();
+  advanceSetup(m);
+});
+
+// ── answers this browser reuses across nodes ────────────────────────────────
+// Setting up a pile of fresh nodes is the same three answers over and over, two
+// of which are the same on every one of them. Ticking the box in either dialog
+// stores that answer here, and setup then skips the dialog it came from: a node
+// costs one dialog (its name) instead of three.
+//
+// Both are held in this origin's LocalSettings as plain text — the browser's
+// storage is the trust boundary, the same one the page's other settings sit
+// behind. The settings panel's "Delete stored wifi and node passwords" wipes
+// both.
+const NODE_PW_KEY = 'flashmon.nodePassword';   // LocalSettings: admin password for every new node
+const WIFI_KEY = 'flashmon.wifiNetworks';      // LocalSettings: [{ssid, pass}], most recent first
+
+function storedNodePassword() {
+  try { return localStorage.getItem(NODE_PW_KEY) || null; } catch (_) { return null; }
+}
+
+function rememberNodePassword(pw) {
+  try { localStorage.setItem(NODE_PW_KEY, pw); } catch (_) { /* storage blocked */ }
+  syncForgetButton();
+}
+
+function storedWifi() {
+  try {
+    const v = JSON.parse(localStorage.getItem(WIFI_KEY));
+    if (!Array.isArray(v)) return [];
+    return v.filter((n) => n && typeof n.ssid === 'string' && typeof n.pass === 'string');
+  } catch (_) { return []; }
+}
+
+// One entry per SSID — a re-entered password replaces the stored one rather than
+// leaving two answers for the same network.
+function rememberWifi(ssid, pass) {
+  const list = storedWifi().filter((n) => n.ssid !== ssid);
+  list.unshift({ ssid, pass });
+  try { localStorage.setItem(WIFI_KEY, JSON.stringify(list)); } catch (_) { /* storage blocked */ }
+  syncForgetButton();
+}
+
+// The remembered network to use for this device: the first one the device's own
+// scan actually saw. A stored network out of range says nothing about where this
+// node should join, so it is not offered.
+function storedWifiInRange(m) {
+  for (const n of storedWifi()) if (m.aps.has(n.ssid)) return n;
+  return null;
+}
+
+function haveStoredAnswers() { return !!storedNodePassword() || storedWifi().length > 0; }
+
+function forgetStoredAnswers() {
+  try {
+    localStorage.removeItem(NODE_PW_KEY);
+    localStorage.removeItem(WIFI_KEY);
+  } catch (_) { /* storage blocked — there was nothing stored either */ }
+  syncForgetButton();
+}
+
 // ── device setup coordinator ─────────────────────────────────────────────────
-// A fresh device can need a password and/or a wifi network. We show the password
-// dialog first (on "No device password set"), then the wifi dialog (on the AP
-// fallback), and finally send everything the user chose in ONE batch. Cancelling
-// either dialog just skips that part and lets the rest proceed.
+// A fresh device can need a password and/or a network. The dialogs run in order
+// — password (on "No device password set"), hostname, then wifi (both on the AP
+// fallback) — and everything the user chose goes out in ONE batch at the end.
+// Skipping a dialog skips that part and lets the rest proceed; an answer this
+// browser was told to reuse (the node password, a remembered network in range)
+// skips its dialog outright.
+// Take down every setup dialog and mark what it was asking as settled, so the
+// coordinator neither re-opens it nor stalls waiting on it. Used both when the
+// user's own action supersedes them (closeDialogs) and when the device turns out
+// to be asking for itself.
+function closeSetupDialogs(m) {
+  if (!m) return;
+  if (m.passwdOpen) { m.passwdOpen = false; m.passwdResolved = true; closePasswdDialog(); }
+  if (m.hostOpen)   { m.hostOpen = false;   m.hostResolved = true;   closeHostDialog(); }
+  if (m.wifiOpen)   { m.wifiOpen = false;   m.wifiResolved = true;   closeConnectDialog(); }
+  if (m.loraOpen)   { m.loraOpen = false;   m.loraResolved = true;   closeLoraDialog(); }
+  if (m.lxmfOpen)   { m.lxmfOpen = false;   m.lxmfResolved = true;   closeLxmfDialog(); }
+}
+
 function resetSetup(m) {
+  // This session watched the boot start, so it can wait for the end of it —
+  // `spangap ready` — before asking anything. Cleared here and set by that line.
+  m.bootWatching = true;
+  m.bootDone = false;
+  m.deviceOnboards = false;   // the marker comes round again on the new boot
+  m.onboardProbed = false;
   m.needPasswd = false;
   m.passwdResolved = false;
   m.newPasswd = null;
   m.passwdOpen = false;
+  m.hostResolved = false;
+  m.newHostname = null;
+  m.hostOpen = false;
   m.wifiNeeded = false;
   m.wifiResolved = false;
   m.wifiCfg = null;
   m.wifiOpen = false;
   m.connectedSeen = false;
+  m.extrasProbed = false;
+  m.extrasProbing = false;
+  m.loraNeeded = false;
+  m.loraSupe = false;
+  m.loraResolved = false;
+  m.loraCfg = null;
+  m.loraOpen = false;
+  m.lxmfNeeded = false;
+  m.lxmfResolved = false;
+  m.lxmfName = null;
+  m.lxmfOpen = false;
   m.setupSent = false;
   m.aps.clear();
   closePasswdDialog();
+  closeHostDialog();
   closeConnectDialog();
+  closeLoraDialog();
+  closeLxmfDialog();
 }
+
+// ── what the boot log doesn't say ───────────────────────────────────────────
+// The radio and the mesh identity have no boot line to watch: nothing is logged
+// for "this radio has never been given a frequency" or "there is no identity
+// yet", because neither is an event — they are states. So they are asked for,
+// once, over the same framed channel the setup commands go out on, and only
+// after the questions that DO have boot lines are settled.
+//
+// `show <key>` answers each one: it prints `<key> = <value>` when the key is
+// there and the literal `(no matches)` when it isn't. That is the whole
+// protocol — an absent straddle, an absent key and an unset value are all
+// distinguishable without any new firmware verb.
+//
+// ONE KEY PER QUERY, never a subtree. A reply frame is length-counted and the
+// device's log echo goes to the same wire on its own path, so a log line that
+// lands inside a frame is unrecoverable for this side — and the wider the frame,
+// the wider that window. Asking `show s.lora.0` during the boot storm (wifi
+// associating, ntp, webrtc, the mesh coming up) put a ~25-line reply in the
+// middle of it and lost frames, which surface as `SG` + the frame's id printed
+// into the terminal. Each of these replies is one short line.
+//
+// Firmware that doesn't speak frames is left alone: we cannot ask, so we don't
+// guess, and neither dialog opens.
+// Does this build carry its own on-device setup? `s.onboard.done` is written by
+// that setup's own init, so the key exists in a build that has it and nowhere
+// else — the same "a key that is there is the capability" reading the extras
+// probe uses. Only reached when this session did not watch the boot (where the
+// device's own marker line answers it for free); firmware without frames cannot
+// be asked and is left to the marker alone.
+async function probeOnboarding(m) {
+  if (m.onboardProbing || m.onboardProbed) return;
+  m.onboardProbing = true;
+  if (await rpcEnsure(m)) {
+    const out = await rpcQuery(m, 'show s.onboard.done');
+    if (monitor !== m) return;
+    if (out && !/\(no matches\)/.test(out)) {
+      m.deviceOnboards = true;
+      closeSetupDialogs(m);
+    }
+  }
+  m.onboardProbed = true;
+  m.onboardProbing = false;
+  if (monitor === m) advanceSetup(m);
+}
+
+async function probeExtras(m) {
+  if (m.extrasProbing || m.extrasProbed) return;
+  m.extrasProbing = true;
+  const done = () => {
+    m.extrasProbed = true;
+    m.extrasProbing = false;
+    if (monitor === m) advanceSetup(m);
+  };
+  if (!(await rpcEnsure(m))) { done(); return; }
+
+  // A key that is there is the capability; `(no matches)` is the absence of it.
+  const has = (out) => !!out && !/\(no matches\)/.test(out);
+  const intOf = (out, key) => {
+    const mm = out && new RegExp(`^${key.replace(/\./g, '\\.')} = (-?\\d+)`, 'm').exec(out);
+    return mm ? parseInt(mm[1], 10) : null;
+  };
+
+  // enable is seeded for every radio in the build, so its presence says there
+  // IS a radio; frequency ships with no default at all (the antenna and the
+  // region decide it), so its absence says the radio was never set up.
+  const loraOn = await rpcQuery(m, 'show s.lora.0.enable');
+  if (monitor !== m) return;                       // session went away mid-probe
+  if (has(loraOn)) {
+    const freq = await rpcQuery(m, 'show s.lora.0.frequency');
+    if (monitor !== m) return;
+    m.loraNeeded = !((intOf(freq, 's.lora.0.frequency') || 0) > 0);
+    if (m.loraNeeded) {
+      const supe = await rpcQuery(m, 'show s.lora.0.SUPE.enable');
+      if (monitor !== m) return;
+      m.loraSupe = has(supe);                      // the key exists only on a SUPE build
+    }
+  }
+
+  // Identity slot 0 carries a label from the moment one is created, so its
+  // absence is "no identity". That reads the same as "no messaging in this
+  // build", so ask for a key the straddle always seeds before concluding there
+  // is anything to ask the operator.
+  const label = await rpcQuery(m, 'show s.lxmf.id.0.label');
+  if (monitor !== m) return;
+  if (!has(label)) {
+    const ver = await rpcQuery(m, 'show s.lxmf.version');
+    if (monitor !== m) return;
+    m.lxmfNeeded = has(ver);
+  }
+  done();
+}
+
+// ── the LoRa dialog ─────────────────────────────────────────────────────────
+function openLoraDialog(m) {
+  m.loraOpen = true;
+  $('lora-msg').textContent = '';
+  $('lora-supe-row').hidden = !m.loraSupe;
+  if ($('lora-supe')) $('lora-supe').checked = false;
+  $('lora-overlay').hidden = false;
+  $('lora-freq').focus();
+}
+
+function closeLoraDialog() { if ($('lora-overlay')) $('lora-overlay').hidden = true; }
+
+on('lora-freq', 'keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('lora-ok').click(); } });
+
+on('lora-skip', 'click', () => {
+  const m = monitor;
+  closeLoraDialog();
+  if (!m) return;
+  m.loraCfg = null;
+  m.loraResolved = true;
+  m.loraOpen = false;
+  advanceSetup(m);
+});
+
+on('lora-ok', 'click', () => {
+  const m = monitor;
+  if (!m) { closeLoraDialog(); return; }
+  const mhz = $('lora-freq').value.trim();
+  // The radio's own bounds (iface-lora's LORA_FREQ_MIN_HZ / LORA_FREQ_MAX_HZ).
+  // Checked here so the answer is "no" rather than a value the device's unit
+  // bridge silently snaps back after the dialog has closed.
+  const v = parseFloat(mhz);
+  if (!/^\d+(\.\d+)?$/.test(mhz) || !(v >= 100 && v <= 2000)) {
+    $('lora-msg').textContent = 'Not a frequency this radio can be set to.';
+    $('lora-freq').focus();
+    return;
+  }
+  m.loraCfg = {
+    mhz,
+    sf: $('lora-sf').value,
+    bw: $('lora-bw').value,
+    cr: $('lora-cr').value,
+    supe: !!($('lora-supe') && m.loraSupe && $('lora-supe').checked),
+  };
+  m.loraResolved = true;
+  m.loraOpen = false;
+  closeLoraDialog();
+  advanceSetup(m);
+});
+
+// ── the mesh-name dialog ────────────────────────────────────────────────────
+function openLxmfDialog(m) {
+  m.lxmfOpen = true;
+  // The hostname is already a name this node was given, so it is a better
+  // starting point than an empty field — and still just a starting point.
+  $('lxmf-name').value = m.newHostname || m.hostname || '';
+  $('lxmf-overlay').hidden = false;
+  $('lxmf-name').focus();
+  $('lxmf-name').select();
+}
+
+function closeLxmfDialog() { if ($('lxmf-overlay')) $('lxmf-overlay').hidden = true; }
+
+on('lxmf-name', 'keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('lxmf-ok').click(); } });
+
+on('lxmf-skip', 'click', () => {
+  const m = monitor;
+  closeLxmfDialog();
+  if (!m) return;
+  m.lxmfName = null;
+  m.lxmfResolved = true;
+  m.lxmfOpen = false;
+  advanceSetup(m);
+});
+
+on('lxmf-ok', 'click', () => {
+  const m = monitor;
+  if (!m) { closeLxmfDialog(); return; }
+  const name = $('lxmf-name').value.trim();
+  if (!name) { $('lxmf-name').focus(); return; }
+  m.lxmfName = name;
+  m.lxmfResolved = true;
+  m.lxmfOpen = false;
+  closeLxmfDialog();
+  advanceSetup(m);
+});
 
 // Send whatever the user chose, once. The admin password uses `auth passwd
 // admin <pw>` (non-interactive; the bare `passwd` command prompts). The
@@ -2025,11 +3358,29 @@ async function sendSetup(m) {
   if (m.setupSent) return;
   const cmds = [];
   if (m.newPasswd) cmds.push(`auth passwd admin ${m.newPasswd}`);
+  if (m.newHostname) cmds.push(`hostname ${m.newHostname}`);
   if (m.wifiCfg) {
-    cmds.push(`hostname ${m.wifiCfg.hostname}`);
     cmds.push(`net add ${cliQuote(m.wifiCfg.ssid)}` +
               (m.wifiCfg.pass ? ` ${cliQuote(m.wifiCfg.pass)}` : ''));
   }
+  if (m.loraCfg) {
+    // Frequency and bandwidth go to the MHz/kHz display keys — iface-lora's own
+    // unit bridge converts them to the stored Hz, so the conversion lives in one
+    // place and any value works. Enable goes LAST: the modem settings are in
+    // before the radio is brought up against them.
+    cmds.push(`set lora.0.freq_mhz ${m.loraCfg.mhz}`);
+    cmds.push(`set lora.0.bw_khz ${m.loraCfg.bw}`);
+    cmds.push(`set s.lora.0.spreading_factor ${m.loraCfg.sf}`);
+    cmds.push(`set s.lora.0.coding_rate ${m.loraCfg.cr}`);
+    if (m.loraCfg.supe) cmds.push('set s.lora.0.SUPE.enable 1');
+    cmds.push('set s.lora.0.enable 1');
+  }
+  // lxmf's own verb, not the storage sentinel behind it: it takes the name as
+  // the rest of the line (so spaces need no quoting, and quoting would put the
+  // quotes IN the name), it creates the identity synchronously, and it answers
+  // with the slot and destination — which is what makes this one confirmable
+  // like every other command in the batch.
+  if (m.lxmfName) cmds.push(`lxmf create ${m.lxmfName}`);
   if (!cmds.length) return;   // user skipped everything
   cmds.push('save');
   m.setupSent = true;         // synchronously, before any await — no double send
@@ -2052,6 +3403,14 @@ async function sendSetupFramed(m, cmds) {
   note(m, '\x1b[90m-- setup sent --\x1b[0m');
   const net = await rpcQuery(m, 'net -O');
   if (net === null || monitor !== m) return;
+  // A second `save`, after the round trip above has given the device's own
+  // tasks a moment. Not everything in the batch lands on the task that ran it:
+  // iface-lora converts the MHz/kHz display keys into the stored Hz on its own
+  // task, so `s.lora.0.frequency` is written AFTER the `save` at the end of the
+  // batch. Storage's own deadline is a minute out, and a device unplugged
+  // inside that minute would come back with a password, a name and a network
+  // but no radio — the worst possible half.
+  if (m.loraCfg) await rpcQuery(m, 'save');
   const kv = parseKv(net);
   if (kv.get('hostname')) {
     m.hostname = kv.get('hostname');
@@ -2066,22 +3425,74 @@ async function sendSetupFramed(m, cmds) {
 
 function advanceSetup(m) {
   if (m.setupSent) return;
-  // 1. Password dialog first.
+  // The device sets itself up on its own screen: either the image we flashed
+  // said so (imageOnboardsItself) or the device itself did (`setup: on-device`).
+  // Every dialog below would be asking for an answer it is asking for at the
+  // same moment, and the winner of that race is not predictable.
+  if (deviceOnboards || m.deviceOnboards) return;
+  // A boot we watched start gets to finish before anything is asked. The
+  // device's own onboarding announces itself near the END of the init walk,
+  // while "No device password set" comes out near the beginning — so acting on
+  // the early line is exactly how a dialog opens ten seconds before the device
+  // says it did not need one. `spangap ready` is the end of that walk.
+  if (m.bootWatching && !m.bootDone) return;
+  // Attached mid-session, so there was no boot to watch and no marker to catch:
+  // ask the device instead. The key exists only in a build carrying on-device
+  // setup, so its presence is the answer. One short framed query, once.
+  if (!m.onboardProbed) { probeOnboarding(m); return; }
+  // 1. Password first — from storage if this browser was told to set the same
+  //    one on every node, otherwise the dialog.
   if (m.needPasswd && !m.passwdResolved) {
-    if (!m.passwdOpen) openPasswdDialog(m);
-    return;
+    const stored = storedNodePassword();
+    if (stored) {
+      m.newPasswd = stored;
+      m.passwdResolved = true;
+      note(m, '\x1b[90m-- using the stored node password --\x1b[0m');
+    } else {
+      if (!m.passwdOpen) openPasswdDialog(m);
+      return;
+    }
   }
   if (m.passwdOpen) return;   // user still in the password dialog
-  // 2. Wifi dialog next, if the device fell back to its own AP.
-  if (m.wifiNeeded && !m.wifiResolved) {
-    if (!m.wifiOpen) openConnectDialog(m);
+  // 2. Hostname next, if the device fell back to its own AP. Asked even when
+  //    the network below is answered from storage: the name is this node's.
+  if (m.wifiNeeded && !m.hostResolved) {
+    if (!m.hostOpen) openHostDialog(m);
     return;
   }
+  if (m.hostOpen) return;     // user still in the hostname dialog
+  // 3. Then the network — from a remembered one the device's scan saw, else the
+  //    dialog.
+  if (m.wifiNeeded && !m.wifiResolved) {
+    const known = storedWifiInRange(m);
+    if (known) {
+      m.wifiCfg = { ssid: known.ssid, pass: known.pass };
+      m.wifiResolved = true;
+      note(m, `\x1b[90m-- using the stored network "${known.ssid}" --\x1b[0m`);
+    } else {
+      if (!m.wifiOpen) openConnectDialog(m);
+      return;
+    }
+  }
   if (m.wifiOpen) return;     // user still in the wifi dialog
-  // 3. Everything settled. Send — but if we don't yet know whether a wifi dialog
-  //    is coming (no AP and no connect yet), wait so we can batch it in.
-  if (!m.newPasswd && !m.wifiCfg) return;         // nothing chosen
-  if (!m.wifiNeeded && !m.connectedSeen) return;  // wifi need still undetermined
+  // 4. The two questions the boot log can't raise. Wait until the wifi need is
+  //    settled first: the probe costs a round trip and the answer doesn't change
+  //    while the earlier dialogs are up.
+  if (!m.wifiNeeded && !m.connectedSeen) return;   // wifi need still undetermined
+  if (!m.extrasProbed) { probeExtras(m); return; } // async; re-enters here
+  // 5. The radio, then the name on the mesh.
+  if (m.loraNeeded && !m.loraResolved) {
+    if (!m.loraOpen) openLoraDialog(m);
+    return;
+  }
+  if (m.loraOpen) return;
+  if (m.lxmfNeeded && !m.lxmfResolved) {
+    if (!m.lxmfOpen) openLxmfDialog(m);
+    return;
+  }
+  if (m.lxmfOpen) return;
+  // 6. Everything settled — send whatever was actually chosen.
+  if (!m.newPasswd && !m.newHostname && !m.wifiCfg && !m.loraCfg && !m.lxmfName) return;
   sendSetup(m);
 }
 
@@ -2092,6 +3503,7 @@ function openPasswdDialog(m) {
   $('pw-2').value = '';
   $('pw-msg').textContent = '';
   $('pw-msg').className = 'pw-msg';
+  if ($('pw-remember')) $('pw-remember').checked = false;
   $('passwd-overlay').hidden = false;
   $('pw-1').focus();
 }
@@ -2127,6 +3539,12 @@ $('pw-suggest').addEventListener('click', async () => {
   $('pw-2').focus();
 });
 
+// The dialog is two fields and a return: Enter on the password moves to the
+// retype (as Tab does — Suggest is out of the tab order), Enter on the retype is
+// the button. Nothing here has to be clicked.
+on('pw-1', 'keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('pw-2').focus(); } });
+on('pw-2', 'keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('pw-ok').click(); } });
+
 $('pw-ok').addEventListener('click', () => {
   const m = monitor;
   if (!m) { closePasswdDialog(); return; }
@@ -2141,6 +3559,7 @@ $('pw-ok').addEventListener('click', () => {
     return;
   }
   if (p1 !== p2) { pwMsg('Passwords don’t match.'); $('pw-2').focus(); return; }
+  if ($('pw-remember') && $('pw-remember').checked) rememberNodePassword(p1);
   m.newPasswd = p1;
   m.passwdResolved = true;
   m.passwdOpen = false;
@@ -2211,8 +3630,9 @@ function showOpenUi(m, ip, ssid) {
   uiPressCount = 0;
   $('open-ui').hidden = false;
   // Explain how to reach the UI only when WE just put the device on this network
-  // (m.wifiCfg = the credentials the user entered this session). A device that
-  // auto-joined a network it was already provisioned for just gets the button.
+  // (m.wifiCfg = the credentials this session provisioned, typed or remembered).
+  // A device that auto-joined a network it was already provisioned for just gets
+  // the button.
   if (!uiInfoShown && m.wifiCfg) {
     uiInfoShown = true;
     showInfo(`Device connected to ${deviceUiSsid || 'WiFi'}`, deviceInfoHtml());
@@ -2229,7 +3649,7 @@ function hideOpenUi() {
 // Force-dismiss every modal dialog. The floating action buttons (Detect
 // Hardware / Open Device UI / Reset) sit above the overlay and call this, so one
 // click both fires the action AND clears whatever dialog was up — no separate
-// dismiss click. Setup-input dialogs (password / wifi), if open, are marked
+// dismiss click. Setup-input dialogs (password / hostname / wifi), if open, are marked
 // settled so the setup coordinator neither re-opens them nor stalls waiting on
 // them.
 function closeDialogs(m) {
@@ -2238,8 +3658,7 @@ function closeDialogs(m) {
   closeDeviceBox();
   closeUiChoice();
   cancelStateWarn();       // an unanswered warning means: don't flash
-  if (m && m.passwdOpen) { m.passwdOpen = false; m.passwdResolved = true; closePasswdDialog(); }
-  if (m && m.wifiOpen)   { m.wifiOpen = false;   m.wifiResolved = true;   closeConnectDialog(); }
+  closeSetupDialogs(m);
 }
 
 $('open-ui').addEventListener('click', () => {
@@ -2359,7 +3778,7 @@ async function adoptConsolePort(port) {
     priorSession = outgoing.gone ? null : outgoing;
     monitor = chosen;
     committed = chosen;
-    outgoing.term.focus();
+    focusTerm(outgoing.term);
     refreshFlashOffer();
   } finally {
     adopting = false;
@@ -2393,7 +3812,7 @@ $('cdcmove-ok').addEventListener('click', async () => {
   try {
     // Filtered to the composite device the firmware presents, so the chooser
     // offers its two ports and nothing else.
-    port = await navigator.serial.requestPort({ filters: [CDC_FILTER] });
+    port = await SERIAL.requestPort({ filters: [CDC_FILTER] });
   } catch (_) {
     awaitingCdc = false;
     return;                                          // chooser dismissed
@@ -2473,7 +3892,7 @@ async function reclaimPort(p, attempts = 8) {
         // the session simply follows it.
         pinnedPort = p;
         note(monitor, `\x1b[32m-- ${portLabel(p)} came back --\x1b[0m`);
-        monitor.term.focus();
+        focusTerm(monitor.term);
         refreshFlashOffer();   // the board is reachable again — re-evaluate the offer
         attached = true;
         reclaimLastReport = null;   // next outage reports afresh
@@ -2590,7 +4009,7 @@ async function repickPort(putBack) {
   if (!monitor) return;
   let port;
   try {
-    port = await navigator.serial.requestPort();
+    port = await SERIAL.requestPort();
   } catch (_) {
     if (putBack) putBack();     // dismissed — this was answering a gesture
     return;
@@ -2612,7 +4031,7 @@ on('monitor-repick', 'click', () => { closeSettings(); repickPort(null); });
 // streams down. Nothing else on the desk is any of this tab's business — three
 // boards mean three sets of these events, and only the one for our own port
 // says anything about our session.
-navigator.serial.addEventListener('disconnect', (e) => {
+SERIAL.addEventListener('disconnect', (e) => {
   const p = e.port || e.target;
   if (!p) return;
   // The port a handover moved away from, finally going. Expected, not a loss:
@@ -2647,7 +4066,7 @@ navigator.serial.addEventListener('disconnect', (e) => {
 // Only ever the tab's own port. An arrival that is not it is another board on
 // the desk coming back — possibly into another tab that owns it — and following
 // it would be how two consoles trade places.
-navigator.serial.addEventListener('connect', async (e) => {
+SERIAL.addEventListener('connect', async (e) => {
   const p = e.port || e.target;
   if (!isOurs(p) || !monitor) return;
   // Ground truth, not bookkeeping: a session with no reader has no working
@@ -2679,6 +4098,7 @@ function initSettingsControls() {
   }
   if ($('set-noreset')) $('set-noreset').checked = SETTINGS.noReset;
   if ($('set-autoflash')) $('set-autoflash').checked = SETTINGS.autoFlash;
+  syncForgetButton();
   syncDetectButton();
   syncBuildSelector();
   showCfg(DEFAULT_CFG);
@@ -2801,12 +4221,18 @@ async function loadFlashPlan(zipURL) {
   }
 }
 
-// An esptool argfile for write_flash: `--flag value` pairs, then one
+// The two-letter esptool flags for the SPI-flash settings, which is how the
+// argfile spells them: the long names differ between esptool 4 (`--flash_mode`)
+// and esptool 5 (`--flash-mode`), while these have been the same since esptool 2.
+const ESPTOOL_SHORT_FLAGS = { '-fm': 'flash_mode', '-ff': 'flash_freq', '-fs': 'flash_size' };
+
+// An esptool argfile for write_flash: `-flag value` pairs, then one
 // `<offset> <file>` pair per image. Returns the flags as flash settings (the
-// names esptool-js wants, minus the leading dashes) and the images as
-// [offset, name] pairs in file order.
+// names esptool-js wants) and the images as [offset, name] pairs in file order.
+// Long flag names are read too, in either spelling, so a zip built before the
+// switch to the short ones still parses.
 //
-//     --flash_mode dio --flash_freq 80m --flash_size 16MB
+//     -fm dio -ff 80m -fs 16MB
 //     0x0 bootloader/bootloader.bin
 //     0x10000 reticulous.bin
 function parseEsptoolArgs(text) {
@@ -2817,7 +4243,10 @@ function parseEsptoolArgs(text) {
     if (!line) continue;
     const tok = line.split(/\s+/);
     for (let i = 0; i < tok.length; i++) {
-      if (tok[i].startsWith('--')) {
+      if (ESPTOOL_SHORT_FLAGS[tok[i]]) {
+        settings[ESPTOOL_SHORT_FLAGS[tok[i]]] = tok[i + 1] || '';
+        i++;
+      } else if (tok[i].startsWith('--')) {
         // A flag esptool takes without a value would swallow the next token;
         // the ones that appear here are all `--flag value`.
         settings[tok[i].replace(/^--/, '').replace(/-/g, '_')] = tok[i + 1] || '';
@@ -2947,8 +4376,14 @@ function usbInfoLine(port) {
     const i = port.getInfo ? port.getInfo() : {};
     if (i.usbVendorId == null) return null;
     const h = (n) => (n != null ? n.toString(16).toUpperCase().padStart(4, '0') : '????');
-    const name = usbDeviceName(port);
-    return `USB ${h(i.usbVendorId)}:${h(i.usbProductId)}${name ? ` — ${name}` : ''}`;
+    const name = port.usbName || usbDeviceName(port);
+    // Which interface and endpoints the bytes are actually on, where the page
+    // chose them itself rather than being handed a port by the operating system.
+    // A console that answers nothing is either a device with nothing to say or a
+    // page talking to the wrong pipe, and only this tells those apart.
+    const e = port.usbEndpoints;
+    const eps = e ? ` — CDC iface ${e.iface}, in EP${e.in}, out EP${e.out}` : '';
+    return `USB ${h(i.usbVendorId)}:${h(i.usbProductId)}${name ? ` — ${name}` : ''}${eps}`;
   } catch (_) {
     return null;
   }
@@ -3362,10 +4797,15 @@ function offerFlash() {
 async function runPendingFlash() {
   if (!monitor || !pendingFlash) return;
   const m = monitor;
-  const { url } = pendingFlash;
+  const { url, name } = pendingFlash;
   const port = m.port;
   const hw = m.hw;                            // carry the board across the re-open
   const hwDetected = m.hwDetected;            // …and how we came to know it
+  // Decided here, before the write, from the catalogue's own account of the
+  // image: what comes back up owns its setup, so this page steps out of it for
+  // the rest of the session. A later re-flash of a flasher-onboarded image
+  // hands it back.
+  deviceOnboards = imageOnboardsItself(name);
   closeDialogs(m);                            // clear any dialog on the way out
   bar.style.display = 'none';
   barfill.style.width = '0';
@@ -3513,6 +4953,38 @@ function syncDetectButton() {
   if (b) b.disabled = !monitor || detecting;
 }
 
+// `?usbprobe=1` turns the Start button into the wire test described in
+// port.usbProbe: pick a port, open it, write one CR, read what comes back, print
+// the counts and the bytes, close. It exists because a console that says nothing
+// back looks the same from the terminal whichever half is at fault, and because
+// the page it would otherwise open has a dozen layers between the endpoint and
+// the screen, every one of which could be the one eating the answer.
+const USB_PROBE = params.get('usbprobe') === '1';
+
+async function runUsbProbe(port) {
+  logEl.hidden = false;
+  logEl.textContent = '';
+  $('intro-hint').textContent = 'Testing the wire…';
+  log('── USB wire test ──');
+  try {
+    await port.open({ baudRate: DEFAULT_CFG.baudRate });
+  } catch (e) {
+    log(`open failed: ${e && e.message ? e.message : e}`, 'err');
+    $('start').hidden = false;
+    return;
+  }
+  try {
+    await port.usbProbe((line) => log(line));
+  } catch (e) {
+    log(`probe threw: ${e && e.message ? e.message : e}`, 'err');
+  } finally {
+    try { await port.close(); } catch (_) { /* nothing left to release */ }
+  }
+  log('── end of test ──');
+  $('intro-hint').textContent = 'Wire test finished. Reload without ?usbprobe=1 for the monitor.';
+  $('start').hidden = false;     // let it be run again
+}
+
 let connecting = false;
 
 // Pop the serial chooser, open the monitor on the port, and identify the board —
@@ -3543,7 +5015,8 @@ async function connect() {
   logEl.hidden = true;
   $('intro-hint').textContent = 'Opening serial monitor…';
   try {
-    const port = await navigator.serial.requestPort();
+    const port = await SERIAL.requestPort();
+    if (USB_PROBE && port.usbProbe) { await runUsbProbe(port); return; }
     if (isFnb58Port(port)) {
       $('intro-hint').innerHTML =
         '<span class="err">That looks like the FNB58 power meter, not your device. ' +
@@ -3584,7 +5057,15 @@ async function connect() {
     // at all. Reading it off the chip is the only way left — and under "No
     // reset" not even that, since the point of the setting is to leave the
     // device alone.
-    if (autoDetect() && monitor) await runDetect();
+    // Not under ?debug=1: a session that probes has already failed at the thing
+    // a debug session exists to observe — and the run itself destroys the
+    // evidence, resetting the device and burying the dead console under a
+    // fresh boot. The settings-panel button still runs one deliberately.
+    if (DEBUG_HUD && monitor) {
+      note(monitor, '\x1b[33m-- debug: the device did not answer the CR; auto-detection is off '
+                  + 'under ?debug=1 so the failure stays observable. Reset shows the boot log; '
+                  + '\u201cDetect hardware\u201d still runs manually. --\x1b[0m');
+    } else if (autoDetect() && monitor) await runDetect();
     else if (monitor) note(monitor, '\x1b[33m-- the device did not say which board it is; '
                                   + '“Detect hardware” in the settings panel will read it off the chip --\x1b[0m');
   }
@@ -3600,6 +5081,12 @@ async function waitForBoardNamed(m) {
   for (let waited = 0; waited < BOARD_NAMED_MS; waited += 200) {
     if (monitor !== m) return false;        // session replaced under us
     if (m.hw) return true;
+    // The opening handshake's own CR goes out inside its mute window, so an
+    // answer that comes back promptly is discarded with the backlog it was
+    // muted for — the question eats its own answer. A bare CR is free, so a
+    // console that has not answered is asked again in the open before it is
+    // called silent.
+    if (waited === 600 || waited === 1400) pokeConsole(m);
     await sleep(200);
   }
   return !!m.hw;
@@ -3659,15 +5146,33 @@ async function loadVersions() {
     return {};
   }
   const out = {};
-  for (const m of text.matchAll(/href\s*=\s*["']([^"']+\.zip)["']/gi)) {
-    const base = m[1].replace(/^.*\//, '').replace(/\.zip$/i, '');
+  // One pass over the anchors rather than over the hrefs: the listing carries
+  // per-image facts as attributes on the same element (`data-onboarding`), and
+  // reading the tag whole is what keeps a fact attached to the image it is about.
+  ONBOARDING = {};
+  for (const tag of text.matchAll(/<a\b([^>]*)>/gi)) {
+    const attrs = tag[1];
+    const href = /href\s*=\s*["']([^"']+\.zip)["']/i.exec(attrs);
+    if (!href) continue;
+    const base = href[1].replace(/^.*\//, '').replace(/\.zip$/i, '');
     const parts = /^(.+?)_(.+)_(\d{8,14})$/.exec(base);
     if (!parts) continue;
     const [, , name, stamp] = parts;
-    if (!out[name] || stamp > out[name]) out[name] = stamp;
+    if (out[name] && stamp <= out[name]) continue;
+    out[name] = stamp;
+    const onb = /data-onboarding\s*=\s*["']([^"']+)["']/i.exec(attrs);
+    ONBOARDING[name] = onb ? onb[1] : '';
   }
   return out;
 }
+
+// True when the catalogue says this image sets a fresh node up from its own
+// screen. Then this page has nothing to ask: asking anyway would race the
+// device's own dialogs for the same answers, and the second answer wins for no
+// reason anybody could predict. Unmarked images are the flasher's to set up,
+// which is the safe default — a node nobody asks and that cannot ask for itself
+// is a node nobody set up.
+function imageOnboardsItself(name) { return ONBOARDING[name] === 'device'; }
 
 // The catalogues the tree says it holds, from `builds/index.html`: the directory
 // links in it, in the order it lists them. Read out of the hrefs, like the image
@@ -3791,20 +5296,22 @@ async function boot() {
   // page was served from cache, older than the script beside it. Flashing and
   // the monitor still work; the dialogs those elements belong to don't, and a
   // reload that bypasses the cache is the fix.
-  const stale = ['dl-overlay', 'device-overlay', 'flash-go', 'set-build'].filter((id) => !$(id));
+  const stale = ['dl-overlay', 'device-overlay', 'flash-go', 'set-build', 'hn-name',
+                 'lora-freq', 'lxmf-name']
+    .filter((id) => !$(id));
   if (stale.length) {
     log(`This page is cached from an older deployment (missing: ${stale.join(', ')}). `
       + 'Reload with Shift held to fetch the current one.', 'err');
   }
 
   setMonTitle(null);
-  $('ch-hostname').value = HOSTNAME_DEFAULT;
+  if ($('hn-name')) $('hn-name').value = HOSTNAME_DEFAULT;
   initSettingsControls();
 
-  if (!('serial' in navigator)) {
+  if (!SERIAL) {
     $('intro-hint').innerHTML = 'This page needs a <b>Chromium-based browser</b> to work, for now — '
-      + 'desktop <b>Chrome</b>, <b>Edge</b>, <b>Brave</b>, or <b>Opera</b>. This browser can’t talk to '
-      + 'the device over USB.';
+      + 'desktop <b>Chrome</b>, <b>Edge</b>, <b>Brave</b>, or <b>Opera</b>, or <b>Chrome on Android</b>. '
+      + 'This browser can’t talk to the device over USB.';
     return;
   }
 
@@ -3816,6 +5323,18 @@ async function boot() {
   $('start').textContent = 'Click here to select the serial port your device is connected to.';
   $('start').hidden = false;
   $('start').addEventListener('click', () => connect());
+
+  // Say up front what the WebUSB road can and cannot reach, because the chooser
+  // itself won't: a board behind a bridge chip is simply absent from the list,
+  // which reads as a broken page rather than a boundary. Also the one thing a
+  // phone user has to do by hand — another app holding the device keeps the
+  // browser out of it, with no way for the page to see that or say so later.
+  if (SERIAL_OVER_USB) {
+    $('intro-hint').innerHTML = 'This browser reaches the device over <b>WebUSB</b>: boards whose serial '
+      + 'port is the chip’s own USB are offered, boards behind a USB-to-serial bridge chip are not. '
+      + 'If another app opens when the board is plugged in, dismiss it — an app holding the device '
+      + 'keeps this page out of it.';
+  }
 
   // The FNB58 graph never opens on its own — only the user clicking the FNB58
   // label connects it, and it is never reconnected from a remembered grant: on

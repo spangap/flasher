@@ -28,6 +28,11 @@
 <style>
   :root{--bg:#000;--fg:#e6edf3;--accent:#2ea043;--err:#f85149;--muted:#8b949e;--panel:#161b22;--line:#30363d}
   *{box-sizing:border-box}
+  /* No pull-to-refresh, and no scroll chaining out of the terminal. A drag
+   * upward in a full monitor otherwise reaches the document, which on a phone
+   * reloads the page — dropping the port grant and the session with it, for a
+   * gesture that meant "scroll back". */
+  html,body{overscroll-behavior:none}
   body{margin:0;font:15px/1.5 system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);
        display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}
   #intro{width:100%;max-width:560px;text-align:center}
@@ -55,11 +60,23 @@
   .bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s}
   .err{color:var(--err)} .ok{color:var(--accent)} a{color:#58a6ff}
 
-  #monitor{position:fixed;inset:0;z-index:20;background:#000}
+  /* --vv-top / --vv-height are the visual viewport, tracked from script. They
+   * matter when an on-screen keyboard is up: that shrinks the visual viewport
+   * but not the layout one, so a fixed full-height element keeps its full
+   * height *behind* the keyboard — and the bottom of a terminal is the part
+   * being read. Sized to the visual viewport instead, the terminal reflows to
+   * fewer rows and its last line sits just above the keyboard; a dialog
+   * re-centres in what is left visible. Both fall back to the layout viewport
+   * where there is no script or no visualViewport. */
+  #monitor{position:fixed;left:0;right:0;top:var(--vv-top,0);height:var(--vv-height,100%);
+       z-index:20;background:#000}
   #monitor[hidden]{display:none}
   /* Lift the terminal off the bottom edge so the cursor's row never sits under
    * the very edge of the window. */
   #monitor-term{position:absolute;top:.5rem;left:.6rem;right:.6rem;bottom:.8rem}
+  /* The scrollback is the terminal's own scroller; reaching its top or bottom
+   * ends the gesture there rather than passing it on to the page. */
+  #monitor-term .xterm-viewport{overscroll-behavior:contain}
 
   /* Top-right action row: [Open Device UI] [Reset]. Identifying the board and
    * offering a flash are not here — the first is a settings-panel action, the
@@ -71,18 +88,24 @@
   #monitor-reset{font:inherit;font-weight:700;
        font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;
        color:#fff;background:#ff1f1f;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
-  #monitor-reset:hover{animation:reset-flicker .5s infinite}
   #open-ui{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;
        color:#fff;background:#1f6feb;border:2px solid #fff;border-radius:8px;padding:.4rem .85rem;cursor:pointer}
   #open-ui[hidden]{display:none}
-  #open-ui:hover{background:#fff;color:#1f6feb;border-color:#1f6feb}
   /* Amber, not green: this is a recovery the session is waiting on, not an
    * action offered on a device that is working. */
   #monitor-repick{font:inherit;font-weight:700;font-size:.8rem;text-transform:uppercase;
        letter-spacing:.04em;color:#fff;background:#b8860b;border:2px solid #fff;border-radius:8px;
        padding:.4rem .85rem;cursor:pointer}
   #monitor-repick[hidden]{display:none}
-  #monitor-repick:hover{background:#fff;color:#b8860b;border-color:#b8860b}
+  /* Hover styling only where there is a pointer to hover with. A tap leaves
+   * :hover stuck on the button until something else is tapped, so on a touch
+   * screen these read as a button that has decided to flicker on its own. */
+  @media (hover: hover) {
+    #monitor-reset:hover{animation:reset-flicker .5s infinite}
+    #open-ui:hover{background:#fff;color:#1f6feb;border-color:#1f6feb}
+    #monitor-repick:hover{background:#fff;color:#b8860b;border-color:#b8860b}
+    #gear:hover{background:#fff;color:#000}
+  }
   @keyframes reset-flicker{
     0%,50%{background:#ff1f1f;color:#fff;border-color:#fff}
     50.01%,100%{background:#fff;color:#ff1f1f;border-color:#ff1f1f}
@@ -128,8 +151,8 @@
   #fnb58-times span{font:.6rem ui-monospace,SFMono-Regular,monospace;color:var(--muted)}
   #monitor.fnb58-open #monitor-term{top:158px}
   #monitor.fnb58-open #monitor-actions{top:calc(150px + .7rem)}
-  body.fnb58-open #gear{top:calc(150px + .7rem)}
-  body.fnb58-open #settings-box{top:calc(150px + 3.3rem)}
+  body.fnb58-open #gear{top:calc(var(--vv-top,0px) + 150px + .7rem)}
+  body.fnb58-open #settings-box{top:calc(var(--vv-top,0px) + 150px + 3.3rem)}
 
   /* The gear, and the panel it opens. Fixed to the window, not the monitor: the
    * settings apply before a port is picked as much as during a session, so both
@@ -142,15 +165,15 @@
    * inherited 1.5 line-height (19.2px) + .4rem padding top and bottom (12.8px)
    * + the 2px border twice = 36px = 2.25rem. The glyph is far bigger than their
    * text, so it is centred in that box rather than padded into it. */
-  #gear{position:fixed;top:.7rem;right:.6rem;z-index:41;height:2.25rem;
+  #gear{position:fixed;top:calc(var(--vv-top,0px) + .7rem);right:.6rem;z-index:41;height:2.25rem;
        display:flex;align-items:center;justify-content:center;
        font-size:2rem;line-height:1;color:#fff;background:#000;
        border:2px solid #fff;border-radius:8px;padding:0 .65rem;cursor:pointer}
-  #gear:hover{background:#fff;color:#000}
   /* Invisible catch-all: a click anywhere off the panel dismisses it. */
-  #settings-overlay{position:fixed;inset:0;z-index:42;background:transparent}
+  #settings-overlay{position:fixed;left:0;right:0;top:var(--vv-top,0);height:var(--vv-height,100%);
+       z-index:42;background:transparent}
   #settings-overlay[hidden]{display:none}
-  #settings-box{position:fixed;top:3.3rem;right:.6rem;z-index:43;background:var(--panel);
+  #settings-box{position:fixed;top:calc(var(--vv-top,0px) + 3.3rem);right:.6rem;z-index:43;background:var(--panel);
        border:1px solid var(--line);border-radius:8px;padding:.7rem .8rem;width:16.5rem;
        display:flex;flex-direction:column;gap:.55rem;font-size:.8rem}
   #settings-box[hidden]{display:none}
@@ -183,8 +206,9 @@
        border:0;border-radius:6px;padding:.35rem;cursor:pointer;margin-top:.2rem}
 
   /* Modal dialogs over the monitor: WiFi connect helper + reachability report. */
-  .modal-overlay{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.6);
-       display:flex;align-items:center;justify-content:center;padding:1.5rem}
+  .modal-overlay{position:fixed;left:0;right:0;top:var(--vv-top,0);height:var(--vv-height,100%);
+       z-index:30;background:rgba(0,0,0,.6);
+       display:flex;align-items:center;justify-content:center;padding:1.5rem;overflow:auto}
   .modal-overlay[hidden]{display:none}
   .modal{width:100%;max-width:420px;background:var(--panel);border:1px solid var(--line);
        border-radius:10px;padding:1.2rem 1.3rem;text-align:left}
@@ -209,6 +233,9 @@
   .modal label.check{display:flex;align-items:center;gap:.5rem;color:var(--fg);font-size:.85rem;
        text-transform:none;margin:1rem 0 0;cursor:pointer}
   .modal label.check input{width:auto;margin:0}
+  /* `display:flex` above outranks the UA's [hidden] rule, so a check row that
+   * hides itself (the SUPE row, on a build that has no SUPE) needs this. */
+  .modal label.check[hidden]{display:none}
   #uichoice-overlay .row button{flex:1}
   /* Firmware download: a bar with no buttons — it closes when the image is in. */
   #dl-bar{display:block}
@@ -232,13 +259,23 @@
   /* Amber "Flash anyway", green "Flash": the button says which of the two this
    * offer is before it is read. */
   .modal .btn-warn{color:#fff;background:#b8860b}
-  /* Suggest sits INSIDE the password field, small, flush right. */
+  /* Suggest sits INSIDE the password field, flush right: a small pill, so it
+   * reads as an offer attached to the field rather than a second button to
+   * decide about. It is out of the tab order (tabindex="-1") — Tab and Enter go
+   * from the password to the retype, which is the path through this dialog. */
   .pw-row{position:relative}
   .pw-row input{padding-right:4.6rem}
   #pw-suggest{position:absolute;right:.35rem;top:50%;transform:translateY(-50%);
-       padding:.12rem .5rem;font-size:.72rem;line-height:1.5;white-space:nowrap;border-radius:5px}
+       padding:.1rem .6rem;font-size:.66rem;letter-spacing:.02em;line-height:1.6;
+       white-space:nowrap;border-radius:999px}
   .pw-msg{min-height:1.1em;margin-top:.5rem;font-size:.82rem;color:var(--err)}
   .pw-msg.ok{color:var(--accent)}
+  /* The radio window. The frequency is the one value here that gets read back
+   * and compared against another node's, so it is set in type nobody has to
+   * lean in for; the three that follow are picks and sit in one row. */
+  #lora-freq{font-size:1.5rem;text-align:center;letter-spacing:.03em;padding:.35rem .5rem}
+  .lora-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.7rem;margin-top:.2rem}
+  .lora-grid label{margin-top:.7rem}
 </style>
 <link rel="stylesheet" href="vendor/xterm.css">
 </head>
@@ -319,6 +356,13 @@
     <div class="hint">Flash a newer build for the attached board as soon as one is
       published, without waiting to be asked.</div>
     <hr>
+    <!-- The answers setup was told to reuse: the node password, and the wifi
+         networks it joins on sight. Disabled while there is nothing stored, so
+         the button also says whether this browser is holding any. -->
+    <button id="set-forget" type="button">Delete stored wifi and node passwords</button>
+    <div class="hint">Forget the device password and the wifi networks this
+      browser remembers, so setup asks again.</div>
+    <hr>
     <button id="set-defaults" type="button">Set as defaults</button>
     <div id="settings-saved"></div>
   </div>
@@ -359,25 +403,43 @@
         <label for="pw-1">Password</label>
         <div class="pw-row">
           <input id="pw-1" type="password" autocomplete="off" spellcheck="false">
-          <button id="pw-suggest" class="btn-ghost" type="button">Suggest</button>
+          <button id="pw-suggest" class="btn-ghost" type="button" tabindex="-1">Suggest</button>
         </div>
         <label for="pw-2">Password again</label>
         <input id="pw-2" type="password" autocomplete="off" spellcheck="false">
         <div id="pw-msg" class="pw-msg"></div>
+        <label class="check"><input id="pw-remember" type="checkbox"> Set this password on all new nodes</label>
         <div class="row">
           <button id="pw-ok" class="btn-primary" type="button">Set password</button>
         </div>
       </div>
     </div>
 
-    <!-- WiFi connect helper: shown when the device falls back to its own AP. -->
+    <!-- Hostname: its own dialog, because it is the one answer that is about
+         THIS node and can never be reused. The password and the network beside
+         it are answered once and remembered for every node after; a name is
+         typed every time, so it is not buried in a dialog that will be skipped. -->
+    <div id="host-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Name this device</h2>
+        <p class="sub">The name it answers to on the network. Its web UI is at
+          <b>&lt;name&gt;.local</b>, so give each node its own.</p>
+        <label for="hn-name">Hostname <span class="hint">(letters, digits, _ — max 20)</span></label>
+        <input id="hn-name" type="text" autocomplete="off" spellcheck="false"
+               maxlength="20" inputmode="latin">
+        <div class="row">
+          <button id="hn-skip" class="btn-ghost" type="button">Skip</button>
+          <button id="hn-ok" class="btn-primary" type="button">Set hostname</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- WiFi connect helper: shown when the device falls back to its own AP and
+         none of the remembered networks is in range. -->
     <div id="connect-overlay" class="modal-overlay" hidden>
       <div class="modal">
         <h2>Connect device to WiFi</h2>
         <p class="sub">The device found no known network and started its own access point.</p>
-        <label for="ch-hostname">Hostname <span class="hint">(letters, digits, _ — max 20)</span></label>
-        <input id="ch-hostname" type="text" autocomplete="off" spellcheck="false"
-               maxlength="20" inputmode="latin">
         <label for="ch-ssid">Network</label>
         <select id="ch-ssid"></select>
         <div id="ch-ssid-other" hidden>
@@ -388,9 +450,71 @@
           <label for="ch-pass">Password</label>
           <input id="ch-pass" type="password" autocomplete="off" spellcheck="false">
         </div>
+        <label class="check"><input id="ch-remember" type="checkbox"> Set this wifi password whenever this AP is visible</label>
         <div class="row">
-          <button id="ch-cancel" class="btn-ghost" type="button">Cancel</button>
+          <button id="ch-cancel" class="btn-ghost" type="button">Skip</button>
           <button id="ch-send" class="btn-primary" type="button">Connect</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- The radio, in one window: a frequency has no default (it is the antenna
+         and the region, which no build can know), and the three modem values
+         every node on a mesh has to agree on. Shown only when the device says it
+         has a radio that was never told what it is. -->
+    <div id="lora-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Set up the LoRa radio</h2>
+        <p class="sub">The frequency has to suit your antenna and your region; the three
+          below have to match every other node on the mesh.</p>
+        <label for="lora-freq">Frequency <span class="hint">(MHz)</span></label>
+        <input id="lora-freq" type="text" inputmode="decimal" autocomplete="off"
+               spellcheck="false" placeholder="868.0">
+        <div class="lora-grid">
+          <div>
+            <label for="lora-sf">Spreading</label>
+            <select id="lora-sf">
+              <option>5</option><option>6</option><option selected>7</option><option>8</option>
+              <option>9</option><option>10</option><option>11</option><option>12</option>
+            </select>
+          </div>
+          <div>
+            <label for="lora-bw">Bandwidth <span class="hint">(kHz)</span></label>
+            <select id="lora-bw">
+              <option selected>125</option><option>250</option><option>500</option>
+            </select>
+          </div>
+          <div>
+            <label for="lora-cr">Coding rate</label>
+            <select id="lora-cr">
+              <option value="5" selected>4/5</option><option value="6">4/6</option>
+              <option value="7">4/7</option><option value="8">4/8</option>
+            </select>
+          </div>
+        </div>
+        <!-- Only on a build that carries SUPE: the device is asked whether the
+             key exists before this row is shown. -->
+        <label class="check" id="lora-supe-row" hidden><input id="lora-supe" type="checkbox"> Enable SUPE</label>
+        <div id="lora-msg" class="pw-msg"></div>
+        <div class="row">
+          <button id="lora-skip" class="btn-ghost" type="button">Skip</button>
+          <button id="lora-ok" class="btn-primary" type="button">Enable LoRa</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- The name this node answers to on the mesh. Last, because it is the one
+         answer that is about what the node IS rather than how it is reached. -->
+    <div id="lxmf-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Your name on the mesh</h2>
+        <p class="sub">This is the name for your LXMF identity, it’s what others on the
+          mesh see when they browse around or message you.</p>
+        <label for="lxmf-name">Name</label>
+        <input id="lxmf-name" type="text" autocomplete="off" spellcheck="false" maxlength="32">
+        <div class="row">
+          <button id="lxmf-skip" class="btn-ghost" type="button">Skip</button>
+          <button id="lxmf-ok" class="btn-primary" type="button">Create identity</button>
         </div>
       </div>
     </div>
