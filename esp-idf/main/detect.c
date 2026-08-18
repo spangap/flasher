@@ -206,14 +206,24 @@ static const char *detect_hw_lilygo_tdeck(void)
     detect_rail_drive(TD_POWER_EN, 1);
     vTaskDelay(pdMS_TO_TICKS(150));                /* 3.3 V rail settle */
 
-    if (!detect_ack(TD_I2C_SDA, TD_I2C_SCL, TD_KB_ADDR)) {
-        detect_dbg("no keyboard at 0x%02X — not a T-Deck", TD_KB_ADDR);
+    /* The keyboard is its own MCU booting its own firmware off this rail, and
+     * from a cold rail it takes several hundred ms to reach its I2C loop — one
+     * ACK attempt at 150 ms reads a healthy board as absent. A warm board
+     * still answers on the first try. */
+    bool kb = false;
+    for (int i = 0; i < 12; i++) {
+        if ((kb = detect_ack(TD_I2C_SDA, TD_I2C_SCL, TD_KB_ADDR)))
+            break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!kb) {
+        detect_miss("no keyboard at 0x%02X — not a T-Deck", TD_KB_ADDR);
         detect_rail_release(TD_POWER_EN);
         return NULL;
     }
     if (!detect_radio(TD_LORA_SCK, TD_LORA_MOSI, TD_LORA_MISO,
                       TD_LORA_CS, TD_LORA_RST, TD_LORA_BUSY, NULL)) {
-        detect_dbg("keyboard answered but no radio — not a T-Deck");
+        detect_miss("keyboard answered but no radio — not a T-Deck");
         detect_rail_release(TD_POWER_EN);
         return NULL;
     }
