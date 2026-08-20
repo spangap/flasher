@@ -14,6 +14,20 @@
 // it is also what a connect falls back to unless "No reset" says to leave the
 // device alone.
 //
+// That probe assumes a reset it can drive, and not every board has one: a device
+// whose USB is on the S3's USB-OTG controller rather than USB-Serial-JTAG has
+// neither DTR/RTS nor the Serial-JTAG reset sequence, so esptool's reset runs and
+// nothing happens. Reaching the ROM loader there takes a human holding BOOT and
+// tapping RESET. So a silent device is asked a second question before the probe:
+// is it in the loader ALREADY? If it is, the whole run switches to no-reset —
+// probe, detector upload and flash alike — because a reset it cannot perform is
+// also a state it cannot get back. The RAM detector closes the circle by
+// returning to the loader instead of idling, so the flash that follows still
+// finds the ROM up without anyone touching the board again. Starting the
+// firmware at the end needs no hands either: a reset does not have to come from
+// outside the chip, and arming the RTC watchdog from the loader restarts it —
+// which is what esptool falls back to on this chip for the same reason.
+//
 // Once the board is known and the catalogue holds an image for it, the offer
 // appears in that same device window, under the facts it follows from: "Flash"
 // for an image newer than what runs, "Flash anyway" — behind a warning — for one
@@ -357,8 +371,8 @@ function captureTerminal(tee) {
 // Read everything esptool-js can learn about the chip on `loader`: main() logs
 // the chip, features (embedded flash/PSRAM), crystal, MAC and flash ID;
 // detectFlashSize() adds the flash size.
-async function gatherChipInfo(loader) {
-  await loader.main();
+async function gatherChipInfo(loader, mode = 'default_reset') {
+  await loader.main(mode);
   try { await loader.detectFlashSize(); } catch (_) { /* leave flash size out */ }
 }
 
@@ -370,6 +384,122 @@ const INFO_PREFIXES = [
 ];
 function chipInfoLines(lines) {
   return lines.filter((l) => INFO_PREFIXES.some((p) => l.startsWith(p)));
+}
+
+// ── reaching the ROM loader without a reset line ────────────────────────────
+//
+// Every ROM-loader step below normally begins by resetting the chip into the
+// loader, which esptool does over DTR/RTS or — when it recognises the
+// USB-Serial-JTAG PID — that unit's own sequence. A board whose USB is on the
+// **USB-OTG** controller instead (the S3 reports PID 0x0009 there, its chip id)
+// has neither: the reset sequence runs and nothing happens.
+//
+// Such a board can still be flashed, but only from a loader a human put it in,
+// by holding BOOT and tapping RESET — and once there it must be kept there, since
+// a reset it cannot perform is a state it cannot get back.
+//
+// Which board that is, is a property of the PORT and is known before anything is
+// touched: the USB identity says which controller answers. `303A:1001` is the
+// Serial-JTAG unit, which esptool resets with its own sequence; a non-Espressif
+// VID is a USB-UART bridge, which resets over DTR/RTS. An Espressif VID with any
+// other PID is the OTG path — the chip's own ROM device, whose PID is its chip
+// id — and there is nothing to pulse.
+//
+// Deciding from the PID rather than from "did it answer a sync" matters: a board
+// that CAN reset is often sitting in the loader too (the detector leaves it
+// there), and treating that as no-reset would suppress the resets it wants — and
+// the no-reset chain has a trap of its own, below.
+function portCanReset(port) {
+  const i = port && port.getInfo ? port.getInfo() : {};
+  if (i.usbVendorId !== ESPRESSIF_VID) return true;      // UART bridge: DTR/RTS
+  return i.usbProductId === JTAG_ID.usbProductId;        // Serial-JTAG: its own sequence
+}
+
+// Set for the run when the port turns out to be one of those, so the ROM steps
+// below pick their connect mode from one place. Cleared on a fresh pick.
+let noResetLine = false;
+
+const romConnectMode = () => (noResetLine ? 'no_reset' : 'default_reset');
+
+// Chip facts read from a loader the chip is ALREADY in, without resetting it and
+// **without running the stub**.
+//
+// The stub is the trap. `ESPLoader.main()` ends by uploading and jumping into
+// esptool's flasher stub, which is fine when every later step resets first — the
+// reset wipes it. Under `no_reset` nothing wipes it, so the next connect syncs
+// with the stub rather than the ROM, and the detector is then RAM-loaded over
+// the stub's own memory and jumped into: an IllegalInstruction, reached quickly
+// because the stub is faster than the ROM. So this path never calls main(), and
+// nothing else in the no-reset chain may either.
+//
+// Returns the info lines, or null when the chip is not in the loader at all.
+async function romInfoNoReset(port) {
+  const transport = new Transport(port, false);
+  try {
+    const cap = captureTerminal();
+    const loader = new ESPLoader({ transport, baudrate: 460800, terminal: cap });
+    await loader.detectChip('no_reset');            // syncs and identifies; no stub
+    cap.writeLine(`Chip is ${await loader.chip.getChipDescription(loader)}`);
+    try { cap.writeLine(`MAC: ${await loader.chip.readMac(loader)}`); } catch (_) { /* skip */ }
+    return chipInfoLines(cap.lines);
+  } catch (_) {
+    return null;                                    // not in the loader (or not an ESP)
+  } finally {
+    try { await transport.disconnect(); } catch (_) { /* already gone */ }
+  }
+}
+
+// The RTC force-download-boot flag, cleared.
+//
+// The RAM detector sets it on its way out so the ROM comes back without anyone
+// touching a button, which is the whole trick on a board that cannot be reset.
+// The flag lives in the RTC domain and survives an ordinary reset, so left set
+// it would send every subsequent boot to the loader instead of the firmware.
+// Clearing it is therefore part of finishing with the ROM, not an afterthought —
+// esptool's own S3 hard reset does the same thing for the same reason.
+//
+// Best-effort by design: a chip that is no longer in the loader cannot be asked,
+// and on that path something else has already reset it, which clears the flag
+// too.
+const RTC_CNTL_OPTION1_REG = 0x6000812c;            // S3: DR_REG_RTCCNTL_BASE (0x60008000) + 0x12C
+const RTC_CNTL_FORCE_DOWNLOAD_BOOT = 0x1;           // bit 0 — same pair esptool uses
+async function clearForceDownloadBoot(loader) {
+  try {
+    await loader.writeReg(RTC_CNTL_OPTION1_REG, 0, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+  } catch (_) { /* not in the loader — then something already reset it, which clears it too */ }
+}
+
+// Restart a device that has no reset line, without one.
+//
+// A reset does not have to come from outside the chip: arming the RTC watchdog
+// with a short timeout and letting it fire restarts the whole system, and every
+// step of that is a register write over the ROM loader. It is what esptool falls
+// back to on this exact chip when it finds itself on USB-OTG, and esptool-js
+// carries the same routine on its S3 class — it simply never reaches for it,
+// because its `after()` only knows the RTS-pin reset.
+//
+// The force-download-boot flag is cleared first, or the chip the watchdog
+// restarts would land straight back in the loader instead of the firmware. What
+// this cannot control is what the device looks like afterwards: a board whose
+// ROM answers on USB-OTG and whose firmware runs USB-Serial-JTAG changes USB
+// identity across the restart, so the port the page is holding goes away and
+// comes back as a different device. The restart is real either way; only the
+// monitor's ability to follow it is not.
+async function restartFromRom(port) {
+  const transport = new Transport(port, false);
+  try {
+    const loader = new ESPLoader({ transport, baudrate: 460800, terminal: captureTerminal() });
+    await loader.detectChip('no_reset');
+    await clearForceDownloadBoot(loader);
+    if (!loader.chip || typeof loader.chip.watchdogReset !== 'function') return false;
+    await loader.chip.watchdogReset(loader);
+    await sleep(500);                               // the timeout esptool waits out
+    return true;
+  } catch (_) {
+    return false;                                   // no loader to ask, or it refused
+  } finally {
+    try { await transport.disconnect(); } catch (_) { /* already gone */ }
+  }
 }
 
 // Best-effort ESP32 detection: bounce into the ROM loader, read everything, then
@@ -384,7 +514,8 @@ async function probeChip(port) {
     const cap = captureTerminal();
     const transport = new Transport(port, false);
     try {
-      await gatherChipInfo(new ESPLoader({ transport, baudrate: 460800, terminal: cap }));
+      await gatherChipInfo(new ESPLoader({ transport, baudrate: 460800, terminal: cap }),
+                           romConnectMode());
       return chipInfoLines(cap.lines);
     } catch (_) {
       /* first miss: settle briefly and try again; second miss: not an ESP */
@@ -435,7 +566,7 @@ async function runDetection(port) {
   const transport = new Transport(port, false);
   try {
     const loader = new ESPLoader({ transport, baudrate: 460800, terminal: captureTerminal() });
-    await loader.detectChip();                      // ROM loader (no stub)
+    await loader.detectChip(romConnectMode());       // ROM loader (no stub)
     try { await loader.changeBaud(); } catch (_) { /* stay at ROM baud */ }
     for (const seg of segments) {
       const blocks = Math.ceil(seg.data.length / loader.ESP_RAM_BLOCK);
@@ -4314,7 +4445,7 @@ async function flash(port, plan) {
     // detail block can be reprinted at the top of the monitor.
     const cap = captureTerminal(terminal);
     const esploader = new ESPLoader({ transport, baudrate: 460800, terminal: cap });
-    await gatherChipInfo(esploader);
+    await gatherChipInfo(esploader, romConnectMode());
     const bannerLines = chipInfoLines(cap.lines);   // chip facts, no stub/baud noise
 
     bar.style.display = 'block';
@@ -4333,6 +4464,11 @@ async function flash(port, plan) {
       },
     });
     barfill.style.width = '100%';
+    // Leave the boot path alone before letting go: the RAM detector may have set
+    // force-download-boot to hand the ROM back for exactly this flash, and a
+    // device that keeps the flag boots into the loader forever rather than into
+    // the image just written.
+    await clearForceDownloadBoot(esploader);
     log('Flash complete — opening serial monitor and resetting…', 'ok');
     return bannerLines;
   } finally {
@@ -4846,7 +4982,18 @@ async function runPendingFlash() {
       let banner = await flash(port, plan);
       const usb = usbInfoLine(port);
       if (usb) banner = [usb, ...(banner || [])];
-      await openMonitor(port, true, banner);   // reset into the freshly-flashed firmware
+      // Reset into the freshly-flashed firmware. A board with no reset line gets
+      // there by watchdog instead of by RTS, which is a restart all the same —
+      // but it may re-enumerate under a different USB identity on the way, and
+      // then the port this page holds is gone and the monitor cannot follow.
+      if (noResetLine) {
+        const ok = await restartFromRom(port);
+        banner = [...(banner || []), '',
+                  ok ? 'Restarted the device with the RTC watchdog (no reset line on this board).'
+                     : 'Could not restart the device from here — press RESET to start the firmware.',
+                  ok ? 'If the port does not come back, it re-enumerated: connect again to watch it.' : ''];
+      }
+      await openMonitor(port, !noResetLine, banner);
       armFlashGrace(hw, hwDetected);            // re-arm: the new build should read as current
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
@@ -4892,7 +5039,17 @@ async function runDetect() {
   // which a hidden tab would throttle to a standstill.
   const releaseTimers = useWorkerTimers();
   try {
-    info = await probeChip(port);
+    // A port that cannot be reset takes the whole run through the loader a human
+    // already put the chip in — no reset anywhere, and no stub, which is what
+    // romInfoNoReset() exists for. Every other port keeps the path it always
+    // had: reset into the ROM, probe with the stub, reset out again.
+    noResetLine = !portCanReset(port);
+    if (noResetLine) {
+      $('intro-hint').textContent = 'No reset line on this port — probing the bootloader…';
+      info = await romInfoNoReset(port);
+    } else {
+      info = await probeChip(port);
+    }
     if (info) {
       const detected = await runDetection(port);
       hw = detectedHw(detected);
@@ -4912,6 +5069,11 @@ async function runDetect() {
         state: statePart,
         probed: true,
       };
+    } else if (noResetLine) {
+      // Nothing answered, and on this port nothing can be made to: the loader is
+      // reached by hand or not at all. Say which hand movement.
+      banner = ['This port has no reset line, and the device is not in the bootloader.',
+                'Hold BOOT, tap RESET, release BOOT, then run detection again.'];
     } else {
       banner = ['No ESP32 detected.'];
     }
@@ -4922,8 +5084,20 @@ async function runDetect() {
   if (usb) banner = [usb, ...banner];
   // Reset back into the real firmware (this wipes the RAM detector) whenever the
   // ROM loader answered — the chip is sitting in it and would stay there.
+  //
+  // Except on the board this run reached without a reset line, where pulsing RTS
+  // would do nothing. The loader is deliberately still up — the detector put it
+  // back — and that is exactly the state a flash wants to start from, so it is
+  // left there and said so. Starting the firmware from here is possible (the
+  // watchdog restart the flash path uses) but not wanted yet: the reason to
+  // detect is usually to flash next, and a restart would only have to be undone.
+  if (noResetLine) {
+    banner = [...banner, '',
+              'Device is in the ROM bootloader — there is no reset line on this board.',
+              'It has been left there, which is where flashing starts; “Flash” works as it is.'];
+  }
   try {
-    await openMonitor(port, !!info, banner);
+    await openMonitor(port, !noResetLine && !!info, banner);
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     log(`Error: ${msg}`, 'err');
@@ -5007,6 +5181,7 @@ async function connect() {
   connecting = true;
   statePart = null;                  // a fresh pick may be a different chip
   deviceFacts = null;                // …so nothing the last one reported carries over
+  noResetLine = false;          // …and it may be one that resets perfectly well
 
   $('start').hidden = true;          // the action is underway — drop the CTA
   bar.style.display = 'none';

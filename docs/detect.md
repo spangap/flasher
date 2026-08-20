@@ -20,7 +20,7 @@ It is written once, there, and read by two callers:
   there). Anything later loses the bus and reads as an unrecognised board.
   A staged board straddle means the image was built for that board, so a NULL (or
   a different board) means the image is on the wrong hardware. spangap logs the
-  mismatch and then **stops where it stands** — the task blocks forever, awake,
+  mismatch and then **stops where it stands** — the task parks on a slow loop, awake,
   so the console stays enumerated and the reason stays on screen. Every pin map
   in that image belongs to someone else's board; a reboot loop would re-drive
   those pins forever, and going to sleep would take the explanation down with the
@@ -98,8 +98,8 @@ a single probe on the old API would take down the keyboard, touch, RTC and codec
 of the firmware that ran it.
 
 Two things shape a probe. First, the **physical flash size** (SFDP), which rules
-a board out before a single pin is touched — 16 MB -> tdeck/heltec, 8 MB ->
-xiao-sense, 4 MB -> t3s3/nibble; the xiao-sx1262 accepts **8 or 16 MB**, since
+a board out before a single pin is touched — 16 MB -> tdeck/heltec/w12/tap-v2,
+8 MB -> xiao-sense/tbeam-supreme, 4 MB -> t3s3/nibble; the xiao-sx1262 accepts **8 or 16 MB**, since
 the Wio-SX1262 fits both the base XIAO and the Plus. (PSRAM size would split the
 16 MB pair, but a RAM-loaded detector cannot init PSRAM — octal vs quad is
 build-fixed — so the anchor settles those instead.) Second, the **anchor**: one
@@ -116,14 +116,65 @@ checksum-valid NMEA sentence. Most peripherals are easier — an I2C ACK plus a
 chip-ID register read — but the principle is the same: probe, then confirm with a
 value only that part returns.
 
+## A board with no reset line
+
+Everything above assumes the flasher can put the chip in the ROM loader itself.
+esptool does that over DTR/RTS, or — when it recognises the USB-Serial-JTAG PID
+(`303A:1001`) — with that unit's own sequence. A board whose USB is on the S3's
+**USB-OTG** controller instead has neither: it reports `303A:0009` (the PID is
+the chip id, which is how esptool's `uses_usb_otg()` recognises it), the reset
+sequence runs, and nothing happens. Only a human holding BOOT and tapping RESET
+gets that board into the loader.
+
+So a device that answers nothing is asked a second question before the probe:
+**is it in the loader already?** That is a sync with no reset in front of it,
+which a device merely running firmware ignores. If it answers, the run latches
+`manualBootloader` and every ROM step after it — chip probe, detector upload,
+flash — connects `no_reset`, because a reset it cannot perform is also a state it
+cannot get back.
+
+The detector closes the circle. Rather than idling until someone resets it, it
+ends by setting the RTC **force-download-boot** flag and restarting, so the ROM
+loader comes back up on its own and the flash that follows still finds it. That
+costs the boards that *can* reset nothing — they were being reset out of the
+detector anyway, and the loader is where their next step starts too.
+
+The flag lives in the RTC domain and survives an ordinary reset, so leaving it
+set would send every later boot to the loader instead of the firmware. Clearing
+it is part of finishing with the ROM: `clearForceDownloadBoot()` runs at the end
+of a flash, and esptool's own S3 hard reset clears the same bit for the same
+reason.
+
+**Starting the firmware afterwards needs no hands either.** A reset does not have
+to come from outside the chip: arming the RTC watchdog with a short timeout and
+letting it fire restarts the whole system, and every step of that is a register
+write over the loader. esptool falls back to exactly this when it finds itself on
+USB-OTG, and esptool-js already carries the routine on its S3 class — it simply
+never reaches for it, because its `after()` only knows the RTS-pin reset.
+`restartFromRom()` clears the download-boot flag and calls it.
+
+What that cannot control is what the device looks like afterwards. A board whose
+ROM answers on USB-OTG and whose firmware runs USB-Serial-JTAG changes USB
+identity across the restart, so the port the page holds goes away and comes back
+as a different device. The restart is real; only the monitor's ability to follow
+it is not, and the page says so rather than appearing to hang.
+
 ## Ordering is a safety property
 
 **The fragile boards come first.** A board identifiable by passive bus reads
 alone (nibble, t3s3, xiao-sense, xiao-sx1262) is settled before any probe that
-DRIVES a power-enable or reset GPIO (heltec Vext GPIO36 + reset GPIO21, then
-tdeck rail GPIO10) — because that pin means something else entirely on the board
-it is not looking at. Since the run stops at the first hit, a passively-read
+DRIVES a power-enable or reset GPIO (heltec Vext GPIO36 and W12 Vext GPIO45,
+both plus reset GPIO21, then the TAP V2's GPIO14 + GPIO4, then tdeck rail
+GPIO10) — because that pin means
+something else entirely on the board it is not looking at. Since the run stops at the first hit, a passively-read
 board is identified before a rail-driving probe ever touches it.
+
+A board can also switch a rail **over its PMU** rather than a GPIO
+(`hw-lilygo-tbeam-supreme`: the SX1262 is dead until the AXP2101 enables ALDO3).
+That probe is safer than a blind pin drive — it writes nothing until the PMU has
+ACKed at its own address on the board's own I2C pins — but it is still a change,
+so it sits after the passive probes and restores the PMU's enable register when
+it fails.
 
 A probe that drives a rail **releases it when it fails, and leaves it when it
 succeeds**. Both are right in both callers: on the board this actually is, the
@@ -147,7 +198,7 @@ Everything a probe learns on the way is logged at **debug** under the tag
 raises that tag to debug for its own run, so the whole trace is captured. The
 same lines appear on a real boot after `log tag detect debug`.
 
-All six boards are **ESP32-S3**.
+All nine boards are **ESP32-S3**.
 
 ## Boards at a glance
 
@@ -155,6 +206,9 @@ All six boards are **ESP32-S3**.
 |---|---|---|---|---|
 | `tdeck` | ESP32-S3 16MB/8MB-oct | SX1262 | ST7789 320×240 TFT | GT911 touch, I²C keyboard, trackball, GPS, ES7210+MAX98357A audio, SD, optional PCF8563 |
 | `heltecv4` | ESP32-S3 16MB/2MB-quad | SX1262 | SSD1306 128×64 OLED (unwired) | Vext rail, battery ADC |
+| `meshnology-w12` | ESP32-S3 16MB/8MB-oct | LR2021 | SSD1315 128×64 OLED | Vext rail, GC1109 30 dBm PA + RFX2402E 2.4 GHz PA (radio-switched), L76K GNSS header, battery ADC, RGB LED |
+| `lilygo-tbeam-supreme` | ESP32-S3 8MB/8MB-quad | SX1262 (or LR1121/SX1278 on the same pins) | SH1106 128×64 OLED | AXP2101 PMU gating every rail, PCF8563 RTC on the PMU bus, L76K/u-blox GNSS, SD, IMU + magnetometer + BME280 (unwired), 18650 holder |
+| `wismesh-tap-v2` | ESP32-S3 16MB/8MB-oct | SX1262 (inside the RAK3112 module, private bus) | ST7789 320×240 TFT | FT5x06 touch, RAK12501 (L76K) GNSS, SD on the panel bus, Home button, buzzer, 2 LEDs, li-ion |
 | `lilygo-t3s3` | ESP32-S3 4MB/2MB-quad | SX1262 (or SX1276/SX1280/LR1121) | SSD1306 OLED (unwired) | SD (own bus) |
 | `nibble-zero` | ESP32-S3 4MB/2MB-quad | SX1262 | SSD1306 OLED (unwired) | BME280 (unwired), NeoPixel, buttons |
 | `xiao-esp32s3-sense` | ESP32-S3 8MB/8MB-oct | none (WiFi/BLE) | none | Camera (OV2640/OV5640/… on B2B), PDM mic, SD (SDMMC 1-bit). Sense board does **not** fit the 16 MB Plus. |
@@ -169,6 +223,10 @@ must be powered first.
 |---|---|---|---|---|
 | tdeck | 18 | 8 | drive **GPIO10 HIGH** (master rail) | 0x55 kbd, 0x5D/0x14 touch, 0x40 ES7210, 0x51 RTC (opt) |
 | heltecv4 | 17 | 18 | drive **GPIO36 LOW** (Vext on); pulse **GPIO21** reset | 0x3C OLED |
+| meshnology-w12 | 17 | 18 | drive **GPIO45 LOW** (Vext on); pulse **GPIO21** reset | 0x3C OLED |
+| lilygo-tbeam-supreme (PMU bus) | 42 | 41 | — (the PMU is always powered) | 0x34 AXP2101, 0x51 PCF8563 |
+| lilygo-tbeam-supreme (peripheral bus) | 17 | 18 | AXP2101 **ALDO1/2/4 on** at 3.3 V | 0x3C/0x3D OLED, 0x76 BME280 |
+| wismesh-tap-v2 | 9 | 40 | drive **GPIO14 HIGH** (3V3 peripheral rail) | 0x38 FT5x06 touch |
 | lilygo-t3s3 | 18 | 17 | — | 0x3C OLED |
 | nibble-zero | 8 | 7 | — | 0x3C OLED, 0x76 BME280 |
 | xiao-esp32s3-sense | 40 | 39 | — (SCCB, camera only) | 0x30/0x3C/0x21 camera |
@@ -183,8 +241,10 @@ must be powered first.
 | **GT911** capacitive touch | 0x5D or 0x14 | Product-ID at reg **0x8140** (16-bit reg addr) = ASCII `"911\0"` = `39 31 31 00`. Address is 0x5D if INT was low at power-on, else 0x14. | tdeck |
 | **T-Deck keyboard** (on-board ESP32-C3) | 0x55 | No ID register. ACK at 0x55; a 1-byte read returns the next queued ASCII key (`0` = none). Confirm with ACK + plausible ASCII. On the tdeck bus only. | tdeck |
 | **ES7210** quad mic ADC | 0x40 | Chip-ID regs **0xFD = 0x72**, **0xFE = 0x10** (→ 0x7210). | tdeck (audio build) |
-| **PCF8563** RTC | 0x51 | No ID register — identify by **ACK at 0x51**. Sanity: seconds reg 0x02 bit7 = VL (clock-integrity-lost) flag; reads should be valid BCD. | tdeck (optional/add-on) |
-| **SSD1306** OLED | 0x3C (alt 0x3D) | No ID register — identify by **ACK**. On heltec, enable Vext (GPIO36 LOW) and pulse the reset (GPIO21) first or it won't ACK. | heltec, t3s3, nibble |
+| **PCF8563** RTC | 0x51 | No ID register — identify by **ACK at 0x51**. Sanity: seconds reg 0x02 bit7 = VL (clock-integrity-lost) flag; reads should be valid BCD. | tbeam-supreme (on the PMU bus), tdeck (optional/add-on) |
+| **AXP2101** PMU | 0x34 | No ID register worth trusting — identify by **ACK at 0x34** on the board's own PMU pins, which is also what licenses writing to it. The rail control is `LDO_EN0` (0x90), one enable bit per ALDO, with each rail's voltage in 0x92..0x95 at 100 mV/LSB above 500 mV. | tbeam-supreme |
+| **FT5x06** capacitive touch | 0x38 | No ID register needed — a plain **ACK at 0x38** is decisive on the pins that carry it. **Poll it**: the controller runs its own firmware off the peripheral rail the probe just raised and can miss the first attempt after a cold power-on, so try for ~600 ms before calling it absent. | wismesh-tap-v2 |
+| **SSD1306**-class OLED (SSD1306 / SSD1315 / SH1106) | 0x3C (alt 0x3D) | No ID register — identify by **ACK**. The three parts are indistinguishable on the bus and none of them needs telling apart to name a board. On heltec and the W12, enable Vext (GPIO36 / GPIO45 LOW) and pulse the reset (GPIO21) first or it won't ACK; on the T-Beam Supreme the panel is behind an AXP2101 rail. | heltec, w12, tbeam-supreme, t3s3, nibble |
 | **BME280** environmental | 0x76 (alt 0x77) | Chip-ID reg **0xD0**: **0x60** = BME280 (0x58 = BMP280, 0x61 = BME680). | nibble |
 | **Camera** (SCCB) — OV2640 / OV5640 / OV3660 / OV7670 / OV7725 / GC2145 / GC0308 | 0x30, 0x3C, 0x21 | The camera is the Sense board's **only** anchor (PDM mic has no bus ID, empty SD slot answers nothing), so `det_camera` probes each sensor by chip-ID, the way esp32-camera/seccam do, and reports the model. **Its SCCB block is clocked from XCLK** — the sensor won't ACK at all until a master clock runs, so `det_camera` first drives ~20 MHz on the XCLK pin (GPIO10 on the XIAO Sense) via LEDC, then probes, then stops it. **OV2640** @0x30 (8-bit regs): bank 0xFF=1, then PID 0x0A=0x26, 0x0B=0x41/0x42. **OV5640/OV3660** @0x3C (16-bit regs): chip ID 0x300A/0x300B = 0x56/0x40 or 0x36/0x60. **GC2145** @0x3C (8-bit): 0xF0/0xF1 = 0x21/0x45. **OV7670/OV7725/GC0308** @0x21 (8-bit): 0x0A/0x0B = 0x76/0x73 or 0x77/0x21; GC0308 reg 0x00 = 0x9B. Model goes in brackets on the `DETECTED:` line. | xiao-esp32s3-sense |
 | **QMI8658** IMU (reference; not on current boards) | 0x6A/0x6B | WHO_AM_I reg **0x00 = 0x05**. Listed for future boards. | — |
@@ -198,9 +258,10 @@ host at the candidate pins. Order the checks register-first, command-last.
 | Radio | Identify | Notes |
 |---|---|---|
 | **SX127x** (SX1276/78) | Register read: **RegVersion 0x42** → **0x12** (SX1276/77/78/79) or **0x22** (SX1272/73). Address byte has bit7=0 for read. No BUSY line. | Cheapest, most specific — try first. |
-| **SX126x** (SX1262/68) | No version register. Reset, wait BUSY low, then **WriteRegister (0x0D)** a scratch value to the LoRa sync-word reg **0x0740** and **ReadRegister (0x1D)** it back (read has 1 NOP/status byte before data). Matching read-back = SX126x present. `GetStatus (0xC0)` must also return a non-0x00/0xFF byte. | The radio on tdeck, heltec, t3s3, nibble, xiao. SX1261/62/68 are not distinguishable in software. |
+| **SX126x** (SX1262/68) | No version register. Reset, wait BUSY low, then **WriteRegister (0x0D)** a scratch value to the LoRa sync-word reg **0x0740** and **ReadRegister (0x1D)** it back (read has 1 NOP/status byte before data). Matching read-back = SX126x present. `GetStatus (0xC0)` must also return a non-0x00/0xFF byte. | The radio on tdeck, heltec, t3s3, nibble, xiao, tbeam-supreme and tap-v2. SX1261/62/68 are not distinguishable in software. The **W12** shares heltec's flash size, OLED pins and LoRa header, so both boards' probes name their modem — loosening either back to "any radio answers" makes both identify as whichever runs first. |
 | **SX128x** (SX1280, 2.4 GHz) | Command/BUSY like SX126x, but has a readable **firmware-version register at 0x0153/0x0154**. | t3s3 variant. |
 | **LR1121** (LR11xx) | **GetVersion** command (`0x01 0x01`); reply `[HW, device, FWmaj, FWmin]` with **device = 0xDF** (0xDA = LR1110, 0xDB = LR1120). | t3s3 variant. |
+| **LR2021** | Same **GetVersion** opcode as the LR11xx, and told apart by the reply's shape: the LR11xx prefixes it with **one** status byte and names itself in a device byte, the LR2021 with **two** and offers only a firmware version. So there is no device id to match — it is checked **last**, after every part that can identify itself has had its turn, and what is required is the status field both families share (bits 3:1 of the first byte) reading as processed. **Two** of its four codes mean that: `2` is "ok" and `3` is "ok, data is being transmitted", and a command that returns something — as GetVersion does — reports the latter, so both are accepted. A W12 answers `07 21 01 18`: status `3`, then firmware 1.24. `0xFF` is rejected as well as `0x00`, since a floating MISO reads as code `3` and would claim to be a radio. | w12 |
 
 Radio SPI pins by board:
 
@@ -208,6 +269,9 @@ Radio SPI pins by board:
 |---|---|---|---|---|---|---|---|
 | tdeck | 40 | 41 | 38 | 9 | 17 | 13 | 45 |
 | heltecv4 | 9 | 10 | 11 | 8 | 12 | 13 | 14 |
+| meshnology-w12 | 9 | 10 | 11 | 8 | 12 | 13 | 14 (chip DIO8) |
+| lilygo-tbeam-supreme | 12 | 11 | 13 | 10 | 5 | 4 | 1 |
+| wismesh-tap-v2 | 5 | 6 | 3 | 7 | 8 | 48 | 47 |
 | lilygo-t3s3 | 5 | 6 | 3 | 7 | 8 | 34 | 33 |
 | nibble-zero | 13 | 11 | 12 | 10 | 6 | 5 | 4 |
 | xiao-esp32s3-sx1262 | 7 | 9 | 8 | 41 | 42 | 40 | 39 |
@@ -223,13 +287,17 @@ Radio SPI pins by board:
 
 | Receiver | Baud | Distinguisher | Boards |
 |---|---|---|---|
-| u-blox **MIA-M10Q** | 38400 | First checksum-valid `$…*` NMEA sentence at 38400; also ACKs UBX (e.g. UBX-MON-VER). Send a `0xFF` wake edge first (may be in software backup). | tdeck |
-| Quectel **L76K** | 9600 | First valid NMEA at 9600; speaks PMTK/PCAS only, no UBX. | tdeck |
+| u-blox **MIA-M10Q** | 38400 | First checksum-valid `$…*` NMEA sentence at 38400; also ACKs UBX (e.g. UBX-MON-VER). Send a `0xFF` wake edge first (may be in software backup). | tdeck, tbeam-supreme |
+| Quectel **L76K** | 9600 | First valid NMEA at 9600; speaks PMTK/PCAS only, no UBX. | tdeck, tbeam-supreme, tap-v2 (RAK12501) |
 
-Pins on tdeck: host RX **44** ← GPS TX, host TX **43** → GPS RX, 8N1. Powered off
-the shared GPIO10 rail (no independent GPS enable). This is the batch
-distinguisher, not a true probe — a receiver reconfigured off its default baud
-would be mis-identified.
+Host RX pins: tdeck **44**, tap-v2 **44**, tbeam-supreme **9** — each ← the
+receiver's TX, 8N1. On tdeck the receiver is powered off the shared GPIO10 rail
+and on the Supreme off an AXP2101 rail, so neither has an independent GPS
+enable. This is the batch distinguisher, not a true probe — a receiver
+reconfigured off its default baud would be mis-identified. It is never an
+anchor: a GNSS module is a header populated at the factory's discretion (the
+W12's is, which is why its probe does not look), so it runs under
+`DETECT_EXTRAS`, logged for the person reading rather than tested.
 
 ### spangap state partition
 
