@@ -69,37 +69,50 @@ straight out of the workspace, at the same two paths.
 
 ## What it does when you connect
 
-The page shows its title (**`<project> Flasher`**) and goes straight to the
-serial port picker on your first click/keypress (the browser only lets the
-chooser open in response to a user gesture; it never silently reuses a
-remembered device). Once you pick a device it opens the port, shows the **serial
-monitor** — and the device **says which board it is**, unasked.
+The page opens on the **startup lobby**, its one front door: the nodes this
+browser has met before, by hostname — not the chooser's `/dev/cu.usbmodem…`
+rows — each verified live before it is offered, by opening the granted port and
+reading the device's own `dev` id off its greeting (no gesture needed on a
+granted port; a grant alone is never trusted to name a board). One click
+connects. A node another flashmon tab is using says so without being touched —
+tabs holding a console stamp a heartbeat in `localStorage` — and a browser that
+has met nothing just reads "No known devices found". **Other device…** is the
+serial-port chooser, which the browser only opens in response to a user
+gesture, and the only road for a stranger. Either way the pick opens the port,
+shows the **serial monitor** — and the device **says which board it is**,
+unasked.
 
 ```
 browser -> device   <CR>                        (the console sync it already sends)
-device  -> browser  Spangap console on serial jtag. Start typing to enter CLI
-device  -> browser  build: hw hw-lilygo-tdeck
-device  -> browser  build: catalogue stable
-device  -> browser  build: datetime 20260814130700
+device  -> browser  dev f9fb74, host tbeam, fw stable/reticulous_hw-lilygo-tdeck_20260814130700, ap "lab", ip 10.1.2.3
+device  -> browser  Spangap console on JTAG/serial. Start typing to enter CLI.
 ```
 
 That is the whole identification, and nothing was interrogated to get it.
 Opening the port already sends the console a bare CR — that is how flashmon
-confirms the port it opened is the console at all — and spangap answers it by
-restating who it is: the same three lines it printed at boot. flashmon's ordinary
-log parser reads them.
+confirms the port it opened is the console at all — and spangap answers it with
+its greeting: the physical unit (`dev`, the low three MAC bytes), the hostname,
+the running image named exactly as its catalogue zip, prefixed by its
+catalogue, and — while it is associated — the network and address it is
+reachable at, which is what puts the **Open Device UI** button up the moment
+the monitor opens rather than only when a `Connected` boot-log line happens to
+scroll past. Plain text, not log lines — it is a message to whoever attached.
+flashmon's line parser reads it.
 
-The board in `build: hw` is not a claim about the image. It is what the board
-straddle's own `detect_hw()` read off the hardware at the top of that boot,
-checked against the board the image was built for — spangap halts rather than run
-on a board it does not recognise (see [`docs/detect.md`](docs/detect.md)). So it
-is exactly what a detection run would find, arriving for free.
+The board named in `fw` is not a claim about the image alone: spangap halts
+rather than run on a board its image was not built for, its board straddle's own
+`detect_hw()` checking the hardware at the top of every boot (see
+[`docs/detect.md`](docs/detect.md)). So a running device's `fw` field is exactly
+what a detection run would find, arriving for free. (An image whose dist is not
+simply the board's name — a variant entry — adds an explicit `hw <board>` field
+with what `detect_hw()` read; a generic image stages no board straddle and
+claims no board at all.)
 
 **Why the device volunteers it rather than answering a query.** A boot happens
 once and almost nobody watches it. A device that announced itself only then, to
 an empty room, forced every tool that turned up later to interrogate it — over a
 side-channel that has to be probed for, may not be armed, and cannot be relied on
-in the moment a port opens. Saying it again to whoever shows up costs three lines
+in the moment a port opens. Saying it again to whoever shows up costs two lines
 and removes that channel entirely.
 
 Only a device that says **nothing** gets probed: firmware too old to answer a CR

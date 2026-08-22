@@ -334,13 +334,63 @@ function log(msg, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-// Window/tab title and the top `<h1>`. `host` is the device's real hostname once
-// it has been seen in the serial log, else null. Until then both read plain
-// "FlashMon - <project>" / "<project>"; once seen, the hostname leads:
-// "<hostname> - FlashMon - <project>" / "<hostname> - <project>".
+// Window/tab title and the top `<h1>`. `host` is the device's real hostname
+// once it has been seen on the wire, else null. The landing tab reads
+// "FlashMon - <project>"; a session's is "<host> - console" — no project, the
+// tab strip is for telling sessions apart — with an emoji lead for the states
+// worth spotting across a row of tabs (the glyph survives a tab squeezed too
+// narrow for any text): ❌ while the serial port is gone, 🔥 while an image is
+// being written ("<host> - flashing"). While flashing, the big header shrinks
+// to "Flashing <project>" with the image's name (its zip filename, extension
+// dropped) as a subheading under it.
+let titleHost = null;
+let titleMode = 'ok';        // 'ok' | 'gone' | 'flashing'
+let flashingImage = null;    // the image name shown while flashing
+function renderMonTitle() {
+  const flashing = titleMode === 'flashing';
+  if (flashing) {
+    document.title = `🔥 ${titleHost || PROJECT} - flashing`;
+  } else {
+    const t = titleHost ? `${titleHost} - console` : `FlashMon - ${PROJECT}`;
+    document.title = titleHost && titleMode === 'gone' ? `❌ ${t}` : t;
+  }
+  const h1 = $('title');
+  h1.classList.toggle('flashing', flashing);
+  h1.textContent = flashing ? `Flashing ${PROJECT}`
+    : titleHost ? `${titleHost} - ${PROJECT}` : PROJECT;
+  // The subheading is script-built like the lobby and the toast: the page is
+  // served without the module's cache-bust, and the flash screen must read
+  // right over a cached page too.
+  let sub = $('title-sub');
+  if (flashing && flashingImage) {
+    if (!sub) {
+      ownStyles();
+      sub = document.createElement('div');
+      sub.id = 'title-sub';
+      h1.insertAdjacentElement('afterend', sub);
+    }
+    sub.textContent = flashingImage;
+    sub.hidden = false;
+  } else if (sub) {
+    sub.hidden = true;
+  }
+}
 function setMonTitle(host) {
-  document.title = host ? `${host} - FlashMon - ${PROJECT}` : `FlashMon - ${PROJECT}`;
-  $('title').textContent = host ? `${host} - ${PROJECT}` : PROJECT;
+  titleHost = host;
+  titleMode = 'ok';    // a title set is a session speaking — neither gone nor flashing
+  renderMonTitle();
+}
+function markTitleGone(gone) {
+  titleMode = gone ? 'gone' : 'ok';
+  renderMonTitle();
+}
+// `image` (the zip filename without its extension) enters the flashing state;
+// null leaves it — though every flash path's closing monitor re-open lands in
+// setMonTitle, which leaves it as well.
+function markTitleFlashing(image) {
+  flashingImage = image;
+  titleMode = image ? 'flashing' : 'ok';
+  renderMonTitle();
 }
 
 // esptool-js writes its own progress/log through this terminal adapter.
@@ -719,7 +769,7 @@ async function syncConsole(m) {
 }
 
 // Ask the console to say where it is. The firmware answers a bare CR with the
-// transport it is running on ("Spangap console on serial jtag" / "… cdc 0"),
+// transport it is running on ("Spangap console on JTAG/serial." / "… USB/CDC 0."),
 // which is the only thing that confirms the port just opened is the console and
 // not the device's second CDC port. Nothing is muted around it: a port that has
 // just come back may be mid-boot-log, and that is precisely what must survive.
@@ -745,7 +795,7 @@ function note(target, text) {
   // One blank above, and none below. The blank below is left to whatever comes
   // next to provide: the next notice opens with one, and the firmware's own
   // messages lead with a newline. Writing one here as well is what put two
-  // empty lines above every "Spangap console on serial …".
+  // empty lines above every "Spangap console on …" greeting.
   t.writeln('');
   t.writeln(text);
 }
@@ -888,6 +938,7 @@ async function restreamAfterDrop(m, err) {
     if (m.drops > RESTREAM_MAX) {
       note(m, `\x1b[31m-- the serial stream keeps dropping${why}; the port is not usable --\x1b[0m`);
       m.gone = true;
+      markTitleGone(true);
       hideOpenUi();
       askReconnect(null);
       return;
@@ -902,6 +953,7 @@ async function restreamAfterDrop(m, err) {
   } catch (e) {
     note(m, `\x1b[31m-- could not reopen the stream: ${e && e.message ? e.message : e} --\x1b[0m`);
     m.gone = true;
+    markTitleGone(true);
     hideOpenUi();
     scheduleRescan();
   } finally {
@@ -953,7 +1005,7 @@ function makeSession(port, term, resizeObserver, muted) {
            // reads the hardware), so the boot log's weaker claim can't overwrite it.
            // versionSettled goes true once the stamp arrives or the grace expires,
            // so an up-to-date device is never offered a flash on the way there.
-           hw: null, hwDetected: false, deviceCatalogue: null,
+           hw: null, hwDetected: false, deviceCatalogue: null, unitId: null, noIdWarned: false,
            deviceVersion: null, versionSettled: false, versionTimer: null,
            rxSeq: 0, rngArmed: false, rngJustArmed: false, rngTimer: null, rngRecovering: false,
            // The framed side-channel (see the RPC section below). Per session,
@@ -1505,14 +1557,18 @@ const SERIAL = chooseSerial();
 const SERIAL_OVER_USB = !!SERIAL && SERIAL !== navigator.serial;
 
 // ── the tab's ports ─────────────────────────────────────────────────────────
-// A tab opens the ports it was handed by a chooser pick, and no others, ever.
-// Not a preference — the only correct rule available. getInfo() exposes the USB
-// vendor and product ids and nothing more: no serial number, no device path. So
-// three identical boards on a desk are ONE identity to this page, and a tab that
-// infers "my port is back" from a matching identity is choosing among them at
-// random. When it chooses wrong, two tabs have quietly traded consoles, with
-// nothing on screen to say so. Object identity is the only handle that tells
-// this board from its neighbours, and a pick is the only way to establish it.
+// A tab opens the ports it was handed by a chooser pick — plus one other case:
+// a returning port that has PROVEN, in its own words, that it is the same
+// board (the returning-boards machinery, below the rescan loop). Nothing is
+// ever opened on a guess. getInfo() exposes the USB vendor and product ids and
+// nothing more: no serial number, no device path. So three identical boards on
+// a desk are ONE identity to this page, and a tab that infers "my port is
+// back" from a matching identity alone is choosing among them at random. When
+// it chooses wrong, two tabs have quietly traded consoles, with nothing on
+// screen to say so. Object identity is the handle that tells this board from
+// its neighbours; a pick establishes it, and the `dev <id>` field of the
+// device's own greeting — read off the port before it is trusted — is the one
+// other proof accepted.
 //
 // Two, because a device presents this tab at most two consoles: the
 // USB-Serial-JTAG one it boots on, and the CDC one `usb cdc` moves it to. A
@@ -1522,9 +1578,10 @@ let pickedPorts = [];
 // The one currently carrying the session. Always a member of pickedPorts.
 let pinnedPort = null;
 
-// Take ownership of a picked port and make it the active one. Callers must have
-// obtained it from requestPort() — a user gesture is the only unambiguous
-// statement of which physical device on the desk this tab is for.
+// Take ownership of a port and make it the active one. Callers must hold one
+// of the two admissible proofs that it is this tab's board: a requestPort()
+// pick — a person pointing at the desk — or the `device` id read off the port
+// itself and matched against `pairedUnit` (the returning-boards path).
 function pinPort(port) {
   if (!port) return null;
   pickedPorts = pickedPorts.filter((p) => p !== port);
@@ -2922,6 +2979,70 @@ function handleNetLine(m, line) {
     if (m === monitor && m.hw !== mm[1]) armFlashGrace(mm[1], true);
     return;
   }
+  // The console greeting's identity line — plain text the firmware writes to
+  // whoever attaches, not a log line:
+  //
+  //   dev f9fb74, host tbeam, fw rop/reticulous_hw-lilygo-tbeam-supreme_20260821142037
+  //
+  // Everything the session learns elsewhere piecemeal, in one answer: the
+  // physical unit (getInfo() has no serial number, so `dev` is the only
+  // per-unit fact that reaches the page, and it is what the returning-boards
+  // adoption verifies against), the hostname (the tab's title), and the image
+  // named exactly as its catalogue zip, prefixed by its catalogue. Optional
+  // fields: `hw <board>` appears only when the detected board differs from the
+  // dist (a variant entry not named after its board), `fw` only for a
+  // catalogue build.
+  // Fields end at a comma, so the captures must exclude it — `\S+` would eat
+  // the comma and knock every field after `host` out of alignment.
+  mm = line.match(/^dev ([0-9a-f]{6}), host ([^\s,]+)(.*)$/);
+  if (mm) {
+    // Per session as well as the tab-level pairing: a console move's incoming
+    // session hears the greeting before it becomes `monitor`, and its commit
+    // carries the id over rather than losing it.
+    m.unitId = mm[1];
+    m.hostname = mm[2];
+    if (m === monitor) { pairedUnit = mm[1]; setMonTitle(mm[2]); }
+    rosterNote(mm[1], mm[2], portUsbKey(m.port));
+    const rest = mm[3] || '';
+    const fw = rest.match(/, fw (?:([^/\s,]+)\/)?([^\s,]+)_(\d{14})\b/);
+    const hw = (rest.match(/, hw (hw-[a-z0-9-]+)\b/) || [])[1]
+      || (fw && (fw[2].match(/(hw-[a-z0-9-]+)$/) || [])[1]);
+    // The same facts the `build:` boot-log lines carry, with the same
+    // strength: a running image has already proved dist and hardware agree
+    // (spangap halts on a mismatch), so the board named here is detector-grade.
+    if (hw && m === monitor && m.hw !== hw) armFlashGrace(hw, true);
+    if (fw) {
+      if (fw[1]) {
+        m.deviceCatalogue = fw[1];
+        if (m === monitor) adoptDeviceCatalogue(fw[1]);
+      }
+      m.deviceVersion = fw[3];
+      m.versionSettled = true;
+      clearTimeout(m.versionTimer);
+      if (m === monitor) refreshFlashOffer();
+    }
+    // `ap "<ssid>", ip <addr>` — present while the device is associated with an
+    // address: it is online and its UI reachable, known at attach rather than
+    // only when a `Connected` boot-log line happens to scroll past. The SSID is
+    // free text (spaces, commas), so the parse anchors on the `", ip` after it.
+    const net = rest.match(/, ap "(.*)", ip ([^\s,]+)/);
+    if (net) {
+      m.connectedSeen = true;
+      showOpenUi(m, net[2], net[1]);   // device online → show the "Open Device UI" button
+      advanceSetup(m);                 // network is up → no wifi dialog needed
+    }
+    return;
+  }
+  // `dev a1b2c3` alone at line end — the boot log stating the unit id (the
+  // same field, same spelling, as the greeting; a boot log line just has
+  // nothing else to say).
+  mm = line.match(/\bdev ([0-9a-f]{6})\s*$/);
+  if (mm) {
+    m.unitId = mm[1];
+    if (m === monitor) pairedUnit = mm[1];
+    rosterNote(mm[1], null, portUsbKey(m.port));
+    return;
+  }
   // `build: invocation spangap build <buildable> --with spangap/hw-<board> …` —
   // the `spangap build` command that produced the running image. Firmware too
   // old to print `build: hw` still names its board here, so this is the fallback
@@ -3908,6 +4029,9 @@ async function adoptConsolePort(port) {
     pinPort(port);                       // the tab's port from here on
     priorSession = outgoing.gone ? null : outgoing;
     monitor = chosen;
+    // The pick re-establishes identity: whatever the new port's attach banner
+    // said is the pairing now — even when the pick landed on a different board.
+    pairedUnit = chosen.unitId;
     committed = chosen;
     focusTerm(outgoing.term);
     refreshFlashOffer();
@@ -4017,6 +4141,7 @@ async function reclaimPort(p, attempts = 8) {
         if (attempt === 0) { try { await p.close(); } catch (_) { /* wasn't open */ } }
         await attachStreams(monitor);
         monitor.gone = false;
+        markTitleGone(false);
         // Whichever of the tab's ports answered is now the active one. That is
         // how a console move completes without a dialog once both transports
         // have been picked: the CDC port this tab already owns turns up, and
@@ -4063,7 +4188,9 @@ async function reclaimPort(p, attempts = 8) {
 // pinned first, because after a console move the port that answers is the other
 // one — which is what makes the second and every later `usb cdc` free of any
 // dialog. A board that was unplugged and plugged back in may return as a fresh
-// SerialPort object; this loop deliberately does not go looking for it.
+// SerialPort object; this loop does not go looking for it — the
+// returning-boards machinery (below) handles that arrival, and only ever on
+// the device's own proof of identity.
 //
 // **This loop never raises a dialog, and never gives up.** Ports go away
 // constantly — every reset, every reflash — and come straight back, so a
@@ -4071,10 +4198,11 @@ async function reclaimPort(p, attempts = 8) {
 // more often than right. Nor is a long silence: a board can sit unpowered for an
 // afternoon and be the same board when it returns. So the loop simply keeps the
 // port and its grant and waits, however long that takes, saying nothing. A board
-// that comes back as a fresh object is Re-select port in the settings panel,
-// which is on screen the whole time and needs no prompting. The only thing that
-// says a port is gone *for good* is the device announcing a transport switch,
-// and those two paths (offerConsoleHandover / offerConsoleReturn) own the ask.
+// that comes back as a fresh object is adopted once it identifies itself, or is
+// Re-select port in the settings panel, which is on screen the whole time and
+// needs no prompting. The only thing that says a port is gone *for good* is the
+// device announcing a transport switch, and those two paths
+// (offerConsoleHandover / offerConsoleReturn) own the ask.
 let rescanTimer = null;
 // Raised for this outage already, so the ask is ONCE per outage. Cleared when
 // the outage ends (below).
@@ -4088,6 +4216,7 @@ function askReconnect(why) {
 function scheduleRescan() {
   if (rescanTimer) return;
   let announced = false;
+  let sweptOnce = false;
   let ticks = 0;
   let rotate = 0;
   rescanTimer = setInterval(async () => {
@@ -4100,8 +4229,8 @@ function scheduleRescan() {
     }
     if (monitor.reattaching) return;          // a reclaim is already running
     // A console move is opening one of these ports itself; stay off it rather
-    // than race for the handle.
-    if (adopting) return;
+    // than race for the handle. Same for an adoption probe committing its port.
+    if (adopting || negotiating) return;
     ticks++;
     // Present and openable is the common case and resolves in the first second
     // or two. Past that the device is off the bus, and polling it hard buys
@@ -4109,7 +4238,24 @@ function scheduleRescan() {
     // object is still picked up for free, however long it took.
     if (ticks > 20 && (ticks % 6)) return;
     const live = pickedPorts.filter((x) => x.connected !== false);
-    if (!live.length) return;
+    // Nothing picked to follow. A returning port may be queued already (its
+    // connect event can land before the disconnect that frees the session to
+    // act on it) — and one may never have raised an event at all, so the
+    // granted ports are swept for candidates too. The grant is the boundary: a
+    // port the browser quietly un-granted is absent from getPorts(), invisible
+    // to this sweep and to every event, and only a pick can bring it back.
+    if (!live.length) {
+      try {
+        const granted = await SERIAL.getPorts();
+        if (!sweptOnce) {
+          sweptOnce = true;
+          console.debug(`adopt: no picked port present; granted ports: [${granted.map(portUsbKey).join(', ')}]`);
+        }
+        for (const p of granted) if (!strayBaseline.has(p)) considerStray(p);
+      } catch (_) { /* */ }
+      maybeAdoptStray();
+      return;
+    }
     // Pinned first, then the other transport — after a move it is the other one
     // that turns up, and following it is the whole point of owning both.
     const order = [pinnedPort, ...live.filter((x) => x !== pinnedPort)].filter(
@@ -4138,15 +4284,26 @@ $('reconnect-dismiss').addEventListener('click', () => {
 // is this tab's. `putBack` restores whatever asked, if the chooser is dismissed.
 async function repickPort(putBack) {
   if (!monitor) return;
-  let port;
+  repicking = true;             // the person's pick outranks the adoption probes
   try {
-    port = await SERIAL.requestPort();
-  } catch (_) {
-    if (putBack) putBack();     // dismissed — this was answering a gesture
-    return;
+    let port;
+    try {
+      port = await SERIAL.requestPort();
+    } catch (_) {
+      if (putBack) putBack();   // dismissed — this was answering a gesture
+      return;
+    }
+    // An in-flight probe may hold the very port just picked; it stands down at
+    // its next check — wait that out (bounded) rather than racing it for the
+    // handle and losing all eight open attempts.
+    for (let i = 0; i < 40 && (negotiating || probeHeld.has(port)); i++) await sleep(250);
+    pairedUnit = null;    // identity is re-learned off the wire after every pick
+    strayArrivals = [];   // …and arrivals queued for the old pairing are moot
+    pinPort(port);
+    await reclaimPort(port);
+  } finally {
+    repicking = false;
   }
-  pinPort(port);
-  await reclaimPort(port);
 }
 
 $('reconnect-pick').addEventListener('click', () => {
@@ -4157,6 +4314,406 @@ $('reconnect-pick').addEventListener('click', () => {
 // The non-modal way back: always on screen in the settings panel, for the one
 // case the rescan can't solve — a board that returned as a different port object.
 on('monitor-repick', 'click', () => { closeSettings(); repickPort(null); });
+
+// ── the node roster ─────────────────────────────────────────────────────────
+// Every node this origin has ever identified, by dev id: its hostname, the USB
+// identities its transports wear, and when it was last seen. localStorage, so
+// it is origin-wide and outlives sessions — it is what lets the startup lobby
+// greet a returning board by name instead of a chooser row. A convenience
+// only: identity is never TRUSTED from here (grants have no page-visible
+// identity, and the greeting is the proof); the roster just says what is worth
+// probing and what to call it while the probe is out.
+const ROSTER_KEY = 'flashmon-nodes';
+function rosterLoad() {
+  try {
+    const r = JSON.parse(localStorage.getItem(ROSTER_KEY));
+    return r && typeof r === 'object' ? r : {};
+  } catch (_) { return {}; }
+}
+function rosterNote(devId, host, key) {
+  if (!devId) return;
+  try {
+    const r = rosterLoad();
+    const n = r[devId] || (r[devId] = { keys: [] });
+    if (host) n.host = host;
+    // At most two transports per node — USB-Serial-JTAG and the CDC composite;
+    // a third identity is a replacement, so the oldest goes (pickedPorts' rule).
+    if (key && !n.keys.includes(key)) {
+      n.keys.push(key);
+      while (n.keys.length > 2) n.keys.shift();
+    }
+    n.seen = Date.now();
+    localStorage.setItem(ROSTER_KEY, JSON.stringify(r));
+  } catch (_) { /* storage unavailable — the lobby just has less to offer */ }
+}
+
+// ── who is holding what ─────────────────────────────────────────────────────
+// A tab with a live console says so: every couple of seconds it stamps its
+// paired dev id in localStorage, and drops the entry when it lets go. Other
+// tabs read the stamps to call a node busy without touching its port — a fresh
+// stamp is a held console, a stale one is a tab that crashed, whose port is
+// fair game again. The ticks are worker-held for the same reason the FNB58
+// keep-alive's are: a hidden tab is throttled, and its stamp going stale while
+// it is still streaming would read as an idle device.
+const HELD_KEY = 'flashmon-held';
+const HELD_FRESH_MS = 6000;
+function heldLoad() {
+  try {
+    const r = JSON.parse(localStorage.getItem(HELD_KEY));
+    return r && typeof r === 'object' ? r : {};
+  } catch (_) { return {}; }
+}
+function heldStamp() {
+  try {
+    const r = heldLoad();
+    let dirty = false;
+    for (const [id, e] of Object.entries(r)) {
+      const mine = e.tab === TAB_ID;
+      const stale = !e.t || Date.now() - e.t > 60000;   // long dead either way
+      if (stale || (mine && (!monitor || monitor.gone || pairedUnit !== id))) {
+        delete r[id];
+        dirty = true;
+      }
+    }
+    if (monitor && !monitor.gone && pairedUnit) {
+      r[pairedUnit] = { t: Date.now(), tab: TAB_ID };
+      dirty = true;
+    }
+    if (dirty) localStorage.setItem(HELD_KEY, JSON.stringify(r));
+  } catch (_) { /* storage unavailable — probing still tells busy from free */ }
+}
+function heldByOther(devId) {
+  const e = heldLoad()[devId];
+  return !!e && e.tab !== TAB_ID && Date.now() - e.t < HELD_FRESH_MS;
+}
+wtSetInterval(heldStamp, 2000);
+window.addEventListener('beforeunload', () => {
+  try {
+    const r = heldLoad();
+    let dirty = false;
+    for (const [id, e] of Object.entries(r)) {
+      if (e.tab === TAB_ID) { delete r[id]; dirty = true; }
+    }
+    if (dirty) localStorage.setItem(HELD_KEY, JSON.stringify(r));
+  } catch (_) { /* the 60 s staleness sweep covers a cut-short unload */ }
+});
+
+// ── returning boards ────────────────────────────────────────────────────────
+// A board that re-enumerates — an unplug, a `usb down`, a long power loss —
+// comes back as a fresh SerialPort object: object identity is lost, and with
+// it the rescan's whole candidate list. When the browser kept the grant (it
+// does for these boards, whose USB descriptors carry a unique serial number),
+// the port turns up in a `connect` event wearing only its vendor/product ids —
+// which every identical board on the desk shares. So a returning port is never
+// adopted on arrival. It is adopted on PROOF: open it, poke it, and let the
+// firmware's greeting say which physical unit answered (`dev a1b2c3`, the
+// field the parser feeds into `pairedUnit`). A match is this tab's board back;
+// a mismatch is closed again, untouched beyond the one carriage return — which
+// a spangap console answers and ignores, and which is the only thing ever
+// written before identity is known. A port another tab holds open cannot even
+// be probed: open() is exclusive browser-wide and fails, and that exclusivity
+// — not the negotiation below — is what makes a steal impossible.
+//
+// Tabs on this origin coordinate the ORDER of their probes over a
+// BroadcastChannel, because every tab receives every connect event (grants are
+// origin-scoped, not tab-scoped) and unordered probes would race open() for
+// the same port, burning attempts. The tab that lost its port most recently
+// goes first. Recency is only an ordering heuristic; correctness comes from
+// the identity check.
+let pairedUnit = null;    // `device` id of the board this tab is paired with;
+                          // cleared on every chooser pick, re-learned off the wire
+let lostPortAt = 0;       // when the pinned port left the bus
+let strayArrivals = [];   // matching arrivals that are not (yet) this tab's
+let negotiating = false;  // an adoption probe, or its wait for a turn, is running
+// Two budgets per port object, because the two failures mean different things:
+// a port that OPENED and said nothing three times is not going to answer, while
+// a port that will not open is usually just early — the OS still building the
+// device node — and deserves the same patience reclaimPort shows, bounded so a
+// port another tab holds is not pestered forever.
+let probeSilent = new WeakMap();
+let probeNoOpen = new WeakMap();
+const PROBE_SILENT_MAX = 3;
+const PROBE_NOOPEN_MAX = 10;
+// A port whose budget ran out is done for good: the sweep re-encounters the
+// same object every 800 ms, and without a terminal state each encounter would
+// re-queue it and re-print its epitaph. (A 'mismatch' from another tab lifts
+// this — that tab just released a port, so the story may have changed.)
+let probeGaveUp = new WeakSet();
+// A person is at the chooser. Their pick outranks any probe: nothing new is
+// probed, and the running probe's open-retry loop stands down at its next check.
+let repicking = false;
+// Ports already listed when this tab lost its own are not "returning" — they
+// are other boards that were on the desk all along, and probing them is noise
+// at best. Snapshotted at each loss; only the getPorts() sweep consults it. A
+// connect event is an arrival by definition and clears membership.
+let strayBaseline = new WeakSet();
+function snapshotStrayBaseline() {
+  strayBaseline = new WeakSet();
+  try {
+    SERIAL.getPorts().then((ports) => { for (const q of ports) strayBaseline.add(q); }).catch(() => {});
+  } catch (_) { /* */ }
+}
+
+const TAB_ID = Math.random().toString(36).slice(2);
+let claimChannel = null;
+try { claimChannel = new BroadcastChannel('flashmon-port-claims'); } catch (_) { /* no peers */ }
+// Rival claims gathered while negotiating: tab id → that tab's lostPortAt.
+let rivalClaims = new Map();
+let negotiatingKey = null;
+if (claimChannel) claimChannel.onmessage = (e) => {
+  const msg = e.data || {};
+  if (msg.tab === TAB_ID) return;
+  if (msg.type === 'claim' && msg.key === negotiatingKey) {
+    rivalClaims.set(msg.tab, msg.lostAt || 0);
+    // Answer while negotiating, so a tab whose claim window opened later than
+    // ours still ranks us — a bare claim only reaches windows already open.
+    if (negotiating) {
+      claimChannel.postMessage({ type: 'claim-echo', key: negotiatingKey, tab: TAB_ID, lostAt: lostPortAt });
+    }
+  }
+  if (msg.type === 'claim-echo' && msg.key === negotiatingKey) {
+    rivalClaims.set(msg.tab, msg.lostAt || 0);
+  }
+  // Another tab probed a port and found it was not theirs. It may be ours — and
+  // any budget this tab spent failing open() against that probe deserves a redo.
+  if (msg.type === 'mismatch') {
+    probeSilent = new WeakMap();
+    probeNoOpen = new WeakMap();
+    probeGaveUp = new WeakSet();
+    maybeAdoptStray();
+  }
+};
+
+const portUsbKey = (p) => {
+  const i = p && p.getInfo ? p.getInfo() : {};
+  return i.usbVendorId == null ? null : `${i.usbVendorId}:${i.usbProductId}`;
+};
+
+// A stranger is worth probing only when it wears the identity of a port this
+// tab was actually given, and only when this tab knows who its board is:
+// without a pairedUnit there is nothing to verify against, and unverified
+// adoption is the traded-consoles bug by construction. Declines are said in
+// the console (not the terminal — most of them are other boards on the desk,
+// none of this tab's business), so a return that goes nowhere is diagnosable.
+const strayLogged = new WeakSet();   // one console line per port object, not per sighting
+function considerStray(p) {
+  if (!monitor || isOurs(p) || strayArrivals.includes(p) || probeGaveUp.has(p)) return;
+  const key = portUsbKey(p);
+  if (!pairedUnit) {
+    if (!strayLogged.has(p)) { strayLogged.add(p); console.debug(`adopt: ${key} declined — no device id was ever learned from this tab's board`); }
+    return;
+  }
+  if (!key || !pickedPorts.some((x) => portUsbKey(x) === key)) {
+    if (!strayLogged.has(p)) { strayLogged.add(p); console.debug(`adopt: ${key} declined — matches no port this tab was given`); }
+    return;
+  }
+  strayArrivals.push(p);
+  while (strayArrivals.length > 4) strayArrivals.shift();
+  console.debug(`adopt: ${key} queued (paired unit ${pairedUnit})`);
+  maybeAdoptStray();
+}
+
+// Wait for this tab's turn at the returning port. Every tab that wants one
+// posts its bereavement time; the most recent loss probes first, and each
+// earlier loss waits long enough for the tabs ahead of it to finish a probe.
+// Ties break on tab id, so two tabs never take the same slot.
+async function claimTurn(key) {
+  if (!claimChannel) return;
+  negotiatingKey = key;
+  rivalClaims = new Map();
+  claimChannel.postMessage({ type: 'claim', key, tab: TAB_ID, lostAt: lostPortAt });
+  await sleep(250);
+  const ahead = [...rivalClaims.entries()].filter(([tab, at]) =>
+    at > lostPortAt || (at === lostPortAt && tab > TAB_ID)).length;
+  if (ahead) await sleep(ahead * 3500);
+}
+
+// Open the port, ask with one CR, and read until the firmware names the unit.
+// Outcomes: `{status:'id', id, host}` — the firmware named itself (host absent
+// when only a boot log's bare `dev` line was seen); `{status:'silent'}` —
+// opened, poked, nothing identifiable came; `{status:'no-open'}` — the open
+// failed every attempt, because the OS is still building the device node or
+// another tab holds the port. The port ends closed in every case. The open
+// gets the same patient retries as reclaimPort — a port rarely accepts an open
+// the instant it appears — re-checking `alive()` between attempts, which is
+// the caller's "this probe still serves a purpose": the adoption path passes
+// its bereft-session test, the startup lobby its still-on-screen test.
+// An await that is not allowed to wedge the probe: settle in `ms` or move on.
+// The probe runs unattended in a loop, so any of its teardown awaits hanging —
+// close() on a vanished port is the known one — would stick `negotiating` and
+// with it every recovery path, including a user's own re-pick.
+const settled = (x, ms) => Promise.race([Promise.resolve(x).catch(() => {}), sleep(ms)]);
+
+// Ports an identity probe currently holds open. A user's own connect must not
+// race a probe for the handle and lose (a chooser pick or a lobby row click
+// landing while a probe is mid-read would fail its open) — callers that open a
+// port for a person first wait, bounded, for the probe to let go.
+const probeHeld = new Set();
+
+async function probeUnitId(p, cfg, alive) {
+  let opened = false;
+  let openErr = null;
+  for (let attempt = 0; attempt < 8 && !opened; attempt++) {
+    if (!alive() || p.connected === false) return { status: 'no-open' };
+    try { await p.open(cfg); opened = true; } catch (e) { openErr = e; await sleep(300); }
+  }
+  if (!opened) {
+    console.debug(`adopt: ${portUsbKey(p)} would not open`, openErr);
+    return { status: 'no-open' };
+  }
+  probeHeld.add(p);
+  let id = null;
+  const reader = p.readable.getReader();
+  const writer = p.writable.getWriter();
+  // A device mid-boot answers late, and one fresh on the bus may still be
+  // settling (or being sniffed by the OS), so the ask is repeated a couple of
+  // times across a ~4 s window before the read is cancelled — an unanswered
+  // read never settles on its own. Every CR that went out is counted: each one
+  // the firmware reads costs one greeting, and the count is what the cleanup
+  // below consumes by.
+  let crs = 0;
+  const cr = () => { crs++; writer.write(new Uint8Array([0x0d])).catch(() => {}); };
+  const repoke1 = setTimeout(cr, 1300);
+  const repoke2 = setTimeout(cr, 2600);
+  const stop = setTimeout(() => { reader.cancel().catch(() => {}); }, 4000);
+  const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  let text = '';
+  try {
+    cr();
+    const dec = new TextDecoder();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += dec.decode(value, { stream: true });
+      // The unit id field: `dev f9fb74` — leading the greeting a console
+      // answers a CR with, and standing alone in a boot log.
+      const mm = stripAnsi(text).match(/\bdev ([0-9a-f]{6})(?![0-9a-f])/);
+      if (mm) { id = mm[1]; break; }
+      if (text.length > 8192) text = text.slice(-2048);
+    }
+    if (id) {
+      // The question is answered — no further asks, so the cleanup below has a
+      // fixed count to consume to.
+      clearTimeout(repoke1);
+      clearTimeout(repoke2);
+      // Consume what the probe caused — and nothing else — before closing.
+      // Bytes left unread stay in the transport's buffer and come back as
+      // backlog when the reclaim reopens this port, so the surplus greetings
+      // this probe's CRs earned would print above the real one. Each greeting
+      // ends in a known line, so read until as many of those terminators have
+      // passed as CRs went out. A hush is no yardstick here: a console logging
+      // continuously never goes quiet — and its log lines are not ours to eat,
+      // so anything real behind our greetings reappears as ordinary backlog
+      // for the session that reclaims the port. Deadline-capped: a CR the
+      // firmware never got to read has no greeting to wait for.
+      const cap = setTimeout(() => { reader.cancel().catch(() => {}); }, 1500);
+      try {
+        for (;;) {
+          const seen = (stripAnsi(text).match(/Start typing to enter CLI/g) || []).length;
+          if (seen >= crs) break;
+          const { value, done } = await reader.read();
+          if (done) break;
+          text += dec.decode(value, { stream: true });
+        }
+      } finally {
+        clearTimeout(cap);
+      }
+    }
+  } catch (_) { /* the device left mid-probe; id stays null */ }
+  clearTimeout(repoke1);
+  clearTimeout(repoke2);
+  clearTimeout(stop);
+  await settled(reader.cancel(), 1500);
+  try { reader.releaseLock(); } catch (_) { /* */ }
+  await settled(writer.abort(), 1500);
+  try { writer.releaseLock(); } catch (_) { /* */ }
+  // Like detachStreams: only close a port that still has a device behind it —
+  // close() on a vanished port is a known Web Serial hang spot. Bounded anyway.
+  if (p.connected !== false) await settled(p.close(), 3000);
+  probeHeld.delete(p);
+  if (id) {
+    // The greeting's host field, if the drain captured it — the id match fires
+    // on the line's first field, so the hostname is read off the full text
+    // afterwards rather than raced for.
+    const g = stripAnsi(text).match(new RegExp(`\\bdev ${id}, host ([^\\s,]+)`));
+    return { status: 'id', id, host: g ? g[1] : undefined };
+  }
+  // A device that left mid-probe did not decline to answer — it was gone. Let
+  // the arrival filters retire the object without burning the silence budget.
+  return p.connected === false ? { status: 'no-open' } : { status: 'silent' };
+}
+
+// Probe the queued stranger, if the session is actually bereft and nothing else
+// is driving a port. One probe per call, budgeted per port object, so a port
+// that turns out to be someone else's is not pestered forever.
+// Retire a port from the adoption machinery for good, with its epitaph said
+// once — in the console, not the terminal: the terminal narrates only what the
+// session actually did (`gone`, `came back`), and the probes' comings and
+// goings are diagnostics. The object stays in probeGaveUp, so re-encounters
+// (the sweep sees it every tick) stay silent.
+function retireStray(p, epitaph) {
+  probeGaveUp.add(p);
+  strayArrivals = strayArrivals.filter((x) => x !== p);
+  if (epitaph) console.debug(`adopt: ${portUsbKey(p)} retired — ${epitaph}`);
+}
+
+async function maybeAdoptStray() {
+  if (negotiating || adopting || repicking) return;
+  if (!monitor || !(monitor.gone || !monitor.reader) || monitor.reattaching) return;
+  strayArrivals = strayArrivals.filter((p) => p.connected !== false && !isOurs(p));
+  const p = strayArrivals[0];
+  if (!p) return;
+  negotiating = true;
+  try {
+    if (!probeSilent.has(p) && !probeNoOpen.has(p)) {
+      console.debug(`adopt: ${portUsbKey(p)} probing — asking it to identify itself`);
+    }
+    await claimTurn(portUsbKey(p));
+    // The wait was long; re-check the ground the probe stands on.
+    if (!monitor || !(monitor.gone || !monitor.reader) || monitor.reattaching || adopting || repicking) return;
+    if (p.connected === false) return;
+    const r = await probeUnitId(p, monitor.cfg,
+      () => !!monitor && (monitor.gone || !monitor.reader) && !repicking);
+    if (r.status === 'no-open') {
+      const rounds = (probeNoOpen.get(p) || 0) + 1;
+      probeNoOpen.set(p, rounds);
+      // No epitaph for a port that is no longer on the bus — it did not decline,
+      // it left (a bus still bouncing after re-enumeration does this), and its
+      // successor object gets its own probes.
+      if (p.connected === false) retireStray(p, null);
+      else if (rounds >= PROBE_NOOPEN_MAX) {
+        retireStray(p, 'would not open (held elsewhere, or the OS never finished the node)');
+      }
+      return;                                  // otherwise the rescan re-offers it next tick
+    }
+    if (r.status === 'silent') {
+      const asked = (probeSilent.get(p) || 0) + 1;
+      probeSilent.set(p, asked);
+      if (asked >= PROBE_SILENT_MAX) {
+        retireStray(p, 'never identified itself (no dev/device line in its answer)');
+      }
+      return;
+    }
+    if (r.id !== pairedUnit) {
+      if (claimChannel) claimChannel.postMessage({ type: 'mismatch', tab: TAB_ID });
+      retireStray(p, `is device ${r.id}, not this tab's ${pairedUnit}`);
+      return;
+    }
+    // Proven: the tab's board, back on a fresh port object. Retire the dead
+    // twin it replaces, take the port, and let the ordinary reclaim finish —
+    // whose `came back` is the one line the terminal shows for all of this.
+    strayArrivals = strayArrivals.filter((x) => x !== p);
+    const key = portUsbKey(p);
+    pickedPorts = pickedPorts.filter((x) => x.connected !== false || portUsbKey(x) !== key);
+    console.debug(`adopt: ${key} answered as device ${r.id} — this tab's board; reclaiming`);
+    rosterNote(r.id, r.host, key);
+    pinPort(p);
+    await reclaimPort(p);
+  } finally {
+    negotiating = false;
+    negotiatingKey = null;
+  }
+}
 
 // The tab's port leaving the bus: note it in the stream and tear the dead
 // streams down. Nothing else on the desk is any of this tab's business — three
@@ -4178,6 +4735,17 @@ SERIAL.addEventListener('disconnect', (e) => {
   // coming and going is the device's business, not an outage.
   if (!monitor || p !== pinnedPort || monitor.gone) return;
   monitor.gone = true;
+  markTitleGone(true);       // the tab strip says so too
+  lostPortAt = Date.now();   // ranks this tab first when the board returns re-enumerated
+  snapshotStrayBaseline();   // what is on the bus NOW was not "returning" later
+  // Without a device id there is nothing a returning re-enumerated port could
+  // be verified against, so adoption is off the table for this board — said in
+  // the console once, because from the outside it looks identical to a working
+  // setup.
+  if (!pairedUnit && !monitor.noIdWarned) {
+    monitor.noIdWarned = true;
+    console.debug('adopt: this board announced no device id; if its port re-enumerates it will need Re-select port');
+  }
   hideOpenUi();            // the device is gone — drop its buttons
   pendingFlash = null;     // can't flash (or detect on) a gone device
   cancelStateWarn();       // …so a warning waiting on an answer is moot
@@ -4194,12 +4762,18 @@ SERIAL.addEventListener('disconnect', (e) => {
   if (!adopting) scheduleRescan();
 });
 
-// Only ever the tab's own port. An arrival that is not it is another board on
-// the desk coming back — possibly into another tab that owns it — and following
-// it would be how two consoles trade places.
+// The tab's own port arriving is reclaimed directly. Any other arrival is
+// either another board on the desk — following it blind would be how two
+// consoles trade places — or this tab's own board back under a fresh
+// SerialPort object, which only the device itself can say: considerStray
+// queues it for the verified-adoption path, which opens nothing on a guess.
 SERIAL.addEventListener('connect', async (e) => {
   const p = e.port || e.target;
-  if (!isOurs(p) || !monitor) return;
+  if (!p) return;
+  console.debug(`serial connect event: ${portUsbKey(p)} ${isOurs(p) ? '(a port this tab was given)' : '(stranger)'}`);
+  strayBaseline.delete(p);   // it just arrived — that is what a return looks like
+  if (!monitor) return;
+  if (!isOurs(p)) { considerStray(p); return; }
   // Ground truth, not bookkeeping: a session with no reader has no working
   // port, whatever `gone` was left saying. That flag has repeatedly gone stale
   // — a missed disconnect leaves it false — and every time it does, an arriving
@@ -4919,9 +5493,32 @@ function offerFlash() {
   if (deviceBoxOpen()) { offerShownFor = f.url; return; }
   if (offerShownFor === f.url) return;
   offerShownFor = f.url;
+  // An image that is not an upgrade is not worth a dialog — the fact fits in a
+  // moment's toast, and the device window (with its Flash anyway) stays one
+  // click away for the re-flash that is actually meant.
+  if (!f.newer) { toast('You have the latest firmware.'); return; }
   showDeviceBox(deviceFacts && deviceFacts.hw === m.hw ? deviceFacts : {
     usb: usbInfoLine(m.port), chip: [], periph: [], hw: m.hw, state: statePart, probed: false,
   });
+}
+
+// A moment's notice: no buttons, gone on its own in 1.5 s or on a click.
+// Built here rather than in the markup, so a cached page older than this
+// script still shows it.
+let toastEl = null;
+let toastTimer = null;
+function toast(text) {
+  if (!toastEl) {
+    ownStyles();
+    toastEl = document.createElement('div');
+    toastEl.id = 'toast';
+    toastEl.addEventListener('click', () => { clearTimeout(toastTimer); toastEl.hidden = true; });
+    document.body.appendChild(toastEl);
+  }
+  toastEl.textContent = text;
+  toastEl.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toastEl.hidden = true; }, 1500);
 }
 
 // Flash the pending image, then reopen the monitor and reset into it. The image
@@ -4937,6 +5534,7 @@ async function runPendingFlash() {
   const port = m.port;
   const hw = m.hw;                            // carry the board across the re-open
   const hwDetected = m.hwDetected;            // …and how we came to know it
+  const host = m.hostname;                    // …and whose board the flash screen names
   // Decided here, before the write, from the catalogue's own account of the
   // image: what comes back up owns its setup, so this page steps out of it for
   // the rest of the session. A later re-flash of a flasher-onboarded image
@@ -4977,6 +5575,11 @@ async function runPendingFlash() {
     if (monitor !== m) return;                  // …or while the warning was up
 
     await closeMonitor();
+    // The tab and the header both say what is happening: 🔥 "<host> -
+    // flashing" up top, the header down to "Flashing <project>" with the
+    // image's name under it. The monitor re-open at the end resets both.
+    setMonTitle(host);                          // closeMonitor cleared it
+    markTitleFlashing(decodeURIComponent(url.split('/').pop() || '').replace(/\.zip$/, ''));
     $('monitor').hidden = true;                 // reveal the intro screen behind it
     try {
       let banner = await flash(port, plan);
@@ -5172,11 +5775,14 @@ let connecting = false;
 // way.
 //
 // requestPort() is called first, while the user gesture is fresh, before any
-// long await.
+// long await. `givenPort` skips the chooser: the startup lobby passes the port
+// it has just identity-probed, which is the other admissible proof of "this is
+// the board the person means" (see pinPort).
 //
 // This pick is what the tab is for. It becomes the tab's one port, and only
-// another pick — the reconnect dialog, or a console move — ever replaces it.
-async function connect() {
+// another pick — the reconnect dialog, a console move, or a verified adoption
+// — ever replaces it.
+async function connect(givenPort) {
   if (connecting || monitor) return;
   connecting = true;
   statePart = null;                  // a fresh pick may be a different chip
@@ -5189,17 +5795,25 @@ async function connect() {
   logEl.textContent = '';
   logEl.hidden = true;
   $('intro-hint').textContent = 'Opening serial monitor…';
+  // Connecting supersedes the lobby, whatever state its probes are in.
+  lobbyHide();
   try {
-    const port = await SERIAL.requestPort();
+    const port = givenPort || await SERIAL.requestPort();
     if (USB_PROBE && port.usbProbe) { await runUsbProbe(port); return; }
     if (isFnb58Port(port)) {
       $('intro-hint').innerHTML =
         '<span class="err">That looks like the FNB58 power meter, not your device. ' +
         'Pick your device&rsquo;s serial port instead — then use the FNB58 button in ' +
         'the monitor to graph the meter.</span>';
-      $('start').hidden = false;      // let them re-pick; finally{} clears `connecting`
+      showFrontDoor();                // let them re-pick; finally{} clears `connecting`
       return;
     }
+    // An identity probe may still hold the very port just picked (a lobby
+    // probe, or an adoption's); it lets go within its own deadlines — wait it
+    // out, bounded, rather than losing the open to it.
+    for (let i = 0; i < 40 && probeHeld.has(port); i++) await sleep(200);
+    pairedUnit = null;      // identity is re-learned off the wire after every pick
+    strayArrivals = [];
     pinPort(port);
     const banner = ['Monitoring — the device has not been reset.'];
     const usb = usbInfoLine(port);
@@ -5208,7 +5822,7 @@ async function connect() {
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     $('intro-hint').innerHTML = `<span class="err">${msg}</span>`;
-    $('start').hidden = false;       // let them try again
+    showFrontDoor();                 // let them try again
   } finally {
     connecting = false;
   }
@@ -5451,6 +6065,175 @@ async function pollStamp() {
 }
 
 // ── boot ──────────────────────────────────────────────────────────────────
+// ── the startup lobby ───────────────────────────────────────────────────────
+// On load the roster and the granted ports become a menu: every node this
+// browser has identified before, by hostname, its presence probed live with
+// the same primitive adoption uses — open, one CR, read `dev …, host …`, close
+// — which needs no gesture on a granted port. The chooser, whose
+// /dev/cu.usbmodem-style rows nobody can tell apart, is behind "Other
+// device…": the one road for a device this origin has never met. Only ports
+// wearing a USB identity the roster has seen are probed at all, so a serial
+// device this origin granted for some other purpose is never poked.
+// Built by this script, styles included, never taken from the page: index.html
+// is served without the cache-bust the module gets, so a surface whose markup
+// or CSS lived only in a fresh page would silently vanish on a cached one —
+// exactly what must not happen to the front door.
+let ownStylesDone = false;
+function ownStyles() {
+  if (ownStylesDone) return;
+  ownStylesDone = true;
+  const s = document.createElement('style');
+  s.textContent = `
+  #lobby-list{display:flex;flex-direction:column;gap:.45rem;margin-top:.9rem}
+  .lobby-node{display:flex;align-items:baseline;gap:.6rem;width:100%;text-align:left}
+  .lobby-node small{color:var(--muted);font-weight:400;margin-left:auto;white-space:nowrap}
+  .lobby-node:disabled{cursor:default;opacity:.55}
+  #toast{position:fixed;left:50%;bottom:2.2rem;transform:translateX(-50%);z-index:40;
+       background:var(--panel);border:1px solid var(--line);border-radius:8px;
+       color:var(--fg);padding:.55rem .9rem;font-weight:600;cursor:pointer;
+       box-shadow:0 4px 18px rgba(0,0,0,.5)}
+  #toast[hidden]{display:none}
+  #title.flashing{font-size:1.25rem}
+  #title-sub{color:var(--muted);font-size:.85rem;margin:.1rem 0 .6rem}
+  #title-sub[hidden]{display:none}`;
+  document.head.appendChild(s);
+}
+
+let lobbyUi = null;   // { box, list }, built on first use
+function lobbyBuild() {
+  if (lobbyUi) return lobbyUi;
+  ownStyles();
+  const box = document.createElement('div');
+  box.className = 'modal-overlay';
+  box.hidden = true;
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const h2 = document.createElement('h2');
+  h2.textContent = 'Connect to a device';
+  const sub = document.createElement('div');
+  sub.className = 'sub';
+  const list = document.createElement('div');
+  list.id = 'lobby-list';
+  const row = document.createElement('div');
+  row.className = 'row';
+  const other = document.createElement('button');
+  other.type = 'button';
+  other.className = 'btn-primary';
+  other.textContent = 'Other device…';
+  other.addEventListener('click', () => { box.hidden = true; connect(); });
+  row.append(other);
+  modal.append(h2, sub, list, row);
+  box.appendChild(modal);
+  document.body.appendChild(box);
+  lobbyUi = { box, list, sub };
+  return lobbyUi;
+}
+function lobbyHide() {
+  if (lobbyUi) lobbyUi.box.hidden = true;
+}
+
+// The way back to square one. The lobby is the page's one front door — an
+// empty roster just makes it a short dialog ("No known devices found" and the
+// chooser behind Other device…). The plain Start button survives only in the
+// ?usbprobe=1 wire-test mode, which has no lobby. A failed connect lands here
+// too: the lobby re-probes, so a node that was taken between probe and click
+// now says so instead of "ready".
+function showFrontDoor() {
+  if (USB_PROBE) { $('start').hidden = false; return; }
+  lobbyShow();
+}
+
+let lobbyScanning = false;
+async function lobbyShow() {
+  if (USB_PROBE || monitor) return;          // wire-test mode, or already connected
+  const roster = rosterLoad();
+  const ids = Object.keys(roster).sort((a, b) => (roster[b].seen || 0) - (roster[a].seen || 0));
+  if (lobbyScanning) {                       // a scan is mid-flight — just re-surface it
+    if (lobbyUi) lobbyUi.box.hidden = false;
+    return;
+  }
+  lobbyScanning = true;
+  try {
+    await lobbyScan(roster, ids);
+  } finally {
+    lobbyScanning = false;
+  }
+}
+
+async function lobbyScan(roster, ids) {
+  const { box, list, sub } = lobbyBuild();
+  sub.textContent = ids.length
+    ? 'Devices this browser has connected to before:'
+    : 'No known devices found.';
+  list.textContent = '';
+  const rows = new Map();
+  const addRow = (devId, host) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'lobby-node btn-ghost';
+    btn.disabled = true;
+    const name = document.createElement('span');
+    name.textContent = host || `device ${devId}`;
+    const state = document.createElement('small');
+    state.textContent = 'looking…';
+    btn.append(name, state);
+    list.appendChild(btn);
+    const row = { btn, name, state };
+    rows.set(devId, row);
+    return row;
+  };
+  for (const devId of ids) addRow(devId, roster[devId].host);
+  // The heartbeat answers "busy" before any port is touched: a node another
+  // tab is stamping is labeled at once and its ports are left alone — probing
+  // them could only fail on exclusivity anyway.
+  const heldIds = new Set(ids.filter((devId) => heldByOther(devId)));
+  for (const devId of heldIds) {
+    rows.get(devId).state.textContent = 'in use in another tab';
+  }
+  box.hidden = false;
+
+  // Probe whatever is present and wears a roster identity. In parallel — the
+  // ports are separate devices, and the list should settle in one probe's
+  // time, not one per device.
+  let granted = [];
+  try { granted = await SERIAL.getPorts(); } catch (_) { /* road closed */ }
+  if (monitor || box.hidden) { box.hidden = true; return; }   // superseded while away
+  // Only keys some free node wears are worth probing — a key that belongs
+  // exclusively to stamped-held nodes has nothing to offer this tab. A key
+  // shared between a held and a free node is still probed, for the free one.
+  const knownKeys = new Set(ids.filter((i) => !heldIds.has(i))
+    .flatMap((i) => roster[i].keys || []));
+  const candidates = granted.filter((p) => knownKeys.has(portUsbKey(p)) && p.connected !== false);
+  const busyKeys = new Set();
+  await Promise.all(candidates.map(async (p) => {
+    const r = await probeUnitId(p, { ...DEFAULT_CFG }, () => !monitor && !box.hidden);
+    if (monitor || box.hidden) return;       // a connect won while this probed
+    if (r.status === 'no-open') {
+      // On the bus but not openable: held by another tab, almost always.
+      if (p.connected !== false) busyKeys.add(portUsbKey(p));
+      return;
+    }
+    if (r.status !== 'id') return;           // mute, or gone — not offerable
+    rosterNote(r.id, r.host, portUsbKey(p));
+    const row = rows.get(r.id) || addRow(r.id, r.host);
+    if (r.host) row.name.textContent = r.host;
+    row.state.textContent = `dev ${r.id} — ready`;
+    row.btn.disabled = false;
+    row.btn.addEventListener('click', () => { box.hidden = true; connect(p); });
+  }));
+  if (monitor) { box.hidden = true; return; }
+  // Whatever never answered is busy (a port with its USB identity refused to
+  // open — a holder without a heartbeat, some other program most likely) or
+  // simply not here. Stamped-held rows keep the label they already have.
+  for (const [devId, row] of rows) {
+    if (!row.btn.disabled || heldIds.has(devId)) continue;
+    const n = roster[devId] || {};
+    const busy = (n.keys || []).some((k) => busyKeys.has(k));
+    row.state.textContent = busy ? 'in use — another program?'
+      : n.seen ? `last seen ${new Date(n.seen).toLocaleDateString()}` : 'not present';
+  }
+}
+
 async function boot() {
   const cfg = await loadConfig();
   applyBrand(cfg);
@@ -5490,14 +6273,21 @@ async function boot() {
     return;
   }
 
-  // Always open the chooser on the Start click. Web Serial exposes only USB
-  // VID/PID, so a remembered grant can't be told apart from a same-model board on
-  // a different port — silently reusing it would land on the wrong device. The
-  // chooser also gives the port a moment to settle, so probe → reset → detect
-  // runs cleanly every time.
-  $('start').textContent = 'Click here to select the serial port your device is connected to.';
-  $('start').hidden = false;
+  // The lobby is the front door: known nodes by name, the chooser behind
+  // "Other device…" for devices this origin has never met. A grant alone still
+  // never picks a board — Web Serial exposes only USB VID/PID, so a remembered
+  // grant can't be told apart from a same-model board on a different port —
+  // but the lobby's identity probe reads the `dev` id off the port before
+  // offering it, which is the same proof adoption stands on. Only the
+  // ?usbprobe=1 wire test keeps the plain Start button: its run wants the
+  // chooser and nothing else.
   $('start').addEventListener('click', () => connect());
+  if (USB_PROBE) {
+    $('start').textContent = 'Click here to select the serial port your device is connected to.';
+    $('start').hidden = false;
+  } else {
+    lobbyShow();
+  }
 
   // Say up front what the WebUSB road can and cannot reach, because the chooser
   // itself won't: a board behind a bridge chip is simply absent from the list,
