@@ -404,12 +404,18 @@ static const char *detect_hw_wismesh_tap_v2(void)
 #define TD_LORA_CS     9
 #define TD_LORA_RST   17
 #define TD_LORA_BUSY  13
+#define TD_LCD_CS     12    // shares SCK/MOSI/MISO with the radio
+#define TD_SD_CS      39    // and so does this
 
 static const char *detect_hw_lilygo_tdeck(void)
 {
     if (!detect_flash_mb(16)) return NULL;
 
     detect_rail_drive(TD_POWER_EN, 1);
+    /* The panel and the SD card sit on the radio's bus with their MISO wired,
+     * so their CS is parked for the probe — on the same terms as the rail. */
+    detect_cs_park(TD_LCD_CS);
+    detect_cs_park(TD_SD_CS);
     vTaskDelay(pdMS_TO_TICKS(150));                /* 3.3 V rail settle */
 
     /* The keyboard is its own MCU booting its own firmware off this rail, and
@@ -424,12 +430,16 @@ static const char *detect_hw_lilygo_tdeck(void)
     }
     if (!kb) {
         detect_miss("no keyboard at 0x%02X — not a T-Deck", TD_KB_ADDR);
+        detect_cs_release(TD_SD_CS);
+        detect_cs_release(TD_LCD_CS);
         detect_rail_release(TD_POWER_EN);
         return NULL;
     }
     if (!detect_radio(TD_LORA_SCK, TD_LORA_MOSI, TD_LORA_MISO,
                       TD_LORA_CS, TD_LORA_RST, TD_LORA_BUSY, NULL)) {
         detect_miss("keyboard answered but no radio — not a T-Deck");
+        detect_cs_release(TD_SD_CS);
+        detect_cs_release(TD_LCD_CS);
         detect_rail_release(TD_POWER_EN);
         return NULL;
     }

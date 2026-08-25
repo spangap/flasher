@@ -3836,8 +3836,22 @@ let uiPressCount = 0;         // presses since this connection came up
 let uiInfoShown = false;      // one-time info dialog shown this session
 const UI_TARGET_KEY = 'flashmon.openUiTarget';   // LocalSettings: 'mdns' | 'ip'
 
+// Served from localhost, the button aims at THIS page's own origin — same
+// scheme, same port, `/?host=<address>&port=443` — instead of at the device. A
+// page on localhost is being served by something already on this machine that
+// can reach the device itself, so the device's address is a parameter for it to
+// act on rather than somewhere the browser navigates: the tab never leaves
+// localhost, and the Local Network Permissions and self-signed-certificate
+// prompts that a direct navigation runs into do not arise. Anywhere else the
+// device is the only thing that can serve its own UI, so the tab goes there.
+const servedFromLocalhost = ['localhost', '127.0.0.1', '[::1]']
+  .includes(location.hostname);
+
 function uiUrl(target) {
-  return target === 'ip' ? `https://${deviceUiIp}/` : `https://${deviceUiHost}.local/`;
+  const addr = target === 'ip' ? deviceUiIp : `${deviceUiHost}.local`;
+  return servedFromLocalhost
+    ? `${location.origin}/?host=${encodeURIComponent(addr)}&port=443`
+    : `https://${addr}/`;
 }
 function openUiTab(target) { window.open(uiUrl(target), '_blank'); }
 
