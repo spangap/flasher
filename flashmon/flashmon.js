@@ -997,6 +997,7 @@ function makeSession(port, term, resizeObserver, muted) {
            // Setup coordinator: password → hostname → wifi, then one batched send.
            needPasswd: false, passwdResolved: false, newPasswd: null, passwdOpen: false,
            hostResolved: false, newHostname: null, hostOpen: false,
+           hostNamed: false, hostProbed: false, hostProbing: false,
            wifiNeeded: false, wifiResolved: false, wifiCfg: null, wifiOpen: false,
            connectedSeen: false, setupSent: false, hostnameQueried: false,
            // Flash offer: the identified board, the catalogue the running image
@@ -3119,9 +3120,7 @@ function handleNetLine(m, line) {
   // refresh the info dialog if it's still up showing the default guess.
   mm = line.match(/^s\.net\.hostname = (\S+)/);
   if (mm) {
-    m.hostname = mm[1];
-    deviceUiHost = mm[1];
-    if (m === monitor) setMonTitle(mm[1]);
+    noteHostname(m, mm[1]);
     if (!$('info-overlay').hidden)
       showInfo(`Device connected to ${deviceUiSsid || 'WiFi'}`, deviceInfoHtml());
     return;
@@ -3135,8 +3134,7 @@ function handleNetLine(m, line) {
   if (mm) {
     m.connectedSeen = true;
     if (mm[4]) {
-      m.hostname = mm[4];            // device reported its actual hostname
-      if (m === monitor) setMonTitle(mm[4]);
+      noteHostname(m, mm[4]);        // device reported its actual hostname
     } else if (!m.hostnameQueried) {
       m.hostnameQueried = true;      // firmware didn't log it — ask for it
       // As a frame where the device speaks them: typing this at the console
@@ -3147,9 +3145,7 @@ function handleNetLine(m, line) {
         rpcQuery(m, 'show s.net.hostname').then((out) => {
           const mm2 = /^s\.net\.hostname = (\S+)/m.exec(out || '');
           if (!mm2) return;
-          m.hostname = mm2[1];
-          deviceUiHost = mm2[1];
-          if (m === monitor) setMonTitle(mm2[1]);
+          noteHostname(m, mm2[1]);
         });
       } else {
         sendToDevice(m, 'show s.net.hostname\n\n');
@@ -3253,6 +3249,40 @@ $('ch-send').addEventListener('click', () => {
   closeConnectDialog();
   advanceSetup(m);
 });
+
+// The device's own name, from whichever source reported it — the `Connected`
+// line, a `show s.net.hostname` reply, or the post-setup readback.
+//
+// `hostNamed` is the setup coordinator's question, and it is deliberately not
+// "is a name set": a device still answering to the project default has not been
+// named by anyone, so it is the one worth offering the dialog to. Anything else
+// is a name somebody chose, and the dialog would offer to overwrite it.
+function noteHostname(m, name) {
+  if (!name) return;
+  m.hostname = name;
+  m.hostNamed = name !== HOSTNAME_DEFAULT;
+  deviceUiHost = name;
+  if (m === monitor) setMonTitle(name);
+}
+
+// What this device is currently called. The `Connected "<ssid>" … host <name>`
+// line answers it for free on a device that reached a real network — but the
+// dialog is raised on the AP-fallback path, where that line never comes. So ask,
+// over the same framed channel the other setup probes use. Firmware that cannot
+// be asked falls through to the dialog, which is where this started.
+async function probeHostname(m) {
+  if (m.hostProbing || m.hostProbed) return;
+  m.hostProbing = true;
+  if (await rpcEnsure(m)) {
+    const out = await rpcQuery(m, 'show s.net.hostname');
+    if (monitor !== m) return;
+    const mm = /^s\.net\.hostname = (\S+)/m.exec(out || '');
+    if (mm) noteHostname(m, mm[1]);
+  }
+  m.hostProbed = true;
+  m.hostProbing = false;
+  if (monitor === m) advanceSetup(m);
+}
 
 // ── hostname dialog ─────────────────────────────────────────────────────────
 // The one answer that is about this node and cannot be reused, so it is asked
@@ -3393,6 +3423,10 @@ function resetSetup(m) {
   m.hostResolved = false;
   m.newHostname = null;
   m.hostOpen = false;
+  /* The name itself survives a reboot, so `hostNamed` is left alone; asking
+   * again is how a name set on the previous pass is picked up. */
+  m.hostProbed = false;
+  m.hostProbing = false;
   m.wifiNeeded = false;
   m.wifiResolved = false;
   m.wifiCfg = null;
@@ -3514,7 +3548,9 @@ function openLoraDialog(m) {
   m.loraOpen = true;
   $('lora-msg').textContent = '';
   $('lora-supe-row').hidden = !m.loraSupe;
+  $('lora-regime-row').hidden = !m.loraSupe;
   if ($('lora-supe')) $('lora-supe').checked = false;
+  if ($('lora-regime')) $('lora-regime').value = '0';
   $('lora-overlay').hidden = false;
   $('lora-freq').focus();
 }
@@ -3552,6 +3588,7 @@ on('lora-ok', 'click', () => {
     bw: $('lora-bw').value,
     cr: $('lora-cr').value,
     supe: !!($('lora-supe') && m.loraSupe && $('lora-supe').checked),
+    regime: (m.loraSupe && $('lora-regime')) ? $('lora-regime').value : null,
   };
   m.loraResolved = true;
   m.loraOpen = false;
@@ -3625,6 +3662,10 @@ async function sendSetup(m) {
     cmds.push(`set s.lora.0.spreading_factor ${m.loraCfg.sf}`);
     cmds.push(`set s.lora.0.coding_rate ${m.loraCfg.cr}`);
     if (m.loraCfg.supe) cmds.push('set s.lora.0.SUPE.enable 1');
+    // Sent whatever the switch says: the regime also selects which channels the
+    // per-second RSSI beat measures and draws, which is what it does with SUPE
+    // off.
+    if (m.loraCfg.regime !== null) cmds.push(`set s.lora.0.SUPE.afa ${m.loraCfg.regime}`);
     cmds.push('set s.lora.0.enable 1');
   }
   // lxmf's own verb, not the storage sentinel behind it: it takes the name as
@@ -3664,11 +3705,7 @@ async function sendSetupFramed(m, cmds) {
   // but no radio — the worst possible half.
   if (m.loraCfg) await rpcQuery(m, 'save');
   const kv = parseKv(net);
-  if (kv.get('hostname')) {
-    m.hostname = kv.get('hostname');
-    deviceUiHost = m.hostname;
-    setMonTitle(m.hostname);
-  }
+  noteHostname(m, kv.get('hostname'));
   if (kv.get('state') === 'sta' && kv.get('ip')) {
     m.connectedSeen = true;
     showOpenUi(m, kv.get('ip'), kv.get('ssid') || '');
@@ -3708,9 +3745,20 @@ function advanceSetup(m) {
   if (m.passwdOpen) return;   // user still in the password dialog
   // 2. Hostname next, if the device fell back to its own AP. Asked even when
   //    the network below is answered from storage: the name is this node's.
+  //
+  //    Only of a node that has no name of its own, though. The dialog prefills
+  //    the project default, and its primary button WRITES that value — so
+  //    raising it over an already-named device offers to rename it, with the
+  //    innocent-looking button being the destructive one. Ask the device what it
+  //    is called first: the AP-fallback path has no `Connected … host` line to
+  //    read it from, so nothing else here would know.
   if (m.wifiNeeded && !m.hostResolved) {
-    if (!m.hostOpen) openHostDialog(m);
-    return;
+    if (!m.hostProbed) { probeHostname(m); return; }   // async; re-enters here
+    if (m.hostNamed) m.hostResolved = true;            // it has a name; keep it
+    else {
+      if (!m.hostOpen) openHostDialog(m);
+      return;
+    }
   }
   if (m.hostOpen) return;     // user still in the hostname dialog
   // 3. Then the network — from a remembered one the device's scan saw, else the

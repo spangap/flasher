@@ -493,8 +493,18 @@
           </div>
         </div>
         <!-- Only on a build that carries SUPE: the device is asked whether the
-             key exists before this row is shown. -->
+             key exists before these rows are shown. The regime follows the
+             switch because it is the second half of the same answer — a node
+             speaking SUPE on a different channel raster from its neighbours
+             negotiates nothing. -->
         <label class="check" id="lora-supe-row" hidden><input id="lora-supe" type="checkbox"> Enable SUPE</label>
+        <div id="lora-regime-row" hidden>
+          <label for="lora-regime">Regime</label>
+          <select id="lora-regime">
+            <option value="0" selected>0 — Single channel</option>
+            <option value="1">1 — EU 863-870, nine channels</option>
+          </select>
+        </div>
         <div id="lora-msg" class="pw-msg"></div>
         <div class="row">
           <button id="lora-skip" class="btn-ghost" type="button">Skip</button>

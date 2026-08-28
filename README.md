@@ -370,8 +370,12 @@ neither dialog opens.
 The **LoRa** dialog is one window: the frequency in MHz (set large — it is the
 one value that gets read back and compared against another node's), then
 spreading factor, bandwidth and coding rate, which every node on a mesh has to
-agree on. **Enable SUPE** appears only on a build that carries SUPE, which the
-page knows because the key exists. Its OK is the only thing that switches the
+agree on. **Enable SUPE** and, under it, **Regime** appear only on a build that carries
+SUPE, which the page knows because the key exists; the regime rides with the
+switch because a node speaking SUPE on a different channel raster from its
+neighbours negotiates nothing, and it is sent whatever the switch says — the
+regime also selects which channels the per-second RSSI beat measures, which is
+what it does with SUPE off. Its OK is the only thing that switches the
 radio on (`s.lora.0.enable`) — a skipped dialog leaves it off rather than on a
 frequency nobody confirmed.
 
@@ -400,6 +404,16 @@ own dialog rather than a field in the WiFi one — with the other two answered f
 storage, naming the node is the whole of setting it up, and it still gets asked
 when the network beside it doesn't. The **name on the mesh** is the same kind of
 answer and is asked last, prefilled from the hostname.
+
+It is asked only of a node that has no name of its own. The dialog prefills the
+project default and its OK **writes** that value, so raising it over a device
+somebody already named would offer to rename it — with the innocent-looking
+button being the destructive one. The device is asked what it is called first
+(`show s.net.hostname`, over the framed channel like the probes above); a device
+still answering to the project default is the unnamed one, and the only one the
+dialog opens for. This has to be a query rather than a read of the boot log: the
+`Connected "<ssid>" … host <name>` line carries the name for free, but the dialog
+is raised on the AP-fallback path, where that line never comes.
 
 ### When the device sets itself up
 
