@@ -496,6 +496,74 @@ found". **Other device…** is the plain chooser, and the only road for a
 stranger. A failed connect returns to the lobby, which re-probes — a node
 taken between probe and click comes back labeled busy rather than ready.
 
+The lobby carries the **reason** it came back, in its own dialog. It covers the
+whole page, so the intro screen the failure is also written onto is behind it:
+without the reason on the dialog itself, a port that would not open presents as
+the front door reappearing for no reason — the pick was made, the chooser
+closed, and the page is back where it started with nothing said. A port that
+refuses is the common case and the browser's words for it ("Failed to open
+serial port.") name no cause, so the line adds the one fact the page holds and
+the sentence does not: `getInfo()` on the picked port, which answers before any
+open.
+
+A port with **no USB vendor/product id** is one the operating system provides
+itself — `/dev/cu.Bluetooth-Incoming-Port` and the debug console on macOS —
+sitting in the chooser looking exactly like a board. That is a wrong row, not a
+wrong state, and it is also why a terminal monitor "opens" one and then sits
+there with nothing arriving: the port is real, there is nothing behind it. The
+line says so and points at the row that appears and disappears with the cable.
+
+A port that **does** wear a USB identity is named (`USB 303A:1001 — ESP32-S3
+USB-Serial-JTAG`), and there the same sentence covers two unrelated faults.
+
+One is a holder: a second flashmon tab, a terminal monitor, an IDE,
+ModemManager sniffing a fresh tty — or, on Linux, a browser with no permission
+for the port at all (dialout/uucp membership).
+
+The other is the **baud rate**, and it is not about the wire. Chromium maps
+only rates up to 38400 onto a termios speed constant on Apple platforms; every
+faster one, 115200 included, it sets with the `IOSSIOSPEED` ioctl, and a failed
+`IOSSIOSPEED` fails the whole open. On a USB CDC device that ioctl is a
+`SET_LINE_CODING` control request — so the *device* has to answer it. A chip
+enumerated but not servicing its USB never does, the driver reports `EDEVERR`,
+and `chrome://device-log` shows
+
+```
+Failed to set custom baud rate: Device error (83)
+```
+
+behind a rejection that reads exactly like a busy port. It is worth knowing
+which side that puts the fault on: a terminal monitor opening the same port
+succeeds, because pyserial uses macOS's `B115200` termios constant and asks the
+device nothing — so "the browser can't open it but my monitor can, and my
+monitor sees no data either" is one fault, in the chip, not two.
+
+There is no UART behind a USB-Serial-JTAG or a CDC console: the bytes cross USB
+at USB's speed and the rate is a number the console never reads. So `openPort`
+retries such a port once at 38400, which macOS sets through termios alone and
+which asks the device nothing — a console that is deaf to control requests but
+still streaming comes up, with a line in the terminal saying the rate was
+dropped and the wire unaffected. A bridge chip is the opposite case (its rate
+*is* the line rate) and is never re-rated. Nor is the WebUSB transport, which
+sets no line coding at all.
+
+The dropped rate is also **evidence**, and the session keeps it
+(`rateDropped`). An ESP32-S3 answers `SET_LINE_CODING` in the USB-Serial-JTAG
+peripheral, in hardware — no firmware involved — so a device that skipped it is
+one whose USB is enumerated but not being driven. If such a session then also
+gets no answer to its CR, the two facts together rule out the ordinary reading
+("firmware too old to greet a CR"): the control endpoint and the data endpoints
+are dead for the same reason. So no detection run is attempted — it would drive
+esptool down the same pipe, fail slowly, and reset the device on the way — and
+the terminal says what actually clears it: a power cycle (battery included), or
+BOOT held while RESET is tapped, or `usb down`/`usb up` from another transport,
+all of which force the host to re-enumerate. Note that the firmware can be wide
+awake, holding its `usb` lock, and reading SOF activity throughout: SOF
+detection, the data ring and the control endpoint are three different things.
+
+A cancelled chooser says nothing — the person changed their mind, and the lobby
+is the answer, not an error.
+
 Busy is known two ways, cheap one first. A tab holding a console **stamps a
 heartbeat** (`localStorage`, dev id → timestamp + tab id, every 2 s on
 worker-held ticks so a hidden tab's stamp stays fresh; dropped on release and

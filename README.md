@@ -80,7 +80,9 @@ has met nothing just reads "No known devices found". **Other device…** is the
 serial-port chooser, which the browser only opens in response to a user
 gesture, and the only road for a stranger. Either way the pick opens the port,
 shows the **serial monitor** — and the device **says which board it is**,
-unasked.
+unasked. A pick that does not open lands back on the lobby with the reason on
+the dialog itself: the usual one is another program holding the port, and the
+browser's own words for it name no cause.
 
 ```
 browser -> device   <CR>                        (the console sync it already sends)
@@ -256,7 +258,9 @@ device, so its serial line switches to the interactive CLI. Controls float over
 it:
 
 - **Open Device UI** (blue) — appears once the device reports it joined WiFi;
-  opens `<hostname>.local` (then the IP) in a new tab.
+  opens `<hostname>.local` (then the IP) in a new tab. Always the device, from
+  wherever the page is served: a `spangap dev` server proxying to that device
+  serves the same UI from source, but it is opened directly when it is wanted.
 - **Reset** (red) — hard-resets the attached device on demand.
 
 Neither flashing nor identifying is among them. The flash is offered in the

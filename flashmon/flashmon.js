@@ -641,7 +641,7 @@ async function runDetection(port) {
 // Read the running detector's one-shot serial output at the console baud, until
 // its end sentinel or a timeout, and return just the DETECTED: lines.
 async function captureDetection(port) {
-  await port.open({ baudRate: DEFAULT_CFG.baudRate });
+  await openPort(port, { baudRate: DEFAULT_CFG.baudRate });
   const reader = port.readable.getReader();
   const dec = new TextDecoder();
   let buf = '';
@@ -800,6 +800,56 @@ function note(target, text) {
   t.writeln(text);
 }
 
+// ── opening a port whose baud rate is decoration ────────────────────────────
+// Chromium maps only rates up to 38400 onto a termios speed constant on Apple
+// platforms; every faster one — 115200 included — it sets with the IOSSIOSPEED
+// ioctl instead, and a failed IOSSIOSPEED fails the whole open. On a USB CDC
+// device that ioctl is a SET_LINE_CODING control request, so it is the DEVICE
+// that has to answer it. A chip whose USB is enumerated but not being serviced
+// — halted firmware, a peripheral left wedged — never does, the driver reports
+// EDEVERR ("Device error (83)" in chrome://device-log), and Web Serial rejects
+// with the same opaque "Failed to open serial port." it uses for a port that is
+// busy. The two look identical from here and mean entirely different things.
+//
+// There is no UART behind a USB-Serial-JTAG or a CDC console: the bytes cross
+// USB at USB's speed, and the rate is a number the console never reads. So an
+// open that fails on one of those is retried at a rate macOS can set through
+// termios alone, which asks the device nothing — the wire is unaffected, and a
+// console that is merely deaf to control requests still streams. A bridge chip
+// is the opposite case (its rate is the line rate) and is never re-rated: a
+// failure there is reported as it stands.
+const TERMIOS_MAX_BAUD = 38400;
+// Espressif's own USB — the S3's USB-Serial-JTAG (303A:1001) and the CDC console
+// the firmware can move to (303A:4002). Both are the chip's USB, not a UART.
+const NATIVE_USB_VID = 0x303A;
+
+function isNativeUsbConsole(port) {
+  try {
+    const i = port && port.getInfo ? port.getInfo() : {};
+    return i.usbVendorId === NATIVE_USB_VID;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Open `port` at `cfg`, and return the config it actually opened at — the same
+// object unless the rate had to be dropped, which callers say out loud rather
+// than letting a session run at a rate the panel does not show.
+async function openPort(port, cfg) {
+  try {
+    await port.open(cfg);
+    return cfg;
+  } catch (e) {
+    // Only on the operating system's tty road: the WebUSB transport carries the
+    // bytes on bulk endpoints itself and never sets a line coding at all, so a
+    // failure there is about claiming the interface and re-rating asks nothing.
+    if (SERIAL_OVER_USB || cfg.baudRate <= TERMIOS_MAX_BAUD || !isNativeUsbConsole(port)) throw e;
+    const lowered = { ...cfg, baudRate: TERMIOS_MAX_BAUD };
+    await port.open(lowered);      // still fails? then it is not the rate — report it
+    return lowered;
+  }
+}
+
 // Detach the reader/writer and close the port (leaving the terminal intact).
 async function detachStreams(m) {
   // Cancelling settles the reader loop but leaves the stream locked to it, and a
@@ -851,7 +901,13 @@ async function detachStreams(m) {
 //   session over the boot log the reset was issued to capture.
 async function attachStreams(m, mode = 'poke') {
   const sync = mode === 'sync';
-  await m.port.open(m.cfg);
+  const used = await openPort(m.port, m.cfg);
+  if (used.baudRate !== m.cfg.baudRate) {
+    m.rateDropped = true;
+    note(m, `\x1b[33m-- ${m.cfg.baudRate} baud could not be set: the console is the chip's own `
+          + `USB, where the rate is decoration and macOS asks the device to agree to it anyway. `
+          + `Opened at ${used.baudRate}; the wire is unaffected. --\x1b[0m`);
+  }
   m.lineSync = sync ? { pending: true, bytes: 0, since: Date.now() } : null;
   m.reader = m.port.readable.getReader();
   m.writer = m.port.writable.getWriter();
@@ -993,6 +1049,11 @@ async function resetDevice(port) {
 function makeSession(port, term, resizeObserver, muted) {
   return { port, term, resizeObserver, cfg: { ...DEFAULT_CFG }, reader: null, writer: null,
            gone: false, reattaching: false, muted, drops: 0, rxBytes: 0,
+           // The open had to drop the rate to avoid IOSSIOSPEED, which means the
+           // device did not answer a SET_LINE_CODING — a control request its
+           // USB-Serial-JTAG answers in hardware. A console that then says
+           // nothing is not old firmware; it is a peripheral nobody is driving.
+           rateDropped: false,
            lineBuf: '', decoder: new TextDecoder(), aps: new Map(), hostname: HOSTNAME_DEFAULT,
            // Setup coordinator: password → hostname → wifi, then one batched send.
            needPasswd: false, passwdResolved: false, newPasswd: null, passwdOpen: false,
@@ -1404,7 +1465,7 @@ function usbSerial() {
     // so a failed open closes it and asks once more. The polyfill does that
     // cleanup itself when it can; this covers the times it could not, and costs
     // a genuinely absent device one extra refusal.
-    const openPort = port.open.bind(port);
+    const rawOpen = port.open.bind(port);
     const setSignals = port.setSignals.bind(port);
 
     // Every bulk endpoint carries a one-bit sequence number (DATA0/DATA1) that
@@ -1467,10 +1528,10 @@ function usbSerial() {
       port.setSignals = async () => {};
       try {
         try {
-          await bounded('open', 10000, openPort(options));
+          await bounded('open', 10000, rawOpen(options));
         } catch (_) {
           if (device.opened) { try { await device.close(); } catch (_) { /* about to fail anyway */ } }
-          await bounded('open', 10000, openPort(options));
+          await bounded('open', 10000, rawOpen(options));
         }
       } catch (e) {
         // "Unable to claim interface" is the browser saying something else has
@@ -3884,22 +3945,15 @@ let uiPressCount = 0;         // presses since this connection came up
 let uiInfoShown = false;      // one-time info dialog shown this session
 const UI_TARGET_KEY = 'flashmon.openUiTarget';   // LocalSettings: 'mdns' | 'ip'
 
-// Served from localhost, the button aims at THIS page's own origin — same
-// scheme, same port, `/?host=<address>&port=443` — instead of at the device. A
-// page on localhost is being served by something already on this machine that
-// can reach the device itself, so the device's address is a parameter for it to
-// act on rather than somewhere the browser navigates: the tab never leaves
-// localhost, and the Local Network Permissions and self-signed-certificate
-// prompts that a direct navigation runs into do not arise. Anywhere else the
-// device is the only thing that can serve its own UI, so the tab goes there.
-const servedFromLocalhost = ['localhost', '127.0.0.1', '[::1]']
-  .includes(location.hostname);
-
+// The button goes to the device, wherever this page is served from. The device
+// is the only thing that always serves its own UI, and it is what the person
+// pressing a button labelled with the device's name is asking for. A `spangap
+// dev` server proxying to a device is the other way to reach that UI — from
+// source, with hot reload — but it is a development tool, reached by opening it
+// directly, not something a device button should redirect to.
 function uiUrl(target) {
   const addr = target === 'ip' ? deviceUiIp : `${deviceUiHost}.local`;
-  return servedFromLocalhost
-    ? `${location.origin}/?host=${encodeURIComponent(addr)}&port=443`
-    : `https://${addr}/`;
+  return `https://${addr}/`;
 }
 function openUiTab(target) { window.open(uiUrl(target), '_blank'); }
 
@@ -4617,7 +4671,7 @@ async function probeUnitId(p, cfg, alive) {
   let openErr = null;
   for (let attempt = 0; attempt < 8 && !opened; attempt++) {
     if (!alive() || p.connected === false) return { status: 'no-open' };
-    try { await p.open(cfg); opened = true; } catch (e) { openErr = e; await sleep(300); }
+    try { await openPort(p, cfg); opened = true; } catch (e) { openErr = e; await sleep(300); }
   }
   if (!opened) {
     console.debug(`adopt: ${portUsbKey(p)} would not open`, openErr);
@@ -5806,7 +5860,7 @@ async function runUsbProbe(port) {
   $('intro-hint').textContent = 'Testing the wire…';
   log('── USB wire test ──');
   try {
-    await port.open({ baudRate: DEFAULT_CFG.baudRate });
+    await openPort(port, { baudRate: DEFAULT_CFG.baudRate });
   } catch (e) {
     log(`open failed: ${e && e.message ? e.message : e}`, 'err');
     $('start').hidden = false;
@@ -5859,15 +5913,21 @@ async function connect(givenPort) {
   $('intro-hint').textContent = 'Opening serial monitor…';
   // Connecting supersedes the lobby, whatever state its probes are in.
   lobbyHide();
+  // Held outside the try so a failure can name the port it happened on: which
+  // row was picked is half the diagnosis, and the chooser's own labels are gone
+  // by the time anyone reads the error.
+  let port = givenPort || null;
   try {
-    const port = givenPort || await SERIAL.requestPort();
+    port = givenPort || await SERIAL.requestPort();
     if (USB_PROBE && port.usbProbe) { await runUsbProbe(port); return; }
     if (isFnb58Port(port)) {
       $('intro-hint').innerHTML =
         '<span class="err">That looks like the FNB58 power meter, not your device. ' +
         'Pick your device&rsquo;s serial port instead — then use the FNB58 button in ' +
         'the monitor to graph the meter.</span>';
-      showFrontDoor();                // let them re-pick; finally{} clears `connecting`
+      showFrontDoor('That looks like the FNB58 power meter, not your device. Pick your '
+        + 'device’s serial port instead — then use the FNB58 button in the monitor to '
+        + 'graph the meter.');         // let them re-pick; finally{} clears `connecting`
       return;
     }
     // An identity probe may still hold the very port just picked (a lobby
@@ -5883,8 +5943,11 @@ async function connect(givenPort) {
     refreshFlashOffer();
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
+    // A cancelled chooser is not a failure — the person changed their mind, and
+    // the lobby they land back on is the answer, not an error to explain.
+    const cancelled = e && (e.name === 'NotFoundError' || /No port selected/i.test(msg));
     $('intro-hint').innerHTML = `<span class="err">${msg}</span>`;
-    showFrontDoor();                 // let them try again
+    showFrontDoor(cancelled ? null : `${msg} ${openHint(port, msg)}`);
   } finally {
     connecting = false;
   }
@@ -5912,7 +5975,21 @@ async function connect(givenPort) {
     // a debug session exists to observe — and the run itself destroys the
     // evidence, resetting the device and burying the dead console under a
     // fresh boot. The settings-panel button still runs one deliberately.
-    if (DEBUG_HUD && monitor) {
+    // A console that says nothing on a port whose SET_LINE_CODING also went
+    // unanswered is not old firmware \u2014 the USB-Serial-JTAG answers that request
+    // in hardware, so a device that skipped it is one whose USB peripheral is
+    // enumerated but not being driven, and the data endpoints are dead for the
+    // same reason the control endpoint was. A detection run drives esptool down
+    // that same pipe, so it cannot do anything but fail slowly and reset the
+    // device on the way. Say what is wrong and what clears it instead.
+    if (monitor && monitor.rateDropped) {
+      note(monitor, '\x1b[31m-- this device is enumerated but not servicing its USB: it did not '
+                  + 'answer the line-coding request, and it has not answered the console either. '
+                  + 'The host cannot reach it, so no detection run is attempted. It has to '
+                  +'re-enumerate: power-cycle the board (pull the battery too, if it has one), or '
+                  + 'hold BOOT and tap RESET for the ROM loader. From another transport, `usb down` '
+                  + 'followed by `usb up` does the same thing deliberately. --\x1b[0m');
+    } else if (DEBUG_HUD && monitor) {
       note(monitor, '\x1b[33m-- debug: the device did not answer the CR; auto-detection is off '
                   + 'under ?debug=1 so the failure stays observable. Reset shows the boot log; '
                   + '\u201cDetect hardware\u201d still runs manually. --\x1b[0m');
@@ -6155,6 +6232,8 @@ function ownStyles() {
        color:var(--fg);padding:.55rem .9rem;font-weight:600;cursor:pointer;
        box-shadow:0 4px 18px rgba(0,0,0,.5)}
   #toast[hidden]{display:none}
+  #lobby-why{color:var(--err);font-size:.85rem;margin:0 0 .8rem}
+  #lobby-why[hidden]{display:none}
   #title.flashing{font-size:1.25rem}
   #title-sub{color:var(--muted);font-size:.85rem;margin:.1rem 0 .6rem}
   #title-sub[hidden]{display:none}`;
@@ -6172,6 +6251,13 @@ function lobbyBuild() {
   modal.className = 'modal';
   const h2 = document.createElement('h2');
   h2.textContent = 'Connect to a device';
+  // Why the last attempt did not stick. The lobby covers the whole page, so a
+  // reason written onto the intro screen is behind it — a failed connect would
+  // read as the front door reappearing for no reason, which is the one thing it
+  // must never do. Anything that sends someone back here says why here.
+  const why = document.createElement('div');
+  why.id = 'lobby-why';
+  why.hidden = true;
   const sub = document.createElement('div');
   sub.className = 'sub';
   const list = document.createElement('div');
@@ -6184,10 +6270,10 @@ function lobbyBuild() {
   other.textContent = 'Other device…';
   other.addEventListener('click', () => { box.hidden = true; connect(); });
   row.append(other);
-  modal.append(h2, sub, list, row);
+  modal.append(h2, why, sub, list, row);
   box.appendChild(modal);
   document.body.appendChild(box);
-  lobbyUi = { box, list, sub };
+  lobbyUi = { box, list, sub, why };
   return lobbyUi;
 }
 function lobbyHide() {
@@ -6199,31 +6285,79 @@ function lobbyHide() {
 // chooser behind Other device…). The plain Start button survives only in the
 // ?usbprobe=1 wire-test mode, which has no lobby. A failed connect lands here
 // too: the lobby re-probes, so a node that was taken between probe and click
-// now says so instead of "ready".
-function showFrontDoor() {
+// now says so instead of "ready" — and `why` carries the reason it came back,
+// because the lobby is drawn over the intro screen any explanation would
+// otherwise land on.
+function showFrontDoor(why) {
   if (USB_PROBE) { $('start').hidden = false; return; }
-  lobbyShow();
+  lobbyShow(why);
 }
 
 let lobbyScanning = false;
-async function lobbyShow() {
+async function lobbyShow(why) {
   if (USB_PROBE || monitor) return;          // wire-test mode, or already connected
   const roster = rosterLoad();
   const ids = Object.keys(roster).sort((a, b) => (roster[b].seen || 0) - (roster[a].seen || 0));
   if (lobbyScanning) {                       // a scan is mid-flight — just re-surface it
-    if (lobbyUi) lobbyUi.box.hidden = false;
+    if (lobbyUi) { lobbySayWhy(lobbyUi.why, why); lobbyUi.box.hidden = false; }
     return;
   }
   lobbyScanning = true;
   try {
-    await lobbyScan(roster, ids);
+    await lobbyScan(roster, ids, why);
   } finally {
     lobbyScanning = false;
   }
 }
 
-async function lobbyScan(roster, ids) {
-  const { box, list, sub } = lobbyBuild();
+// A port that will not open says so in the browser's words ("Failed to open
+// serial port."), which name no cause. The page knows one thing the sentence
+// does not, and it is the thing that splits the causes in two: whether the port
+// picked is a USB device at all.
+//
+// getInfo() answers that before the port is ever opened, and it answers `{}`
+// for a port the operating system provides itself — /dev/cu.Bluetooth-… and
+// the debug console on macOS, which sit in the chooser looking exactly like a
+// board and are the wrong row, not a wrong state. Those are also why a terminal
+// monitor "opens" them and then sits there with nothing arriving: the port is
+// real, there is simply nothing behind it.
+//
+// A port that DOES wear a USB identity is the device, and refusing to open is
+// then about who holds it: another flashmon tab, a terminal monitor, an IDE,
+// ModemManager sniffing a fresh tty on Linux — or, on Linux, a browser without
+// permission for the port at all.
+function openHint(port, msg) {
+  const usb = port ? usbInfoLine(port) : null;
+  if (port && !usb) {
+    return 'That port is not a USB device — it has no USB vendor/product id, so it is one '
+      + 'the operating system provides itself (on macOS the Bluetooth-Incoming-Port and '
+      + 'debug-console rows, which sit in the chooser looking like a board). Pick the row '
+      + 'that appears when the device is plugged in, and disappears when it is unplugged.';
+  }
+  if (!/open/i.test(msg)) return usb ? `The port picked was ${usb}.` : '';
+  // Two causes wear the same sentence, and the page cannot tell them apart from
+  // the rejection alone — chrome://device-log can, so it is named. A device that
+  // would not agree to the line coding has already been retried at a rate that
+  // asks it nothing (openPort), so by the time this is read that road is closed
+  // and what is left is the chip itself.
+  return `The port picked was ${usb}. Either another program is holding it — close any `
+    + 'serial monitor, IDE, or other flashmon tab that has it open — or the device is '
+    + 'enumerated but not answering its USB control requests, which is firmware that has '
+    + 'stopped rather than a port that is busy. chrome://device-log says which: a busy port '
+    + 'logs EBUSY, a chip that has stopped logs "Failed to set custom baud rate: Device '
+    + 'error (83)", and the cure for that one is a power cycle, not a re-pick. On Linux the '
+    + 'browser also needs permission for the port (membership of the dialout or uucp group).';
+}
+
+function lobbySayWhy(el, why) {
+  if (!el) return;
+  el.textContent = why || '';
+  el.hidden = !why;
+}
+
+async function lobbyScan(roster, ids, why) {
+  const { box, list, sub, why: whyEl } = lobbyBuild();
+  lobbySayWhy(whyEl, why);
   sub.textContent = ids.length
     ? 'Devices this browser has connected to before:'
     : 'No known devices found.';
