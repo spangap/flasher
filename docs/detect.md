@@ -176,6 +176,15 @@ ACKed at its own address on the board's own I2C pins — but it is still a chang
 so it sits after the passive probes and restores the PMU's enable register when
 it fails.
 
+A third kind writes an **IO expander** (`hw-waveshare-28b`: the touch
+controller's and the panel's resets are its lines, and a PCA9554 powers up
+holding every line as an input, so nothing else on that bus is worth reading
+until it has been written). Like the PMU write it is licensed by the part
+ACKing first, at an address on pins nothing else here uses as a bus, and unlike
+a rail it drives no pin blind — so it too sits after the passive probes. What it
+changes it does not undo on failure: the lines it releases are resets, and a
+board this is not has no PCA9554 at 0x20 to have released anything on.
+
 A probe that drives a rail **releases it when it fails, and leaves it when it
 succeeds**. Both are right in both callers: on the board this actually is, the
 firmware wants the rail exactly as the probe left it (and the board's own
@@ -198,7 +207,7 @@ Everything a probe learns on the way is logged at **debug** under the tag
 raises that tag to debug for its own run, so the whole trace is captured. The
 same lines appear on a real boot after `log tag detect debug`.
 
-All nine boards are **ESP32-S3**.
+All ten boards are **ESP32-S3**.
 
 ## Boards at a glance
 
@@ -209,6 +218,7 @@ All nine boards are **ESP32-S3**.
 | `meshnology-w12` | ESP32-S3 16MB/8MB-oct | LR2021 | SSD1315 128×64 OLED | Vext rail, GC1109 30 dBm PA + RFX2402E 2.4 GHz PA (radio-switched), L76K GNSS header, battery ADC, RGB LED |
 | `lilygo-tbeam-supreme` | ESP32-S3 8MB/8MB-quad | SX1262 (or LR1121/SX1278 on the same pins) | SH1106 128×64 OLED | AXP2101 PMU gating every rail, PCF8563 RTC on the PMU bus, L76K/u-blox GNSS, SD, IMU + magnetometer + BME280 (unwired), 18650 holder |
 | `wismesh-tap-v2` | ESP32-S3 16MB/8MB-oct | SX1262 (inside the RAK3112 module, private bus) | ST7789 320×240 TFT | FT5x06 touch, RAK12501 (L76K) GNSS, SD on the panel bus, Home button, buzzer, 2 LEDs, li-ion |
+| `waveshare-28b` | ESP32-S3 16MB/8MB-oct | none (WiFi/BLE) | ST7701S 480×640 IPS, **16-bit RGB parallel** | GT911 touch, QMI8658 IMU, PCF85063 RTC, PCA9554 expander (both resets, both chip-selects), SD sharing the panel's config wires, buzzer, li-ion + charger |
 | `lilygo-t3s3` | ESP32-S3 4MB/2MB-quad | SX1262 (or SX1276/SX1280/LR1121) | SSD1306 OLED (unwired) | SD (own bus) |
 | `nibble-zero` | ESP32-S3 4MB/2MB-quad | SX1262 | SSD1306 OLED (unwired) | BME280 (unwired), NeoPixel, buttons |
 | `xiao-esp32s3-sense` | ESP32-S3 8MB/8MB-oct | none (WiFi/BLE) | none | Camera (OV2640/OV5640/… on B2B), PDM mic, SD (SDMMC 1-bit). Sense board does **not** fit the 16 MB Plus. |
@@ -227,6 +237,7 @@ must be powered first.
 | lilygo-tbeam-supreme (PMU bus) | 42 | 41 | — (the PMU is always powered) | 0x34 AXP2101, 0x51 PCF8563 |
 | lilygo-tbeam-supreme (peripheral bus) | 17 | 18 | AXP2101 **ALDO1/2/4 on** at 3.3 V | 0x3C/0x3D OLED, 0x76 BME280 |
 | wismesh-tap-v2 | 9 | 40 | drive **GPIO14 HIGH** (3V3 peripheral rail) | 0x38 FT5x06 touch |
+| waveshare-28b | 15 | 7 | write the **PCA9554 at 0x20** (outputs high, then directions) to release the touch and panel resets it holds | 0x20 PCA9554, 0x5D/0x14 GT911, 0x6B QMI8658, 0x51 PCF85063 |
 | lilygo-t3s3 | 18 | 17 | — | 0x3C OLED |
 | nibble-zero | 8 | 7 | — | 0x3C OLED, 0x76 BME280 |
 | xiao-esp32s3-sense | 40 | 39 | — (SCCB, camera only) | 0x30/0x3C/0x21 camera |
@@ -238,16 +249,18 @@ must be powered first.
 
 | Peripheral | Addr (7-bit) | Identify | Boards |
 |---|---|---|---|
-| **GT911** capacitive touch | 0x5D or 0x14 | Product-ID at reg **0x8140** (16-bit reg addr) = ASCII `"911\0"` = `39 31 31 00`. Address is 0x5D if INT was low at power-on, else 0x14. | tdeck |
+| **GT911** capacitive touch | 0x5D or 0x14 | Product-ID at reg **0x8140** (16-bit reg addr) = ASCII `"911\0"` = `39 31 31 00`. Address is 0x5D if INT was low at power-on, else 0x14. | tdeck, waveshare-28b (whose reset is an expander line, so the expander is written first and the controller given ~60 ms to boot its own firmware) |
 | **T-Deck keyboard** (on-board ESP32-C3) | 0x55 | No ID register. ACK at 0x55; a 1-byte read returns the next queued ASCII key (`0` = none). Confirm with ACK + plausible ASCII. On the tdeck bus only. | tdeck |
 | **ES7210** quad mic ADC | 0x40 | Chip-ID regs **0xFD = 0x72**, **0xFE = 0x10** (→ 0x7210). | tdeck (audio build) |
 | **PCF8563** RTC | 0x51 | No ID register — identify by **ACK at 0x51**. Sanity: seconds reg 0x02 bit7 = VL (clock-integrity-lost) flag; reads should be valid BCD. | tbeam-supreme (on the PMU bus), tdeck (optional/add-on) |
+| **PCF85063** RTC | 0x51 | The same address and the same ACK-only identification as the PCF8563, and **the two are not distinguishable on the bus** — the board says which is soldered on, the probe only says something answered. The difference is where the time block starts (0x04 rather than 0x02), which is why naming the wrong one reads a plausible wrong time rather than failing. | waveshare-28b |
+| **PCA9554** IO expander | 0x20 | No ID register — identify by **ACK at 0x20**, which is also what licenses writing to it. That write has to happen before the rest of the bus is worth reading: the part powers up with every line an input, and on the 2.8B its lines hold the touch and panel resets. Output register (0x01) first, then direction (0x03), never the other way round. | waveshare-28b |
 | **AXP2101** PMU | 0x34 | No ID register worth trusting — identify by **ACK at 0x34** on the board's own PMU pins, which is also what licenses writing to it. The rail control is `LDO_EN0` (0x90), one enable bit per ALDO, with each rail's voltage in 0x92..0x95 at 100 mV/LSB above 500 mV. | tbeam-supreme |
 | **FT5x06** capacitive touch | 0x38 | No ID register needed — a plain **ACK at 0x38** is decisive on the pins that carry it. **Poll it**: the controller runs its own firmware off the peripheral rail the probe just raised and can miss the first attempt after a cold power-on, so try for ~600 ms before calling it absent. | wismesh-tap-v2 |
 | **SSD1306**-class OLED (SSD1306 / SSD1315 / SH1106) | 0x3C (alt 0x3D) | No ID register — identify by **ACK**. The three parts are indistinguishable on the bus and none of them needs telling apart to name a board. On heltec and the W12, enable Vext (GPIO36 / GPIO45 LOW) and pulse the reset (GPIO21) first or it won't ACK; on the T-Beam Supreme the panel is behind an AXP2101 rail. | heltec, w12, tbeam-supreme, t3s3, nibble |
 | **BME280** environmental | 0x76 (alt 0x77) | Chip-ID reg **0xD0**: **0x60** = BME280 (0x58 = BMP280, 0x61 = BME680). | nibble |
 | **Camera** (SCCB) — OV2640 / OV5640 / OV3660 / OV7670 / OV7725 / GC2145 / GC0308 | 0x30, 0x3C, 0x21 | The camera is the Sense board's **only** anchor (PDM mic has no bus ID, empty SD slot answers nothing), so `det_camera` probes each sensor by chip-ID, the way esp32-camera/seccam do, and reports the model. **Its SCCB block is clocked from XCLK** — the sensor won't ACK at all until a master clock runs, so `det_camera` first drives ~20 MHz on the XCLK pin (GPIO10 on the XIAO Sense) via LEDC, then probes, then stops it. **OV2640** @0x30 (8-bit regs): bank 0xFF=1, then PID 0x0A=0x26, 0x0B=0x41/0x42. **OV5640/OV3660** @0x3C (16-bit regs): chip ID 0x300A/0x300B = 0x56/0x40 or 0x36/0x60. **GC2145** @0x3C (8-bit): 0xF0/0xF1 = 0x21/0x45. **OV7670/OV7725/GC0308** @0x21 (8-bit): 0x0A/0x0B = 0x76/0x73 or 0x77/0x21; GC0308 reg 0x00 = 0x9B. Model goes in brackets on the `DETECTED:` line. | xiao-esp32s3-sense |
-| **QMI8658** IMU (reference; not on current boards) | 0x6A/0x6B | WHO_AM_I reg **0x00 = 0x05**. Listed for future boards. | — |
+| **QMI8658** IMU | 0x6A/0x6B | WHO_AM_I reg **0x00 = 0x05**. The address is the part's SA0 strapping: 0x6B with it high, 0x6A with it low. (The same part is also made for SPI, and the Supreme's is wired that way — on the peripheral SPI host, where no I2C scan reaches it.) | waveshare-28b (0x6B) |
 
 ### SPI radios
 
@@ -282,6 +295,11 @@ Radio SPI pins by board:
 |---|---|---|
 | **SD over SPI** | Standard init: CMD0 (→ idle 0x01) → CMD8 → ACMD41 → CMD58; then read CID (CMD10) / CSD (CMD9) for manufacturer ID and size. | tdeck (CS 39, on the display bus 40/41/38), t3s3 (host 3: SCK 14/MOSI 11/MISO 2, CS 13) |
 | **SD over SDMMC (1-bit)** | CMD0/CMD8/ACMD41 on the SDMMC peripheral (CLK 7, CMD 9, D0 8; 1-bit only). | xiao-esp32s3-sense |
+
+A card is not always reachable even where one is fitted: on `waveshare-28b` the
+chip-select is an IO expander line rather than a GPIO, so selecting the card
+means an I2C write, and the same two wires carry the panel's configuration
+channel. Its probe anchors on the bus chips instead and never speaks to the slot.
 
 ### GNSS (UART — the reference case)
 
@@ -332,7 +350,10 @@ nothing to lose there.
 ### Not host-detectable
 
 These are on the PCB but have no bus identity — presence is a board fact, not a
-probe: ST7789/OLED are effectively write-only (infer from the board, not MISO);
+probe: ST7789/OLED are effectively write-only (infer from the board, not MISO),
+and an **RGB parallel panel** (the 2.8B's ST7701S) is further out of reach still
+— its configuration channel is write-only *and* only exists before the timing
+generator starts;
 MAX98357A amp is strap-configured (no register interface); linear Li-ion chargers
 (no PMIC/fuel-gauge on any of these boards — unlike T-Beam/T-Deck-Pro); Vext /
 power-enable MOSFETs, battery-sense ADC dividers, trackball, buttons, LEDs, and
@@ -349,3 +370,10 @@ the esptool probe already reports before this binary even runs.
   0xFD/0xFE chip-ID read disambiguates.
 - **0x76/0x77** BME280 shares its space with BMP280/BME680 — the 0xD0 value
   disambiguates.
+- **0x51** is a PCF8563 on the Supreme's PMU bus and a PCF85063 on the 2.8B, and
+  no read tells them apart — both are ACK-only parts with the same register
+  layout offset by two. The board is the answer; a probe learns only that a
+  clock is there.
+- **0x20** is the bottom of the PCA95xx/TCA95xx strap range, so an expander at
+  0x20 says "an expander" rather than "a PCA9554" — on the 2.8B it is decisive
+  only because nothing else on this board list uses 15/7 as a bus at all.

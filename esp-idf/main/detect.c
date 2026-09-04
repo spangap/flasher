@@ -148,6 +148,63 @@ static const char *detect_hw_xiao_esp32s3_sx1262(void)
     return "hw-xiao-esp32s3-sx1262";
 }
 
+// hw-waveshare-28b — WRITES AN IO EXPANDER, and nothing else: no rail, no pin
+// driven blind. The write is on I2C and licensed by the expander answering at
+// 0x20 on 15/7, which nothing else here uses as a bus. It has to happen: the
+// touch controller's reset is one of that expander's lines and the chip powers
+// up holding every line as an input.
+#define WS_I2C_SDA        15
+#define WS_I2C_SCL         7
+#define WS_EXIO_ADDR    0x20
+#define WS_EXIO_OUTPUT  0x01
+#define WS_EXIO_CONFIG  0x03
+#define WS_EXIO_OUT     0x0F   // P0 LCD_RST, P1 TP_RST, P2 LCD_CS, P3 SD_CS: all high
+#define WS_EXIO_CFG     0x70   // P4/P5 IMU INTs, P6 RTC INT: inputs
+#define WS_RTC_ADDR     0x51   // PCF85063
+#define WS_IMU_ADDR     0x6B   // QMI8658, SA0 high
+#define WS_IMU_WHOAMI   0x00
+#define WS_IMU_ID       0x05
+
+static const char *detect_hw_waveshare_28b(void)
+{
+    if (!detect_flash_mb(16)) return NULL;
+
+    detect_i2c_t h;
+    if (!detect_i2c_open(&h, WS_I2C_SDA, WS_I2C_SCL)) return NULL;
+
+    if (!detect_i2c_ack(&h, WS_EXIO_ADDR)) {
+        detect_i2c_close(&h);
+        detect_dbg("no IO expander at 0x%02X on 15/7 — not a Waveshare 2.8B",
+                   WS_EXIO_ADDR);
+        return NULL;
+    }
+
+    detect_i2c_wr(&h, WS_EXIO_ADDR, WS_EXIO_OUTPUT, WS_EXIO_OUT);
+    detect_i2c_wr(&h, WS_EXIO_ADDR, WS_EXIO_CONFIG, WS_EXIO_CFG);
+    vTaskDelay(pdMS_TO_TICKS(60));             /* the GT911 boots its own firmware */
+
+    bool rtc = detect_i2c_ack(&h, WS_RTC_ADDR);
+    uint8_t who = 0;
+    bool imu = detect_i2c_rd(&h, WS_IMU_ADDR, WS_IMU_WHOAMI, &who, 1) &&
+               who == WS_IMU_ID;
+    detect_i2c_close(&h);
+
+    if (!rtc || !imu) {
+        detect_dbg("expander answered but rtc=%d imu=%d — not a Waveshare 2.8B",
+                   rtc, imu);
+        return NULL;
+    }
+    /* The GT911's "911" product ID is what separates the -Touch- board from the
+     * bare-LCD variant of the same PCB. */
+    if (!detect_gt911(WS_I2C_SDA, WS_I2C_SCL)) {
+        detect_dbg("no GT911 touch — not a Waveshare 2.8B");
+        return NULL;
+    }
+
+    detect_found("hw_waveshare_28b");
+    return "hw-waveshare-28b";
+}
+
 // hw-lilygo-tbeam-supreme — SWITCHES A RAIL, but over I2C rather than a GPIO:
 // the SX1262 is dead until the AXP2101 enables ALDO3, and the PMU answering at
 // 0x34 on 42/41 is what licenses the write. So it runs after the passive probes
@@ -543,6 +600,7 @@ void app_main(void)
         detect_hw_lilygo_t3s3_sx1262,
         detect_hw_xiao_esp32s3_sense,
         detect_hw_xiao_esp32s3_sx1262,
+        detect_hw_waveshare_28b,
         detect_hw_lilygo_tbeam_supreme,
         detect_hw_heltecv4,
         detect_hw_meshnology_w12,
